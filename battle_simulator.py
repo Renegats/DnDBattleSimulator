@@ -2,7 +2,7 @@ import tkinter as tk
 from tkinter import ttk, messagebox
 import random
 from entities import Attack, Enemy
-from ui_components import ScrollableFrame
+from ui_components import ScrollableFrame, fit_window_to_screen
 from battle_ui import BattleUI
 from battle_logic import BattleLogic
 from alliance_ui import AllianceUI
@@ -22,7 +22,8 @@ class BattleSimulator(BattleUI, BattleLogic, AllianceUI, SettingsUI):
 
         self.root = root
         self.root.title("Мастер Подземелий - Симулятор Битв")
-        self.root.geometry("1600x800")
+        fit_window_to_screen(self.root, 1600, 800)
+        self.root.minsize(800, 480)
         self.sides = []  # Список списков врагов для каждой стороны
         self.num_sides = 2  # Количество сторон в битве
         self.side_names = ["Сторона А", "Сторона Б", "Сторона В", "Сторона Г", "Сторона Д", "Сторона Е"]
@@ -54,6 +55,24 @@ class BattleSimulator(BattleUI, BattleLogic, AllianceUI, SettingsUI):
         file_frame.pack(fill='x', pady=10)
         ttk.Button(file_frame, text="Сохранить настройки", command=self.save_settings).pack(side='left', padx=5)
         ttk.Button(file_frame, text="Загрузить настройки", command=self.load_settings).pack(side='left', padx=5)
+        # В battle_simulator.py, в методе setup_ui(), после создания кнопок сохранения/загрузки
+
+        ttk.Button(file_frame, text="📖 Импортировать из бестиария",
+                   command=self.open_bestiary_import).pack(side='left', padx=5)
+
+        # Добавь метод в класс BattleSimulator
+        def open_bestiary_import(self):
+            """Открывает окно импорта из бестиария"""
+            from bestiary_importer import BestiaryImporter
+            importer = BestiaryImporter(self.root, self.enemy_types)
+            enemy = importer.open_import_window()
+
+            if enemy:
+                # Можно добавить врага в текущую сторону или создать новую
+                # Например, добавить в первую сторону
+                if self.sides and len(self.sides) > 0:
+                    self.sides[0].append(enemy)
+                    self.setup_battle_ui()  # Обновляем UI
 
         # Количество сторон
         ttk.Label(setup_scroll_frame.scrollable_frame, text="Количество сторон:", font=('Arial', 10, 'bold')).pack(
@@ -156,6 +175,19 @@ class BattleSimulator(BattleUI, BattleLogic, AllianceUI, SettingsUI):
 
         # Первоначальное обновление интерфейса
         self.update_sides_ui()
+
+    def open_bestiary_import(self):
+        """Открывает окно импорта из бестиария"""
+        try:
+            from bestiary_importer import BestiaryImporter
+        except ImportError:
+            messagebox.showerror("Ошибка",
+                                 "Файл bestiary_importer.py не найден!\nУбедитесь, что он создан в папке проекта.")
+            return
+
+        # Передаем self (симулятор), чтобы импортер мог обновить списки армий!
+        importer = BestiaryImporter(self.root, self)
+        importer.open_import_window()
 
     def update_sides_ui(self):
         """Обновление отображения сторон в интерфейсе"""

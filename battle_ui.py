@@ -1,7 +1,7 @@
 import tkinter as tk
 from tkinter import ttk, messagebox
 from entities import Attack, Enemy
-from ui_components import ScrollableFrame
+from ui_components import ScrollableFrame, fit_window_to_screen
 from observer import Observer
 
 
@@ -152,8 +152,8 @@ class BattleUI:
         """Открытие окна массового редактирования"""
         edit_window = tk.Toplevel(self.root)
         edit_window.title("Массовое редактирование")
-        edit_window.geometry("600x800")
-        edit_window.minsize(600, 700)
+        fit_window_to_screen(edit_window, 600, 800)
+        edit_window.minsize(400, 300)
 
         # Создание прокручиваемого фрейма для диалога
         main_frame = ttk.Frame(edit_window)
@@ -256,7 +256,7 @@ class BattleUI:
 
         attack_dialog = tk.Toplevel(self.root)
         attack_dialog.title("Добавить атаку")
-        attack_dialog.geometry("400x500")
+        fit_window_to_screen(attack_dialog, 400, 500)
 
         ttk.Label(attack_dialog, text="Новая атака", font=('Arial', 12, 'bold')).pack(pady=10)
 
@@ -330,7 +330,7 @@ class BattleUI:
         # Создаем окно редактирования
         attack_dialog = tk.Toplevel(self.root)
         attack_dialog.title("Редактировать атаку")
-        attack_dialog.geometry("400x500")
+        fit_window_to_screen(attack_dialog, 400, 500)
 
         ttk.Label(attack_dialog, text="Редактирование атаки", font=('Arial', 12, 'bold')).pack(pady=10)
 
