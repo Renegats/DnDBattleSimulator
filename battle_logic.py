@@ -20,6 +20,11 @@ class BattleLogic:
 
         battle_log = "=== НОВЫЙ РАУНД БОЯ ===\n"
 
+        # Новый раунд - все очки движения восстанавливаются
+        for side_enemies in self.sides:
+            for enemy in side_enemies:
+                enemy.moved_ft = 0
+
         # Обработка атак для каждой стороны
         for attacker_side_idx, side_enemies in enumerate(self.sides):
             alive_attackers = [e for e in side_enemies if e.alive]
@@ -44,6 +49,18 @@ class BattleLogic:
                 if not attack:
                     battle_log += f"{attacker.name} - нет доступных атак\n"
                     continue
+
+                # --- Карта: продвижение к цели и проверка дальности ---
+                if getattr(self, 'battle_map', None) and \
+                        self.battle_map.get_pos(attacker) and self.battle_map.get_pos(target):
+                    dist = self.battle_map.distance_ft(attacker, target)
+                    if dist > attack.range_ft and getattr(self, 'auto_move', False):
+                        self.battle_map.move_towards(attacker, target, attacker.speed)
+                        dist = self.battle_map.distance_ft(attacker, target)
+                    if dist > attack.range_ft:
+                        battle_log += (f"{attacker.name} не может достать {target.name} "
+                                       f"({dist} фт > {attack.range_ft} фт)\n")
+                        continue
 
                 # Выполнение атаки
                 hit, damage, attack_roll, critical, damage_info = attacker.perform_attack(attack, target.ac)
@@ -89,3 +106,5 @@ class BattleLogic:
 
         # Обновляем UI чтобы показать изменения в здоровье
         self.update_battle_ui()
+        if getattr(self, 'battle_map', None):
+            self.draw_map()

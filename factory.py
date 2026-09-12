@@ -3,10 +3,23 @@ from entities import Enemy, Attack
 
 class EnemyFactory:
     """Фабрика для создания врагов разных типов"""
+    CUSTOM_TYPES = {}  # Сюда импортер из бестиария регистрирует монстров с dnd.su
+
+    @staticmethod
+    def register_type(type_name, hp, ac, attacks, speed=30, regen=0):
+        """Регистрация кастомного монстра (атаки - список словарей для Attack(**a))"""
+        EnemyFactory.CUSTOM_TYPES[type_name] = {
+            'hp': hp, 'ac': ac, 'attacks': attacks, 'speed': speed, 'regen': regen
+        }
 
     @staticmethod
     def create_enemy(enemy_type, name, side):
-        """Создает врага определенного типа с предопределенными характеристиками"""
+        # Сначала ищем импортированного монстра!
+        if enemy_type in EnemyFactory.CUSTOM_TYPES:
+            t = EnemyFactory.CUSTOM_TYPES[enemy_type]
+            return Enemy(name=name, hp=t['hp'], ac=t['ac'],
+                         attacks=[Attack(**a) for a in t['attacks']],
+                         side=side, regen=t['regen'], speed=t['speed'])
         if enemy_type == "гоблин":
             return Enemy(
                 name=name,

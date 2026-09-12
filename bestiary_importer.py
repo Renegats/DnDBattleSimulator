@@ -14,7 +14,7 @@ class BestiaryImporter:
     MONSTER_URL_RE = re.compile(r'/(?:multiverse/)?bestiary/\d+[-_][\w\-]+/?$')
     ATTACK_RE = re.compile(
         r'(?P<name>[А-ЯЁA-Z][^.\n]{2,80}?)\.\s*'
-        r'(?:Рукопашная|Дальнобойная)\s+атака\s+оружием:?\s*'
+        r'(?P<kind>Рукопашная|Дальнобойная)\s+атака\s+оружием:?\s*'
         r'(?P<bonus>[+-]?\d+)\s+к\s+попаданию',
         re.IGNORECASE)
     DICE_RE = re.compile(r'(\d+)\s*[кkd]\s*(\d+)(?:\s*([+-]\s*\d+))?')
@@ -181,6 +181,10 @@ class BestiaryImporter:
 
         text = soup.get_text()
 
+        monster['speed'] = 30
+        spd = re.search(r'Скорость\s*(\d+)\s*футов', text, re.I)
+        if spd:
+            monster['speed'] = int(spd.group(1))
         hp = re.search(r'(?:Хиты|Hit\s+Points)[^\d]{0,20}(\d+)', text, re.I)
         if hp:
             monster['hp'] = int(hp.group(1))
@@ -204,6 +208,14 @@ class BestiaryImporter:
             bonus = int(m.group('bonus'))
             # Ищем кости урона в окне сразу после "+N к попаданию"
             window = text[m.end(): m.end() + 250]
+            rm = re.search(r'дистанция\s*(\d+)', window)
+            reach = re.search(r'досягаемость\s*(\d+)', window)
+            if m.group('kind').lower().startswith('дально') and rm:
+                range_ft = int(rm.group(1))
+            elif reach:
+                range_ft = int(reach.group(1))
+            else:
+                range_ft = 5
             dm = self.DICE_RE.search(window)
             if not dm:
                 continue
@@ -223,7 +235,8 @@ class BestiaryImporter:
                 'damage_dice_count': count,
                 'damage_dice_type': f'd{die}',  # внутри симулятора кости всё равно через "d"
                 'damage_modifier': mod,
-                'damage_type': dtype
+                'damage_type': dtype,
+                'range_ft': range_ft
             })
 
         if not attacks:
@@ -252,26 +265,30 @@ class BestiaryImporter:
         if not self.selected_monster:
             return
 
-        attacks = []
-        for atk_data in self.selected_monster['attacks']:
-            attack = Attack(
-                name=atk_data['name'],
-                attack_bonus=atk_data['attack_bonus'],
-                damage_dice_count=atk_data['damage_dice_count'],
-                damage_dice_type=atk_data['damage_dice_type'],
-                damage_modifier=atk_data['damage_modifier'],
-                damage_type=atk_data.get('damage_type', '')
-            )
-            attacks.append(attack)
-
-        # Создаем шаблон врага (нам не нужен инстанс для фабрики, нам нужно имя типа)
+        # Имя типа, под которым монстр зарегистрируется в фабрике
         monster_type = self.selected_monster['name']
 
-        # Добавляем тип в список симулятора!
+        attacks_data = [{
+            'name': a['name'], 'attack_bonus': a['attack_bonus'],
+            'damage_dice_count': a['damage_dice_count'],
+            'damage_dice_type': a['damage_dice_type'],
+            'damage_modifier': a['damage_modifier'],
+            'damage_type': a.get('damage_type', ''),
+            'range_ft': a.get('range_ft', 5),
+        } for a in self.selected_monster['attacks']]
+
+        from factory import EnemyFactory
+        EnemyFactory.register_type(monster_type,
+                                   hp=self.selected_monster['hp'],
+                                   ac=self.selected_monster['ac'],
+                                   attacks=attacks_data,
+                                   speed=self.selected_monster.get('speed', 30),
+                                   regen=self.selected_monster.get('regen', 0))
+
+        # Добавляем тип в список симулятора
         if monster_type not in self.simulator.enemy_types:
             self.simulator.enemy_types.append(monster_type)
 
-            # МАГИЯ! 🪄 Обновляем все Combobox-ы в главном окне, чтобы новый монстр там появился!
             for child in self.simulator.types_frame.winfo_children():
                 for widget in child.winfo_children():
                     if isinstance(widget, ttk.Combobox):
@@ -280,10 +297,8 @@ class BestiaryImporter:
                             current_values.append(monster_type)
                             widget.config(values=current_values)
 
-            # Также можно сохранить шаблон в Factory, но пока просто добавили в список
-
             messagebox.showinfo("Успех",
-                                f"✨ Монстр {monster_type} успешно импортирован и добавлен в выпадающие списки армий!")
+                                f" Монстр {monster_type} успешно импортирован и добавлен в выпадающие списки армий!")
         else:
             messagebox.showinfo("Информация", f"Монстр {monster_type} уже есть в списке!")
 

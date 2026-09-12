@@ -8,13 +8,15 @@ class Attack:
     """Класс для представления атаки существа"""
 
     def __init__(self, name: str, attack_bonus: int, damage_dice_count: int,
-                 damage_dice_type: str, damage_modifier: int, damage_type: str = ""):
+                 damage_dice_type: str, damage_modifier: int, damage_type: str = "",
+                 range_ft: int = 5):
         self.name = name
         self.attack_bonus = attack_bonus
         self.damage_dice_count = damage_dice_count
         self.damage_dice_type = damage_dice_type
         self.damage_modifier = damage_modifier
         self.damage_type = damage_type
+        self.range_ft = range_ft
 
     def to_dict(self):
         """Преобразует объект атаки в словарь для сохранения"""
@@ -24,7 +26,8 @@ class Attack:
             'damage_dice_count': self.damage_dice_count,
             'damage_dice_type': self.damage_dice_type,
             'damage_modifier': self.damage_modifier,
-            'damage_type': self.damage_type
+            'damage_type': self.damage_type,
+            'range_ft': self.range_ft
         }
 
     @classmethod
@@ -36,25 +39,30 @@ class Attack:
             data['damage_dice_count'],
             data['damage_dice_type'],
             data['damage_modifier'],
-            data.get('damage_type', '')
+            data.get('damage_type', ''),
+            data.get('range_ft', 5)
         )
 
 
 class Enemy(Subject):
     """Класс для представления врага/существа в битве"""
 
-    def __init__(self, name: str, hp: int, ac: int, attacks: List[Attack], side: int, regen=0):
-        super().__init__()  # Инициализация Subject для паттерна "Наблюдатель"
+    def __init__(self, name: str, hp: int, ac: int, attacks: List[Attack], side: int,
+                 regen=0, speed=30):
+        super().__init__()
         self.name = name
         self.max_hp = hp
         self.hp = hp
         self.ac = ac
         self.attacks = attacks
-        self.side = side  # Номер стороны (0, 1, 2...)
+        self.side = side
         self.alive = True
-        self.ignore_sides = set()  # Множество сторон, которые этот враг игнорирует
-        self.strategy: BattleStrategy = RandomStrategy()  # Паттерн "Стратегия"
-        self.regen = regen  # Регенерация здоровья (для троллей и подобных существ)
+        self.ignore_sides = set()
+        self.strategy: BattleStrategy = RandomStrategy()
+        self.regen = regen
+        self.speed = speed  # скорость в футах (5 фт = 1 клетка)
+        self.pos = None  # позиция на карте (x, y) или None
+        self.moved_ft = 0  # потрачено футов перемещения за раунд
 
     def take_damage(self, damage: int):
         """Нанесение урона врагу"""
@@ -112,7 +120,8 @@ class Enemy(Subject):
             'alive': self.alive,
             'ignore_sides': list(self.ignore_sides),
             'strategy_type': self.strategy.__class__.__name__,
-            'regen': self.regen
+            'regen': self.regen,
+            'speed': self.speed, 'pos': self.pos
         }
 
     @classmethod
@@ -129,6 +138,7 @@ class Enemy(Subject):
         enemy.hp = data['hp']
         enemy.alive = data['alive']
         enemy.ignore_sides = set(data['ignore_sides'])
+        enemy.speed = data.get('speed', 30)
 
         # Восстановление стратегии из сохранения
         strategy_type = data.get('strategy_type', 'RandomStrategy')
