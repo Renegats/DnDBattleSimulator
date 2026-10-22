@@ -1,6 +1,7 @@
 import tkinter as tk
 from tkinter import ttk, messagebox
 import random
+from theme_manager import current_palette
 
 CELL_PX = 28  # размер клетки в пикселях
 SIDE_COLORS = ['#e74c3c', '#3498db', '#2ecc71', '#f1c40f', '#9b59b6', '#e67e22']
@@ -14,28 +15,29 @@ class BattleMap:
         self.height = height
         self.positions = {}   # id(enemy) -> (x, y)
         self._enemies = {}    # id(enemy) -> enemy
+        self.cell_map = {}  # (x, y) -> enemy
 
     def cell_free(self, x, y, ignore_id=None):
         if not (0 <= x < self.width and 0 <= y < self.height):
             return False
-        for eid, (px, py) in self.positions.items():
-            if (px, py) == (x, y) and eid != ignore_id:
-                return False
-        return True
+        occ = self.cell_map.get((x, y))
+        return occ is None or id(occ) == ignore_id
 
     def place(self, enemy, x, y):
+        old = self.positions.get(id(enemy))
+        if old:
+            self.cell_map.pop(old, None)
         self.positions[id(enemy)] = (x, y)
+        self.cell_map[(x, y)] = enemy
         self._enemies[id(enemy)] = enemy
         enemy.pos = (x, y)
 
     def get_pos(self, enemy):
+        """Возвращает позицию токена (x, y) или None, если он не на карте"""
         return self.positions.get(id(enemy))
 
     def enemy_at(self, x, y):
-        for eid, (px, py) in self.positions.items():
-            if (px, py) == (x, y):
-                return self._enemies.get(eid)
-        return None
+        return self.cell_map.get((x, y))
 
     def distance_ft(self, a, b):
         """Дистанция в футах: в 5e диагональ = 5 фт, поэтому берём максимум разниц"""
@@ -51,9 +53,18 @@ class BattleMap:
         x1 = min(self.width, (side_idx + 1) * w) if side_idx < total - 1 else self.width
         return x0, x1
 
+    def _find_any_free(self):
+        """Первая свободная клетка где угодно на карте, или None, если карта забита"""
+        for yy in range(self.height):
+            for xx in range(self.width):
+                if self.cell_free(xx, yy):
+                    return xx, yy
+        return None
+
     def random_placement(self, sides):
         """Случайная расстановка, но каждая сторона в своей зоне"""
         self.positions.clear()
+        self.cell_map.clear()
         self._enemies.clear()
         for i, side in enumerate(sides):
             x0, x1 = self._zone_for(i, len(sides))
@@ -68,46 +79,97 @@ class BattleMap:
                     if self.cell_free(x, y):
                         self.place(enemy, x, y)
                         break
+                else:
+                    spot = self._find_any_free()  # зона переполнена - селим куда угодно
+                    if spot:
+                        self.place(enemy, spot[0], spot[1])
 
     def formation_placement(self, sides):
-        """Расстановка шеренгами у края своей зоны"""
+        """Расстановка шеренгами в своей зоне; переполнение зоны больше НЕ вешает программу"""
         self.positions.clear()
+        self.cell_map.clear()
         self._enemies.clear()
         for i, side in enumerate(sides):
             x0, x1 = self._zone_for(i, len(sides))
-            cols = max(1, x1 - x0)
-            k = 0
             for enemy in side:
                 enemy.moved_ft = 0
                 if not enemy.alive:
                     continue
-                x = x0 + (k % cols)
-                y = (k // cols) % self.height
-                while not self.cell_free(x, y):
-                    y = (y + 1) % self.height
-                self.place(enemy, x, y)
-                k += 1
+                spot = None
+                # Первая свободная клетка в своей зоне, ряд за рядом (шеренги!)
+                for yy in range(self.height):
+                    for xx in range(x0, x1):
+                        if self.cell_free(xx, yy):
+                            spot = (xx, yy)
+                            break
+                    if spot:
+                        break
+                if spot is None:  # зона забита под завязку
+                    spot = self._find_any_free()
+                if spot is None:  # вся карта забита - пропускаем бойца
+                    continue
+                self.place(enemy, spot[0], spot[1])
 
-    def move_towards(self, enemy, target, max_ft):
-        """Жадное движение к цели (для авто-продвижения в бою), обходя занятые клетки"""
-        pos, tpos = self.get_pos(enemy), self.get_pos(target)
-        if not pos or not tpos:
-            return
-        x, y = pos
-        for _ in range(max_ft // 5):
-            if (x, y) == tpos:
+    def find_path(self, enemy, target, max_steps, reach_steps=1):
+        """BFS-поиск кратчайшего пути (до max_steps шагов) до ближайшей клетки,
+        с которой цель досягаема (чебышевское расстояние <= reach_steps).
+        Если такой клетки нет - возвращает путь, приближающий к цели максимально.
+        Возвращает список клеток БЕЗ стартовой, или None, если идти некуда."""
+        start = self.get_pos(enemy)
+        tpos = self.get_pos(target)
+        if not start or not tpos:
+            return None
+        eid = id(enemy)
+        # 8 направлений, перемешанные - чтобы воины не ходили одной колонной
+        dirs = [(-1, -1), (0, -1), (1, -1), (-1, 0),
+                (1, 0), (-1, 1), (0, 1), (1, 1)]
+        random.shuffle(dirs)
+
+        parents = {start: None}
+        frontier = [start]
+        best_cell = start
+        best_dist = max(abs(start[0] - tpos[0]), abs(start[1] - tpos[1]))
+
+        def rebuild(cell):
+            path = []
+            cur = cell
+            while cur is not None:
+                path.append(cur)
+                cur = parents[cur]
+            return path[::-1][1:]  # без стартовой клетки
+
+        for _ in range(max_steps):
+            next_frontier = []
+            for (cx, cy) in frontier:
+                for dx, dy in dirs:
+                    nx, ny = cx + dx, cy + dy
+                    if (nx, ny) in parents:
+                        continue
+                    if not self.cell_free(nx, ny, ignore_id=eid):
+                        continue
+                    parents[(nx, ny)] = (cx, cy)
+                    d = max(abs(nx - tpos[0]), abs(ny - tpos[1]))
+                    if d <= reach_steps:
+                        return rebuild((nx, ny))  # нашли клетку атаки!
+                    if d < best_dist:
+                        best_dist = d
+                        best_cell = (nx, ny)
+                    next_frontier.append((nx, ny))
+            frontier = next_frontier
+            if not frontier:
                 break
-            dx = (tpos[0] > x) - (tpos[0] < x)
-            dy = (tpos[1] > y) - (tpos[1] < y)
-            moved = False
-            for nx, ny in ((x + dx, y + dy), (x + dx, y), (x, y + dy)):
-                if self.cell_free(nx, ny, ignore_id=id(enemy)):
-                    x, y = nx, ny
-                    moved = True
-                    break
-            if not moved:
-                break
-        self.place(enemy, x, y)
+        # Цель недоступна - ползем максимально близко по лучшему пути
+        if best_cell == start:
+            return None
+        return rebuild(best_cell)
+
+    def move_towards(self, enemy, target, max_ft, reach_ft=5):
+        """Умное движение: BFS-маршрут в обход союзников до ближайшей клетки атаки"""
+        steps = max_ft // 5
+        reach_steps = max(1, reach_ft // 5)  # рукопашка 5 фт = соседняя клетка
+        path = self.find_path(enemy, target, steps, reach_steps)
+        if path:
+            self.place(enemy, path[-1][0], path[-1][1])
 
 
 class BattleMapUI:
@@ -142,11 +204,22 @@ class BattleMapUI:
         ttk.Label(top, text="Клетка = 5 фт. Клик по токену — выбрать, клик по зелёной клетке — шаг.",
                   font=('Arial', 9)).pack(side='left', padx=10)
 
-        self.map_canvas = tk.Canvas(self.map_frame,
-                                    width=self.battle_map.width * CELL_PX,
-                                    height=self.battle_map.height * CELL_PX,
-                                    bg='#2e4d2e', highlightthickness=1)
-        self.map_canvas.pack(pady=5)
+        map_wrap = ttk.Frame(self.map_frame)
+        map_wrap.pack(fill='both', expand=True, pady=5)
+        map_wrap.grid_rowconfigure(0, weight=1)
+        map_wrap.grid_columnconfigure(0, weight=1)
+        p = current_palette(self)
+        self.map_canvas = tk.Canvas(map_wrap, bg=p['canvas_map'], highlightthickness=1,
+                                    highlightbackground=p['border'])
+        vbar = ttk.Scrollbar(map_wrap, orient='vertical', command=self.map_canvas.yview)
+        hbar = ttk.Scrollbar(map_wrap, orient='horizontal', command=self.map_canvas.xview)
+        self.map_canvas.configure(yscrollcommand=vbar.set, xscrollcommand=hbar.set)
+        self.map_canvas.grid(row=0, column=0, sticky='nsew')
+        vbar.grid(row=0, column=1, sticky='ns')
+        hbar.grid(row=1, column=0, sticky='ew')
+        self.map_canvas.configure(scrollregion=(0, 0,
+                                                self.battle_map.width * CELL_PX,
+                                                self.battle_map.height * CELL_PX))
         self.map_canvas.bind('<Button-1>', self.on_map_click)
         self.draw_map()
 
@@ -164,13 +237,14 @@ class BattleMapUI:
     def draw_map(self):
         if not hasattr(self, 'map_canvas'):
             return
+        p = current_palette(self)
         c = self.map_canvas
         c.delete('all')
         bm = self.battle_map
         for x in range(bm.width + 1):
-            c.create_line(x * CELL_PX, 0, x * CELL_PX, bm.height * CELL_PX, fill='#4d7a4d')
+            c.create_line(x * CELL_PX, 0, x * CELL_PX, bm.height * CELL_PX, fill=p['canvas_grid'])
         for y in range(bm.height + 1):
-            c.create_line(0, y * CELL_PX, bm.width * CELL_PX, y * CELL_PX, fill='#4d7a4d')
+            c.create_line(0, y * CELL_PX, bm.width * CELL_PX, y * CELL_PX, fill=p['canvas_grid'])
 
         # Подсветка клеток, достижимых с остатком скорости выбранного токена
         if self.selected_enemy and self.selected_enemy.alive:
@@ -183,7 +257,7 @@ class BattleMapUI:
                         if bm.cell_free(nx, ny, ignore_id=id(self.selected_enemy)):
                             c.create_rectangle(nx * CELL_PX + 1, ny * CELL_PX + 1,
                                                (nx + 1) * CELL_PX - 1, (ny + 1) * CELL_PX - 1,
-                                               fill='#3d6b3d', outline='')
+                                               fill=p['canvas_reach'], outline='')
         # Токены
         for i, side in enumerate(self.sides):
             color = SIDE_COLORS[i % len(SIDE_COLORS)]
@@ -202,8 +276,12 @@ class BattleMapUI:
                 c.create_text(cx, cy, text=label, fill='white', font=('Arial', 8, 'bold'))
 
     def on_map_click(self, event):
+        """Обрабатывает клик по карте: сначала переводим координаты экрана в координаты карты"""
         bm = self.battle_map
-        x, y = event.x // CELL_PX, event.y // CELL_PX
+        cx = self.map_canvas.canvasx(event.x)
+        cy = self.map_canvas.canvasy(event.y)
+        x, y = int(cx) // CELL_PX, int(cy) // CELL_PX
+
         clicked = bm.enemy_at(x, y)
         if clicked and clicked.alive:
             self.selected_enemy = clicked

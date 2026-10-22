@@ -6,15 +6,18 @@ from observer import Observer
 
 
 class UIUpdater(Observer):
-    """Класс для обновления UI при изменении состояния врагов"""
-
     def __init__(self, battle_ui):
         self.battle_ui = battle_ui
 
     def update(self, subject):
-        """Обновляет UI при изменении состояния врага"""
-        if hasattr(self.battle_ui, 'update_battle_ui'):
-            self.battle_ui.update_battle_ui()
+        bu = self.battle_ui
+        if not hasattr(bu, '_dirty_enemies'):
+            bu._dirty_enemies = set()
+        bu._dirty_enemies.add(subject)
+        if getattr(bu, 'ui_suspend', False):
+            return
+        if hasattr(bu, 'update_battle_ui'):
+            bu.update_battle_ui()
 
 
 class BattleUI:
@@ -22,7 +25,10 @@ class BattleUI:
 
     def __init__(self):
         """Инициализация UI обновителя"""
-        pass
+        def __init__(self):
+            self._dirty_enemies = set()
+            self.label_by_enemy = {}
+            self.ui_suspend = False
 
     def setup_battle_ui(self):
         """Настройка интерфейса битвы"""
@@ -33,6 +39,8 @@ class BattleUI:
         # Полностью очищаем battle frame
         for widget in self.battle_frame.winfo_children():
             widget.destroy()
+
+        self.label_by_enemy = {}
 
         # Создаем основной контейнер с прокруткой
         main_scroll_frame = ScrollableFrame(self.battle_frame)
@@ -73,17 +81,14 @@ class BattleUI:
                 var = tk.BooleanVar()
                 frame = ttk.Frame(scroll_frame.scrollable_frame)
                 frame.pack(fill='x', pady=2)
-
                 ttk.Checkbutton(frame, variable=var).pack(side='left')
                 status = "🟢" if enemy.alive else "🔴"
-
-                # Отображение информации о враге с атаками
-                attack_info = ", ".join([f"{attack.name}+{attack.attack_bonus}" for attack in enemy.attacks])
-                ttk.Label(frame, text=f"{status} {enemy.name}: {enemy.hp}/{enemy.max_hp} HP [{attack_info}]").pack(
-                    side='left')
-                ttk.Button(frame, text="Изменить",
-                           command=lambda e=enemy: self.edit_enemy(e)).pack(side='right')
-
+                attack_info = ", ".join([f"{a.name}+{a.attack_bonus}" for a in enemy.attacks])
+                lbl = ttk.Label(frame, text=f"{status} {enemy.name}: {enemy.hp}/{enemy.max_hp} HP [{attack_info}]")
+                lbl.pack(side='left')
+                self.label_by_enemy[enemy] = lbl  # прямая ссылка: обновление за O(1)!
+                for w in (frame, lbl):
+                    w.bind('<Double-Button-1>', lambda e, en=enemy: self.edit_enemy(en))
                 side_vars.append(var)
 
             self.side_vars.append(side_vars)
@@ -390,18 +395,13 @@ class BattleUI:
             self.battle_results_text.see(tk.END)
 
     def update_battle_ui(self):
-        """Обновление интерфейса битвы без полного пересоздания"""
-        for i, (side_enemies, side_vars) in enumerate(zip(self.sides, self.side_vars)):
-            for j, (enemy, var) in enumerate(zip(side_enemies, side_vars)):
-                # Находим соответствующий фрейм врага
-                scroll_frame, _ = self.side_frames_battle[i]
-                # +1 потому что первый child - это "Выделить все"
-                if j + 1 < len(scroll_frame.scrollable_frame.winfo_children()):
-                    enemy_frame = scroll_frame.scrollable_frame.winfo_children()[j + 1]
-                    # Находим label с здоровьем (второй дочерний элемент фрейма)
-                    if len(enemy_frame.winfo_children()) > 1:
-                        health_label = enemy_frame.winfo_children()[1]
-                        status = "🟢" if enemy.alive else "🔴"
-                        attack_info = ", ".join([f"{attack.name}+{attack.attack_bonus}" for attack in enemy.attacks])
-                        health_label.configure(
-                            text=f"{status} {enemy.name}: {enemy.hp}/{enemy.max_hp} HP [{attack_info}]")
+        """Обновление интерфейса: только изменившиеся враги, O(число изменений)"""
+        dirty = getattr(self, '_dirty_enemies', set())
+        for enemy in dirty:
+            label = self.label_by_enemy.get(enemy)
+            if label is None:
+                continue
+            status = "🟢" if enemy.alive else "🔴"
+            attack_info = ", ".join([f"{a.name}+{a.attack_bonus}" for a in enemy.attacks])
+            label.configure(text=f"{status} {enemy.name}: {enemy.hp}/{enemy.max_hp} HP [{attack_info}]")
+        dirty.clear()

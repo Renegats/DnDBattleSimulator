@@ -12,7 +12,7 @@ class BattleLogic:
         """Инициализация логики битвы"""
         pass
 
-    def run_battle_round(self):
+    def _run_round_inner(self):
         """Проведение одного раунда битвы"""
         if not self.sides or not any(any(enemy.alive for enemy in side) for side in self.sides):
             messagebox.showerror("Ошибка", "Армии не созданы или все мертвы!")
@@ -50,14 +50,21 @@ class BattleLogic:
                     battle_log += f"{attacker.name} - нет доступных атак\n"
                     continue
 
-                # --- Карта: продвижение к цели и проверка дальности ---
+                # --- Карта: дальность, продвижение и умный выбор атаки ---
                 if getattr(self, 'battle_map', None) and \
                         self.battle_map.get_pos(attacker) and self.battle_map.get_pos(target):
                     dist = self.battle_map.distance_ft(attacker, target)
-                    if dist > attack.range_ft and getattr(self, 'auto_move', False):
-                        self.battle_map.move_towards(attacker, target, attacker.speed)
+                    # Выбранная атака не достаёт - пробуем подойти
+                    if dist > getattr(attack, 'range_ft', 5) and getattr(self, 'auto_move', False):
+                        self.battle_map.move_towards(attacker, target, attacker.speed,
+                                                     reach_ft=getattr(attack, 'range_ft', 5))
                         dist = self.battle_map.distance_ft(attacker, target)
-                    if dist > attack.range_ft:
+                    # Перевыбираем атаку с учётом НОВОЙ дистанции:
+                    # подошёл лук в радиус - лучник стреляет, а не машет мечом!
+                    new_attack = attacker.strategy.select_attack(attacker, target)
+                    if new_attack:
+                        attack = new_attack
+                    if dist > getattr(attack, 'range_ft', 5):
                         battle_log += (f"{attacker.name} не может достать {target.name} "
                                        f"({dist} фт > {attack.range_ft} фт)\n")
                         continue
@@ -103,8 +110,15 @@ class BattleLogic:
             self.battle_results_text.insert(tk.END, battle_log + "\n")
 
         self.battle_results_text.see(tk.END)
+        if int(self.battle_results_text.index('end-1c').split('.')[0]) > 3000:
+            self.battle_results_text.delete('1.0', 'end-2500l')
 
-        # Обновляем UI чтобы показать изменения в здоровье
-        self.update_battle_ui()
-        if getattr(self, 'battle_map', None):
-            self.draw_map()
+    def run_battle_round(self):
+        self.ui_suspend = True
+        try:
+            self._run_round_inner()
+        finally:
+            self.ui_suspend = False
+            self.update_battle_ui()
+            if getattr(self, 'battle_map', None):
+                self.draw_map()

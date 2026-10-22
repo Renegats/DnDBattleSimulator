@@ -1,0 +1,249 @@
+{
+  "num_sides": 9,
+  "side_names": [
+    "Гном",
+    "Ст гном",
+    "Веркрыс",
+    "Элементаль",
+    "Призрак",
+    "Черная слизь",
+    "Охристое желе",
+    "Желатиновый куб",
+    "Серая слизь"
+  ],
+  "side_counts": [
+    60,
+    12,
+    40,
+    5,
+    15,
+    20,
+    30,
+    80,
+    100
+  ],
+  "army_types": [
+    "Глубинный гном (Свирфнеблин)—Бестиарий",
+    "Ветеран—Бестиарий",
+    "Свирфнеблины веркрысы—Бестиарий",
+    "Земляной элементаль—Бестиарий",
+    "Спектр—Бестиарий",
+    "Чёрная слизь—Бестиарий",
+    "Золотистый студень—Бестиарий",
+    "Студенистый куб—Бестиарий",
+    "Серая слизь—Бестиарий"
+  ],
+  "strategy_types": [
+    "Ветеран—Бестиарий",
+    "защитная",
+    "защитная",
+    "защитная",
+    "защитная",
+    "агрессивная",
+    "агрессивная",
+    "агрессивная",
+    "агрессивная"
+  ],
+  "custom_types": {
+    "Свирфнеблины веркрысы—Бестиарий": {
+      "hp": 33,
+      "ac": 12,
+      "attacks": [
+        {
+          "name": "Укус (только в облике крысы или гибрида)",
+          "attack_bonus": 4,
+          "damage_dice_count": 1,
+          "damage_dice_type": "d4",
+          "damage_modifier": 2,
+          "damage_type": "колющий",
+          "range_ft": 5
+        },
+        {
+          "name": "Короткий меч (только в облике гуманоида или гибрида)",
+          "attack_bonus": 4,
+          "damage_dice_count": 1,
+          "damage_dice_type": "d6",
+          "damage_modifier": 2,
+          "damage_type": "колющий",
+          "range_ft": 5
+        },
+        {
+          "name": "Ручной арбалет (только в облике гуманоида или гибрида)",
+          "attack_bonus": 4,
+          "damage_dice_count": 1,
+          "damage_dice_type": "d6",
+          "damage_modifier": 2,
+          "damage_type": "колющий",
+          "range_ft": 30
+        }
+      ],
+      "speed": 30,
+      "regen": 0
+    },
+    "Глубинный гном (Свирфнеблин)—Бестиарий": {
+      "hp": 16,
+      "ac": 15,
+      "attacks": [
+        {
+          "name": "ДействияБоевая кирка",
+          "attack_bonus": 4,
+          "damage_dice_count": 1,
+          "damage_dice_type": "d8",
+          "damage_modifier": 2,
+          "damage_type": "колющий",
+          "range_ft": 5
+        },
+        {
+          "name": "Отравленный дротик",
+          "attack_bonus": 4,
+          "damage_dice_count": 1,
+          "damage_dice_type": "d4",
+          "damage_modifier": 2,
+          "damage_type": "колющий",
+          "range_ft": 30
+        }
+      ],
+      "speed": 20,
+      "regen": 0
+    },
+    "Ветеран—Бестиарий": {
+      "hp": 58,
+      "ac": 17,
+      "attacks": [
+        {
+          "name": "Длинный меч",
+          "attack_bonus": 5,
+          "damage_dice_count": 1,
+          "damage_dice_type": "d8",
+          "damage_modifier": 3,
+          "damage_type": "рубящий",
+          "range_ft": 5
+        },
+        {
+          "name": "Короткий меч",
+          "attack_bonus": 5,
+          "damage_dice_count": 1,
+          "damage_dice_type": "d6",
+          "damage_modifier": 3,
+          "damage_type": "колющий",
+          "range_ft": 5
+        },
+        {
+          "name": "Тяжелый арбалет",
+          "attack_bonus": 3,
+          "damage_dice_count": 1,
+          "damage_dice_type": "d10",
+          "damage_modifier": 1,
+          "damage_type": "колющий",
+          "range_ft": 100
+        }
+      ],
+      "speed": 30,
+      "regen": 0
+    },
+    "Земляной элементаль—Бестиарий": {
+      "hp": 126,
+      "ac": 17,
+      "attacks": [
+        {
+          "name": "Размашистый удар",
+          "attack_bonus": 8,
+          "damage_dice_count": 2,
+          "damage_dice_type": "d8",
+          "damage_modifier": 5,
+          "damage_type": "дробящий",
+          "range_ft": 10
+        }
+      ],
+      "speed": 30,
+      "regen": 0
+    },
+    "Спектр—Бестиарий": {
+      "hp": 22,
+      "ac": 12,
+      "attacks": [
+        {
+          "name": "ст обладает следующими вариантами действий вместо Вытягивания жизни: Силовой удар",
+          "attack_bonus": 4,
+          "damage_dice_count": 3,
+          "damage_dice_type": "d6",
+          "damage_modifier": 0,
+          "damage_type": "силовое поле",
+          "range_ft": 5
+        }
+      ],
+      "speed": 0,
+      "regen": 0
+    },
+    "Чёрная слизь—Бестиарий": {
+      "hp": 85,
+      "ac": 7,
+      "attacks": [
+        {
+          "name": "ДействияЛожноножка",
+          "attack_bonus": 5,
+          "damage_dice_count": 1,
+          "damage_dice_type": "d6",
+          "damage_modifier": 3,
+          "damage_type": "дробящий",
+          "range_ft": 5
+        }
+      ],
+      "speed": 20,
+      "regen": 0
+    },
+    "Серая слизь—Бестиарий": {
+      "hp": 22,
+      "ac": 8,
+      "attacks": [
+        {
+          "name": "ДействияЛожноножка",
+          "attack_bonus": 3,
+          "damage_dice_count": 1,
+          "damage_dice_type": "d6",
+          "damage_modifier": 1,
+          "damage_type": "дробящий",
+          "range_ft": 5
+        }
+      ],
+      "speed": 10,
+      "regen": 0
+    },
+    "Золотистый студень—Бестиарий": {
+      "hp": 45,
+      "ac": 8,
+      "attacks": [
+        {
+          "name": "ДействияЛожноножка",
+          "attack_bonus": 4,
+          "damage_dice_count": 2,
+          "damage_dice_type": "d6",
+          "damage_modifier": 2,
+          "damage_type": "дробящий",
+          "range_ft": 5
+        }
+      ],
+      "speed": 10,
+      "regen": 0
+    },
+    "Студенистый куб—Бестиарий": {
+      "hp": 84,
+      "ac": 6,
+      "attacks": [
+        {
+          "name": "ДействияЛожноножка",
+          "attack_bonus": 4,
+          "damage_dice_count": 3,
+          "damage_dice_type": "d6",
+          "damage_modifier": 0,
+          "damage_type": "кислотный",
+          "range_ft": 5
+        }
+      ],
+      "speed": 15,
+      "regen": 0
+    }
+  },
+  "alliance_settings": [],
+  "ignore_sides": {}
+}
