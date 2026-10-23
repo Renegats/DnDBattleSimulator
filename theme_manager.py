@@ -2,7 +2,7 @@ import json
 import os
 import tkinter as tk
 from tkinter import ttk
-from ui_components import RoundedButton
+from ui_components import RoundedButton, EditableLabel
 
 THEME_FILE = os.path.join('battle_settings', 'theme.json')
 
@@ -171,6 +171,8 @@ class ThemeUI:
                     w.configure(bg=p['border'])
                 elif w is getattr(self, 'sub_caption', None):
                     w.configure(bg=p['bg_secondary'], fg=p['fg_muted'])
+                if isinstance(w, EditableLabel):
+                    w.apply_palette(p)
                 elif isinstance(w, RoundedButton):
                     w.apply_palette(p)
                 elif cls == 'Canvas':

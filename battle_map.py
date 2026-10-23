@@ -164,12 +164,30 @@ class BattleMap:
         return rebuild(best_cell)
 
     def move_towards(self, enemy, target, max_ft, reach_ft=5):
-        """Умное движение: BFS-маршрут в обход союзников до ближайшей клетки атаки"""
+        """Умное движение: BFS-маршрут в обход союзников до клетки атаки.
+        Если путь намертво заблокирован толпой - делает случайный 'дрейф'-шаг,
+        чтобы пробка понемногу рассасывалась, а не стояла насмерть."""
         steps = max_ft // 5
-        reach_steps = max(1, reach_ft // 5)  # рукопашка 5 фт = соседняя клетка
+        reach_steps = max(1, reach_ft // 5)
         path = self.find_path(enemy, target, steps, reach_steps)
         if path:
             self.place(enemy, path[-1][0], path[-1][1])
+            return
+        # Путь не найден - ерзаем в случайную свободную соседнюю клетку (анти-пробка)
+        pos = self.get_pos(enemy)
+        if not pos:
+            return
+        x, y = pos
+        free = []
+        for dx in (-1, 0, 1):
+            for dy in (-1, 0, 1):
+                if dx == 0 and dy == 0:
+                    continue
+                if self.cell_free(x + dx, y + dy, ignore_id=id(enemy)):
+                    free.append((x + dx, y + dy))
+        if free:
+            nx, ny = random.choice(free)
+            self.place(enemy, nx, ny)
 
 
 class BattleMapUI:

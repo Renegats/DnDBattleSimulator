@@ -1,7 +1,7 @@
 import tkinter as tk
 from tkinter import ttk, messagebox
 from entities import Attack, Enemy
-from ui_components import ScrollableFrame, fit_window_to_screen
+from ui_components import ScrollableFrame, fit_window_to_screen, EditableLabel
 from battle_ui import BattleUI
 from battle_logic import BattleLogic
 from alliance_ui import AllianceUI
@@ -10,6 +10,7 @@ from factory import EnemyFactory
 from battle_strategies import AggressiveStrategy, DefensiveStrategy, RandomStrategy, SupportStrategy
 from battle_map import BattleMapUI, BattleMap
 from theme_manager import ThemeManager, ThemeUI
+from side_creator import SideCreatorDialog
 
 
 class BattleSimulator(BattleUI, BattleLogic, AllianceUI, SettingsUI, BattleMapUI, ThemeUI):
@@ -37,7 +38,11 @@ class BattleSimulator(BattleUI, BattleLogic, AllianceUI, SettingsUI, BattleMapUI
         self.ignore_sides = {}
         self.enemy_types = ["обычный", "гоблин", "орк", "скелет", "тролль", "гном", "эльф", "дротик"]
         self.strategy_types = ["случайная", "агрессивная", "защитная", "поддержка"]
-        self.army_frames = []
+        self.side_army_types = []
+        self.side_strategy_vars = []
+        self.side_type_labels = []
+        self.side_cols = 3
+        self.MAX_SIDES = 26
 
         self.setup_ui()
 
@@ -77,13 +82,7 @@ class BattleSimulator(BattleUI, BattleLogic, AllianceUI, SettingsUI, BattleMapUI
         self.setup_scroll_frame = setup_scroll_frame
 
         # Количество сторон
-        ttk.Label(setup_scroll_frame.scrollable_frame, text="Количество сторон:",
-                  font=('Arial', 10, 'bold')).pack(anchor='w', pady=10)
-        side_frame = ttk.Frame(setup_scroll_frame.scrollable_frame)
-        side_frame.pack(fill='x', pady=5)
         self.num_sides_var = tk.IntVar(value=2)
-        ttk.Spinbox(side_frame, from_=2, to=self.MAX_SIDES, textvariable=self.num_sides_var, width=10,
-                    command=self.on_num_sides_changed).pack(side='left')
 
         # Контейнер карточек сторон (сами карточки создаются по требованию!)
         self.side_frames = []
@@ -92,48 +91,17 @@ class BattleSimulator(BattleUI, BattleLogic, AllianceUI, SettingsUI, BattleMapUI
         sides_container = ttk.Frame(setup_scroll_frame.scrollable_frame)
         sides_container.pack(fill='x', pady=10)
         self.sides_container = sides_container
-        for i in range(3):
-            sides_container.grid_columnconfigure(i, weight=1)
-
-        # Настройка типов армий и тактик
-        ttk.Label(setup_scroll_frame.scrollable_frame,
-                  text="=== Настройка типов армий и тактик ===",
-                  font=('Arial', 12, 'bold')).pack(anchor='w', pady=10)
-
-        types_frame = ttk.Frame(setup_scroll_frame.scrollable_frame)
-        types_frame.pack(fill='x', pady=5)
-
-        header_frame = ttk.Frame(types_frame)
-        header_frame.grid(row=0, column=0, columnspan=3, sticky='ew', pady=5)
-        ttk.Label(header_frame, text="Сторона", font=('Arial', 10, 'bold'), width=15).grid(row=0, column=0, padx=5)
-        ttk.Label(header_frame, text="Тип армии", font=('Arial', 10, 'bold'), width=20).grid(row=0, column=1, padx=5)
-        ttk.Label(header_frame, text="Тактика", font=('Arial', 10, 'bold'), width=20).grid(row=0, column=2, padx=5)
-
-        self.army_type_vars = []
-        self.strategy_type_vars = []
-
-        for i in range(2):
-            side_frame = ttk.Frame(types_frame)
-            side_frame.grid(row=i + 1, column=0, columnspan=3, sticky='ew', pady=2)
-
-            ttk.Label(side_frame, text=f"Сторона {chr(65 + i)}", width=15).grid(row=0, column=0, padx=5)
-
-            army_type_var = tk.StringVar(value=self.enemy_types[0])
-            army_type_combo = ttk.Combobox(side_frame, textvariable=army_type_var,
-                                           values=self.enemy_types, width=18, state="readonly")
-            army_type_combo.grid(row=0, column=1, padx=5)
-            self.army_type_vars.append(army_type_var)
-
-            strategy_type_var = tk.StringVar(value=self.strategy_types[0])
-            strategy_type_combo = ttk.Combobox(side_frame, textvariable=strategy_type_var,
-                                               values=self.strategy_types, width=18, state="readonly")
-            strategy_type_combo.grid(row=0, column=2, padx=5)
-            self.strategy_type_vars.append(strategy_type_var)
-
-            self.army_frames.append(side_frame)
-
-        self.types_frame = types_frame
-        self.num_sides_var.trace_add("write", lambda *args: self.on_num_sides_changed())
+        for i in range(8):
+            sides_container.grid_columnconfigure(i, weight=1 if i < 3 else 0)
+        self.side_cols = 3
+        sides_container.bind('<Configure>', self.relayout_sides)
+        # Круглая кнопка-плюс: добавляет новую сторону в следующий свободный слот
+        from ui_components import RoundedButton
+        self.add_side_btn = RoundedButton(sides_container, icon='plus',
+                                          palette=self.theme_manager.palette(),
+                                          command=self.add_side,
+                                          width=44, height=44, radius=22,
+                                          outline=True, surface_key='bg')
 
         ttk.Button(setup_scroll_frame.scrollable_frame, text="Создать армии",
                    command=self.create_armies).pack(pady=20)
@@ -157,7 +125,6 @@ class BattleSimulator(BattleUI, BattleLogic, AllianceUI, SettingsUI, BattleMapUI
             self.setup_frame: [
                 ("Сохранить настройки", self.save_settings),
                 ("Загрузить настройки", self.load_settings),
-                ("Импортировать из бестиария", self.open_bestiary_import),
             ],
             self.battle_frame: [],
             self.alliance_frame: [],
@@ -165,10 +132,7 @@ class BattleSimulator(BattleUI, BattleLogic, AllianceUI, SettingsUI, BattleMapUI
         }
 
         self._build_nav()
-        self._build_nav()
-
-        # Первоначальное обновление интерфейса
-        self.update_sides_ui()
+        self.update_sides_layout()
 
     def _build_nav(self):
         """Создаёт закруглённые кнопки навигации по центру верхней панели"""
@@ -217,97 +181,93 @@ class BattleSimulator(BattleUI, BattleLogic, AllianceUI, SettingsUI, BattleMapUI
         """Имя стороны: A-Z, а дальше цифрами"""
         return chr(65 + i) if i < 26 else str(i + 1)
 
-    def create_side_card(self, i):
-        """Создаёт карточку стороны номер i по требованию"""
-        frame = ttk.LabelFrame(self.sides_container, text=f"Сторона {self.side_letter(i)}")
-        frame.grid(row=i // 3, column=i % 3, padx=5, pady=5, sticky='ew')
+    def create_side_card(self, i, army_type, strategy):
+        """Карточка стороны: имя-заголовок + состав + тактика + количество + крестик удаления"""
+        frame = ttk.LabelFrame(self.sides_container, text="")
+        frame.grid(row=i // self.side_cols, column=i % self.side_cols, padx=5, pady=5, sticky='ew')
 
-        ttk.Label(frame, text="Название стороны:").grid(row=0, column=0, sticky='w')
         name_var = tk.StringVar(value=f"Сторона {self.side_letter(i)}")
-        name_entry = ttk.Entry(frame, textvariable=name_var, width=15)
-        name_entry.grid(row=0, column=1, padx=5)
+        title = EditableLabel(frame, name_var, palette=self.theme_manager.palette())
+        title.grid(row=0, column=0, columnspan=2, sticky='w', padx=6, pady=(4, 2))
+        cross = ttk.Label(frame, text="✕", cursor="hand2",
+                          foreground=self.theme_manager.palette()['fg_muted'],
+                          font=('Segoe UI', 10, 'bold'))
+        cross.grid(row=0, column=2, padx=(0, 6), pady=(4, 0), sticky='e')
+        cross.bind('<Button-1>', lambda e, f=frame, w=cross: self._show_delete_confirm(w, f))
+        cross.bind('<Enter>', lambda e, w=cross: w.configure(foreground='#e74c3c'))
+        cross.bind('<Leave>', lambda e, w=cross: w.configure(
+            foreground=self.theme_manager.palette()['fg_muted']))
 
-        ttk.Label(frame, text="Количество врагов:").grid(row=1, column=0, sticky='w', pady=5)
-        count_var = tk.IntVar(value=5 if i < 2 else 0)
-        count_spin = ttk.Spinbox(frame, from_=0, to=500, textvariable=count_var, width=10)
-        count_spin.grid(row=1, column=1, padx=5, pady=5)
+        # Состав: read-only лейбл + кнопка смены (индекс ищем по frame в момент клика!)
+        ttk.Label(frame, text="Состав:").grid(row=1, column=0, sticky='w', pady=2)
+        type_lbl = ttk.Label(frame, text=army_type,
+                             foreground=self.theme_manager.palette()['accent'])
+        type_lbl.grid(row=1, column=1, sticky='w', padx=5)
+        ttk.Button(frame, text="🔄", width=3,
+                   command=lambda f=frame: self.change_side_composition(
+                       self.side_frames.index(f))).grid(row=1, column=2, padx=2)
+
+        ttk.Label(frame, text="Тактика:").grid(row=2, column=0, sticky='w', pady=2)
+        strat_var = tk.StringVar(value=strategy)
+        ttk.Combobox(frame, textvariable=strat_var, values=self.strategy_types,
+                     width=16, state="readonly").grid(row=2, column=1, padx=5, pady=2)
+
+        ttk.Label(frame, text="Количество врагов:").grid(row=3, column=0, sticky='w', pady=2)
+        count_var = tk.IntVar(value=5)
+        ttk.Spinbox(frame, from_=0, to=500, textvariable=count_var, width=10).grid(
+            row=3, column=1, padx=5, pady=2)
 
         self.side_frames.append(frame)
         self.side_name_vars.append(name_var)
+        self.side_army_types.append(army_type)
+        self.side_strategy_vars.append(strat_var)
+        self.side_type_labels.append(type_lbl)
         self.side_count_vars.append(count_var)
 
-        # Колёсико крутит вкладку, даже когда курсор над карточкой!
-        for w in (frame, name_entry, count_spin):
+        for w in (frame, title, title.label, title.entry):
             w.bind("<MouseWheel>", self.setup_scroll_frame._on_mousewheel)
 
-    def open_bestiary_import(self):
-        """Открывает окно импорта из бестиария"""
+    def change_side_composition(self, i):
+        SideCreatorDialog(self, mode='edit', current_type=self.side_army_types[i],
+                          on_result=lambda d: self._apply_type(i, d['army_type'], d['strategy']))
+
+    def _create_new_side(self, army_type, strategy, name=None, count=None):
+        i = len(self.side_frames)
+        self.create_side_card(i, army_type, strategy)
+        if name is not None: self.side_name_vars[i].set(name)
+        if count is not None: self.side_count_vars[i].set(count)
+        self.num_sides_var.set(i + 1)
+        self.update_sides_layout()
+
+    def _apply_type(self, i, army_type, strategy):
+        self.side_army_types[i] = army_type
+        self.side_type_labels[i].configure(text=army_type)
+        self.side_strategy_vars[i].set(strategy)
+
+    def launch_bestiary_import(self, on_imported, on_cancel=None):
+        """Точка входа для диалога: открывает импортёр и отдаёт ему колбэки успеха/отмены."""
         try:
             from bestiary_importer import BestiaryImporter
         except ImportError:
-            messagebox.showerror("Ошибка",
-                                 "Файл bestiary_importer.py не найден!\n"
-                                 "Убедитесь, что он создан в папке проекта.")
+            messagebox.showerror("Ошибка", "Файл bestiary_importer.py не найден!")
+            if on_cancel:
+                on_cancel()  # чтобы диалог-родитель не остался спрятанным
             return
+        BestiaryImporter(self.root, self,
+                         on_imported=on_imported,
+                         on_cancel=on_cancel).open_import_window()
 
-        importer = BestiaryImporter(self.root, self)
-        importer.open_import_window()
-
-    def update_sides_ui(self):
-        try:
-            num_sides = self.num_sides_var.get()
-        except (tk.TclError, ValueError):
-            return
-        while len(self.side_frames) < num_sides:
-            self.create_side_card(len(self.side_frames))
+    def update_sides_layout(self):
+        """Только переставляет существующие карточки + плюсик по текущей сетке."""
+        cols = self.side_cols
+        n = len(self.side_frames)
         for i, frame in enumerate(self.side_frames):
-            if i < num_sides:
-                frame.grid()
+            frame.grid(row=i // cols, column=i % cols, padx=5, pady=5, sticky='ew')
+        if hasattr(self, 'add_side_btn'):
+            if n < self.MAX_SIDES:
+                self.add_side_btn.grid(row=n // cols, column=n % cols, padx=5, pady=5)
             else:
-                frame.grid_remove()
-
-    def on_num_sides_changed(self):
-        try:
-            num = self.num_sides_var.get()
-        except (tk.TclError, ValueError):
-            return
-        num = max(2, min(self.MAX_SIDES, num))
-        if num != self.num_sides_var.get():
-            self.num_sides_var.set(num)
-            return
-        self.update_sides_ui()
-        self.update_types_ui()
-
-    def update_types_ui(self):
-        """Обновление отображения типов армий и тактик при изменении количества сторон"""
-        num_sides = self.num_sides_var.get()
-
-        while len(self.army_frames) < num_sides:
-            i = len(self.army_frames)
-            side_frame = ttk.Frame(self.types_frame)
-            side_frame.grid(row=i + 1, column=0, columnspan=3, sticky='ew', pady=2)
-
-            ttk.Label(side_frame, text=f"Сторона {self.side_letter(i)}", width=15).grid(row=0, column=0, padx=5)
-
-            army_type_var = tk.StringVar(value=self.enemy_types[0])
-            army_type_combo = ttk.Combobox(side_frame, textvariable=army_type_var,
-                                           values=self.enemy_types, width=18, state="readonly")
-            army_type_combo.grid(row=0, column=1, padx=5)
-            self.army_type_vars.append(army_type_var)
-
-            strategy_type_var = tk.StringVar(value=self.strategy_types[0])
-            strategy_type_combo = ttk.Combobox(side_frame, textvariable=strategy_type_var,
-                                               values=self.strategy_types, width=18, state="readonly")
-            strategy_type_combo.grid(row=0, column=2, padx=5)
-            self.strategy_type_vars.append(strategy_type_var)
-
-            self.army_frames.append(side_frame)
-
-        for i, frame in enumerate(self.army_frames):
-            if i < self.num_sides_var.get():
-                frame.grid()
-            else:
-                frame.grid_remove()
+                self.add_side_btn.grid_remove()
 
     def create_armies(self):
         """Создание армий на основе текущих настроек"""
@@ -321,8 +281,8 @@ class BattleSimulator(BattleUI, BattleLogic, AllianceUI, SettingsUI, BattleMapUI
             for i in range(num_sides):
                 side_name = self.side_name_vars[i].get()
                 enemy_count = self.side_count_vars[i].get()
-                army_type = self.army_type_vars[i].get()
-                strategy_type = self.strategy_type_vars[i].get()
+                army_type = self.side_army_types[i]
+                strategy_type = self.side_strategy_vars[i].get()
 
                 self.side_names.append(side_name)
                 side_enemies = []
@@ -361,3 +321,80 @@ class BattleSimulator(BattleUI, BattleLogic, AllianceUI, SettingsUI, BattleMapUI
             messagebox.showinfo("Успех", f"Армии созданы!\nКоличество сторон: {num_sides}")
         except Exception as e:
             messagebox.showerror("Ошибка", f"Ошибка при создании армий: {str(e)}")
+
+    def add_side(self):
+        SideCreatorDialog(self, mode='create',
+                          on_result=lambda d: self._create_new_side(d['army_type'], d['strategy']))
+
+    def _show_delete_confirm(self, anchor_widget, frame):
+        """Вскакивающая плашка 'Точно удалить?' прямо поверх карточки (без grab, без Toplevel!)."""
+        # Если где-то уже висит открытая плашка - сначала закрываем её
+        if getattr(self, '_confirm_popover', None) is not None:
+            try:
+                self._confirm_popover.destroy()
+            except tk.TclError:
+                pass
+            self._confirm_popover = None
+
+        p = self.theme_manager.palette()
+        parent = self.setup_scroll_frame.scrollable_frame   # большой контейнер - плашку не обрежет
+
+        pop = tk.Frame(parent, bg=p['field_bg'], highlightbackground=p['border'],
+                       highlightthickness=1)
+        tk.Label(pop, text="Удалить отряд?", bg=p['field_bg'], fg=p['fg'],
+                 font=('Segoe UI', 9, 'bold')).pack(padx=10, pady=(8, 2))
+        btns = tk.Frame(pop, bg=p['field_bg']); btns.pack(pady=(0, 8))
+
+        def close():
+            nonlocal pop
+            try:
+                pop.destroy()
+            except tk.TclError:
+                pass
+            if getattr(self, '_confirm_popover', None) is pop:
+                self._confirm_popover = None
+
+        def yes():
+            close()
+            self.remove_side_by_frame(frame)
+
+        tk.Button(btns, text="✓ Да", command=yes, bd=0, cursor='hand2',
+                  bg='#e74c3c', fg='white', activebackground='#c0392b',
+                  activeforeground='white', font=('Segoe UI', 8, 'bold'),
+                  padx=8, pady=1).pack(side='left', padx=(0, 4))
+        tk.Button(btns, text="✕ Нет", command=close, bd=0, cursor='hand2',
+                  bg=p['button_bg'], fg=p['button_fg'], activebackground=p['hover'],
+                  font=('Segoe UI', 8, 'bold'), padx=8, pady=1).pack(side='left')
+
+        px = anchor_widget.winfo_rootx() + anchor_widget.winfo_width() - parent.winfo_rootx()
+        py = anchor_widget.winfo_rooty() + anchor_widget.winfo_height() - parent.winfo_rooty()
+        pop.place(x=px, y=py, anchor='ne')
+        pop.lift()
+        self._confirm_popover = pop
+
+    def remove_side_by_frame(self, frame):
+        """Удаляет сторону по объекту карточки: чистит ВСЕ параллельные списки и переставляет сетку."""
+        try:
+            idx = self.side_frames.index(frame)
+        except ValueError:
+            return
+        frame.destroy()
+        for lst in (self.side_frames, self.side_name_vars, self.side_count_vars,
+                    self.side_army_types, self.side_strategy_vars, self.side_type_labels):
+            del lst[idx]
+        # Синхронизируем внутренний счётчик (create_armies читает именно его)
+        self.num_sides_var.set(len(self.side_frames))
+        self.update_sides_layout()   # плюсик перепрыгнет на освободившееся место
+
+    def relayout_sides(self, event=None):
+        """Умная сетка: количество карточек в ряду подстраивается под ширину окна"""
+        width = self.sides_container.winfo_width()
+        if width < 100:
+            return
+        cols = max(1, min(8, width // 300))  # одной карточке нужно ~300 px
+        if cols == self.side_cols:
+            return
+        self.side_cols = cols
+        for i in range(8):
+            self.sides_container.grid_columnconfigure(i, weight=1 if i < cols else 0)
+        self.update_sides_layout()

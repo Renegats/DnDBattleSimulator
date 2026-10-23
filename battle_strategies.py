@@ -24,7 +24,8 @@ def damage_score(a):
 
 
 class BattleStrategy(ABC):
-    """Абстрактный класс для стратегий поведения врагов в бою"""
+    """Абстрактная стратегия. Общие хелперы сбора целей и учёта дистанции."""
+
     @abstractmethod
     def select_target(self, attacker, all_sides, ignore_sides):
         pass
@@ -33,33 +34,56 @@ class BattleStrategy(ABC):
     def select_attack(self, attacker, target):
         pass
 
+    # ---------- общие хелперы ----------
+    def _collect_enemies(self, attacker, all_sides, ignore_sides):
+        """Живые враги attacker'a с учётом игнорируемых сторон."""
+        enemies = []
+        for side_idx, side_enemies in enumerate(all_sides):
+            if side_idx == attacker.side:
+                continue
+            if side_idx in ignore_sides or side_idx in attacker.ignore_sides:
+                continue
+            enemies.extend([e for e in side_enemies if e.alive])
+        return enemies
+
+    def _pick_target(self, attacker, candidates, prefer_key):
+        """Умный выбор цели в THREE приоритетах:
+        1) враг в радиусе оружия -> бей прямо сейчас, не двигаясь;
+        2) враг в радиусе (оружие + скорость) -> подойди и ударь;
+        3) никого вокруг -> беги к ближайшему (а не к 'идеальному' через всю карту).
+        Без карты distance=0 для всех -> приоритет 1 = все -> как раньше."""
+        if not candidates:
+            return None
+        max_range = max((getattr(a, 'range_ft', 5) for a in attacker.attacks), default=5)
+        speed = getattr(attacker, 'speed', 30)
+        d = lambda e: distance_ft_between(attacker, e)
+
+        tier1 = [e for e in candidates if d(e) <= max_range]          # ударь на месте
+        if tier1:
+            return prefer_key(tier1)
+        tier2 = [e for e in candidates if d(e) <= max_range + speed]  # подойди и ударь
+        if tier2:
+            return prefer_key(tier2)
+        return min(candidates, key=d)                                 # беги к ближайшему
 
 class AggressiveStrategy(BattleStrategy):
-    """Агрессивная стратегия - атакует самого слабого врага"""
+    """Агрессивная - бьёт самого слабого ИЗ ДОСТУПНЫХ, иначе бежит к ближайшему."""
     def select_target(self, attacker, all_sides, ignore_sides):
-        potential_targets = []
-        for side_idx, side_enemies in enumerate(all_sides):
-            if side_idx != attacker.side and side_idx not in ignore_sides and side_idx not in attacker.ignore_sides:
-                potential_targets.extend([e for e in side_enemies if e.alive])
-        if not potential_targets:
-            return None
-        return min(potential_targets, key=lambda e: e.hp)
+        enemies = self._collect_enemies(attacker, all_sides, ignore_sides)
+        return self._pick_target(attacker, enemies,
+                                 lambda pool: min(pool, key=lambda e: e.hp))
 
     def select_attack(self, attacker, target):
-        # Бьём тем, что ДОСТАЁТ: вблизи меч, издалека лук!
         return max(reachable_attacks(attacker, target), key=damage_score)
 
 
 class DefensiveStrategy(BattleStrategy):
-    """Защитная стратегия - атакует самого опасного врага"""
+    """Защитная - нейтрализует самого опасного ИЗ ДОСТУПНЫХ."""
     def select_target(self, attacker, all_sides, ignore_sides):
-        potential_targets = []
-        for side_idx, side_enemies in enumerate(all_sides):
-            if side_idx != attacker.side and side_idx not in ignore_sides and side_idx not in attacker.ignore_sides:
-                potential_targets.extend([e for e in side_enemies if e.alive])
-        if not potential_targets:
-            return None
-        return max(potential_targets, key=lambda e: max((a.attack_bonus for a in e.attacks), default=0))
+        enemies = self._collect_enemies(attacker, all_sides, ignore_sides)
+        return self._pick_target(attacker, enemies,
+                                 lambda pool: max(pool, key=lambda e:
+                                                  max((a.attack_bonus for a in e.attacks), default=0)))
 
     def select_attack(self, attacker, target):
         if not attacker.attacks:
@@ -68,15 +92,10 @@ class DefensiveStrategy(BattleStrategy):
 
 
 class RandomStrategy(BattleStrategy):
-    """Случайная стратегия - выбирает случайную цель и атаку"""
+    """Случайная - случайная цель из доступных (или ближайшая, если вокруг пусто)."""
     def select_target(self, attacker, all_sides, ignore_sides):
-        potential_targets = []
-        for side_idx, side_enemies in enumerate(all_sides):
-            if side_idx != attacker.side and side_idx not in ignore_sides and side_idx not in attacker.ignore_sides:
-                potential_targets.extend([e for e in side_enemies if e.alive])
-        if not potential_targets:
-            return None
-        return random.choice(potential_targets)
+        enemies = self._collect_enemies(attacker, all_sides, ignore_sides)
+        return self._pick_target(attacker, enemies, lambda pool: random.choice(pool))
 
     def select_attack(self, attacker, target):
         if not attacker.attacks:
@@ -85,29 +104,29 @@ class RandomStrategy(BattleStrategy):
 
 
 class SupportStrategy(BattleStrategy):
-    """Тактика поддержки - сначала лечит союзников, затем атакует"""
+    """Поддержка - лечит самого раненого СОЮЗНИКА из доступных, иначе бьёт врага."""
     def select_target(self, attacker, all_sides, ignore_sides):
-        healing_targets = []
+        # Сначала раненые союзники (тоже с учётом дистанции - лекарь подбегает к ближнему)
+        allies = []
         for side_idx, side_enemies in enumerate(all_sides):
             if side_idx == attacker.side and side_idx not in ignore_sides:
-                healing_targets.extend([e for e in side_enemies if e.alive and e.hp < e.max_hp * 0.7])
-        if healing_targets:
-            return min(healing_targets, key=lambda e: e.hp / e.max_hp)
-        potential_targets = []
-        for side_idx, side_enemies in enumerate(all_sides):
-            if side_idx != attacker.side and side_idx not in ignore_sides and side_idx not in attacker.ignore_sides:
-                potential_targets.extend([e for e in side_enemies if e.alive])
-        if not potential_targets:
-            return None
-        return min(potential_targets, key=lambda e: e.hp)
+                allies.extend([e for e in side_enemies
+                               if e.alive and e.hp < e.max_hp * 0.7])
+        if allies:
+            return self._pick_target(attacker, allies,
+                                     lambda pool: min(pool, key=lambda e: e.hp / e.max_hp))
+        # Союзников лечить некого - атакуем врага по правилам агрессора
+        enemies = self._collect_enemies(attacker, all_sides, ignore_sides)
+        return self._pick_target(attacker, enemies,
+                                 lambda pool: min(pool, key=lambda e: e.hp))
 
     def select_attack(self, attacker, target):
         if not attacker.attacks:
             return None
         if target.side == attacker.side:
-            healing_attacks = [a for a in attacker.attacks if
-                               "лечение" in a.name.lower() or "heal" in a.name.lower()
-                               or "восстановление" in a.name.lower()]
-            if healing_attacks:
-                return healing_attacks[0]
+            healing = [a for a in attacker.attacks if
+                       "лечение" in a.name.lower() or "heal" in a.name.lower()
+                       or "восстановление" in a.name.lower()]
+            if healing:
+                return healing[0]
         return max(reachable_attacks(attacker, target), key=damage_score)

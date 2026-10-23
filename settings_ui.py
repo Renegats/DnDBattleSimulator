@@ -38,8 +38,8 @@ class SettingsUI:
                     current_alliance_settings.append(row_settings)
 
             # Сохраняем типы армий и стратегии
-            army_types = [var.get() for var in self.army_type_vars[:self.num_sides_var.get()]]
-            strategy_types = [var.get() for var in self.strategy_type_vars[:self.num_sides_var.get()]]
+            army_types = list(self.side_army_types[:self.num_sides_var.get()])
+            strategy_types = [v.get() for v in self.side_strategy_vars[:self.num_sides_var.get()]]
 
             from factory import EnemyFactory
             custom_types_snapshot = dict(getattr(EnemyFactory, 'CUSTOM_TYPES', {}))
@@ -64,7 +64,7 @@ class SettingsUI:
             messagebox.showerror("Ошибка", f"Ошибка при сохранении: {str(e)}")
 
     def load_settings(self):
-        """Загрузка настроек из файла"""
+        """Загрузка настроек из файла (под новую архитектуру карточек сторон)"""
         try:
             filename = filedialog.askopenfilename(
                 title="Выберите файл настроек",
@@ -77,60 +77,42 @@ class SettingsUI:
             with open(filename, 'r', encoding='utf-8') as f:
                 settings = json.load(f)
 
-            # Применение настроек
-            self.num_sides_var.set(settings['num_sides'])
-            self.update_sides_ui()
-            self.update_types_ui()
-
-            for i in range(len(self.side_name_vars)):
-                if i < len(settings.get('side_names', [])):
-                    self.side_name_vars[i].set(settings['side_names'][i])
-                if i < len(settings.get('side_counts', [])):
-                    self.side_count_vars[i].set(settings['side_counts'][i])
-
-            # восстанавливаем импортированных монстров ДО создания армий!
             from factory import EnemyFactory
             if not hasattr(EnemyFactory, 'CUSTOM_TYPES'):
                 EnemyFactory.CUSTOM_TYPES = {}
-
-            restored_custom = settings.get('custom_types', {})
-            for type_name, type_data in restored_custom.items():
+            for type_name, type_data in settings.get('custom_types', {}).items():
                 EnemyFactory.CUSTOM_TYPES[type_name] = type_data
-                # Добавляем имя типа в список, чтобы он появился во всех combobox!
                 if type_name not in self.enemy_types:
                     self.enemy_types.append(type_name)
 
-            # Обновляем значения во всех существующих combobox
-            for combo in self.army_type_vars:
-                current_value = combo.get()
-                combo.set('')  # сбрасываем
-                combo.set(current_value)  # и восстанавливаем (теперь тип есть в списке!)
+            for frame in self.side_frames:
+                frame.destroy()
+            for lst in (self.side_frames, self.side_name_vars, self.side_count_vars,
+                        self.side_army_types, self.side_strategy_vars, self.side_type_labels):
+                lst.clear()
 
-            # Загрузка типов армий и стратегий
-            if 'army_types' in settings:
-                for i, army_type in enumerate(settings['army_types']):
-                    if i < len(self.army_type_vars):
-                        self.army_type_vars[i].set(army_type)
 
-            if 'strategy_types' in settings:
-                for i, strategy_type in enumerate(settings['strategy_types']):
-                    if i < len(self.strategy_type_vars):
-                        self.strategy_type_vars[i].set(strategy_type)
+            saved_names   = settings.get('side_names', [])
+            saved_counts  = settings.get('side_counts', [])
+            saved_types   = settings.get('army_types', [])
+            saved_strats  = settings.get('strategy_types', [])
+            num_sides     = int(settings.get('num_sides', 0))
 
-            # Загрузка настроек альянсов если они существуют
+            for i in range(num_sides):
+                army_type = saved_types[i] if i < len(saved_types) else self.enemy_types[0]
+                strategy  = saved_strats[i] if i < len(saved_strats) else self.strategy_types[0]
+                name      = saved_names[i] if i < len(saved_names) else None
+                count     = saved_counts[i] if i < len(saved_counts) else None
+                self._create_new_side(army_type, strategy, name=name, count=count)
+
+            # Синхронизируем внутренний счётчик сторон (нужен вкладке альянсов позже).
+            self.num_sides = num_sides
+
             if 'alliance_settings' in settings:
                 self.alliance_settings = settings['alliance_settings']
-
-            # Загрузка глобальных настроек игнорирования
             if 'ignore_sides' in settings:
                 self.ignore_sides = {int(k): set(v) for k, v in settings['ignore_sides'].items()}
-            # Обновляем список значений во всех combobox-ах армий
-            for var in self.army_type_vars:
-                # Ищем combobox через родительский виджет
-                for child in self.types_frame.winfo_children():
-                    for widget in child.winfo_children():
-                        if isinstance(widget, ttk.Combobox) and widget.cget('textvariable') == var:
-                            widget.config(values=self.enemy_types)
-            messagebox.showinfo("Успех", "Настройки загружены!")
+
+            messagebox.showinfo("Успех", f"Настройки загружены!\nСторон восстановлено: {num_sides}")
         except Exception as e:
             messagebox.showerror("Ошибка", f"Ошибка при загрузке: {str(e)}")

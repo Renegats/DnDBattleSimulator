@@ -60,27 +60,27 @@ class Enemy(Subject):
         self.ignore_sides = set()
         self.strategy: BattleStrategy = RandomStrategy()
         self.regen = regen
-        self.speed = speed  # скорость в футах (5 фт = 1 клетка)
-        self.pos = None  # позиция на карте (x, y) или None
-        self.moved_ft = 0  # потрачено футов перемещения за раунд
+        self.speed = speed          # скорость в футах (5 фт = 1 клетка)
+        self.pos = None             # позиция на карте (x, y) или None
+        self.moved_ft = 0           # потрачено футов перемещения за раунд
+        self.multiattack = None     # список ударов [{'attack': имя, 'count': n}] или None
 
     def take_damage(self, damage: int):
-        """Нанесение урона врагу"""
+        """Нанесение урона врага"""
         actual_damage = max(0, damage)  # Урон не может быть отрицательным
         previous_hp = self.hp
         self.hp -= actual_damage
         if self.hp <= 0:
             self.alive = False
             self.hp = 0
-            self.notify()  # Оповещаем наблюдателей об изменении состояния
+            self.notify()           # Оповещаем наблюдателей об изменении состояния
             return False
         elif self.hp != previous_hp:
-            self.notify()  # Оповещаем наблюдателей об изменении состояния
+            self.notify()           # Оповещаем наблюдателей об изменении состояния
 
         return self.alive
 
     def perform_attack(self, attack: Attack, target_ac: int) -> Tuple[bool, int, int, bool, str]:
-        """Выполнение атаки на цель"""
         attack_roll = random.randint(1, 20)
         total_attack = attack_roll + attack.attack_bonus
         critical = (attack_roll == 20)  # Критическое попадание при 20
@@ -106,7 +106,7 @@ class Enemy(Subject):
             prev_hp = self.hp
             self.hp = min(self.max_hp, self.hp + self.regen)
             if self.hp != prev_hp:
-                self.notify()  # Оповещаем об изменении здоровья
+                self.notify()       # Оповещаем об изменении здоровья
 
     def to_dict(self):
         """Преобразует объект врага в словарь для сохранения"""
@@ -121,7 +121,9 @@ class Enemy(Subject):
             'ignore_sides': list(self.ignore_sides),
             'strategy_type': self.strategy.__class__.__name__,
             'regen': self.regen,
-            'speed': self.speed, 'pos': self.pos
+            'speed': self.speed,
+            'pos': self.pos,
+            'multiattack': self.multiattack,
         }
 
     @classmethod
@@ -139,6 +141,8 @@ class Enemy(Subject):
         enemy.alive = data['alive']
         enemy.ignore_sides = set(data['ignore_sides'])
         enemy.speed = data.get('speed', 30)
+        enemy.pos = data.get('pos')             # восстанавливаем позицию на карте
+        enemy.multiattack = data.get('multiattack')
 
         # Восстановление стратегии из сохранения
         strategy_type = data.get('strategy_type', 'RandomStrategy')

@@ -6,14 +6,11 @@ class EnemyFactory:
     CUSTOM_TYPES = {}  # Сюда регистрируются монстры, импортированные с dnd.su
 
     @staticmethod
-    def register_type(type_name, hp, ac, attacks, speed=30, regen=0):
-        """Регистрация кастомного монстра; attacks - список словарей с ключами Attack"""
+    def register_type(type_name, hp, ac, attacks, speed=30, regen=0, multiattack=None):
         EnemyFactory.CUSTOM_TYPES[type_name] = {
-            'hp': hp,
-            'ac': ac,
-            'attacks': attacks,
-            'speed': speed,
-            'regen': regen,
+            'hp': hp, 'ac': ac, 'attacks': attacks,
+            'speed': speed, 'regen': regen,
+            'multiattack': multiattack,
         }
 
     @staticmethod
@@ -39,15 +36,12 @@ class EnemyFactory:
         # 1) Сначала ищем среди импортированных монстров с dnd.su!
         if enemy_type in EnemyFactory.CUSTOM_TYPES:
             t = EnemyFactory.CUSTOM_TYPES[enemy_type]
-            enemy = Enemy(
-                name=name,
-                hp=t['hp'],
-                ac=t['ac'],
-                attacks=[EnemyFactory._make_attack(a) for a in t['attacks']],
-                side=side,
-                regen=t.get('regen', 0)
-            )
-            return EnemyFactory._finish(enemy, speed=t.get('speed', 30))
+            enemy = Enemy(name=name, hp=t['hp'], ac=t['ac'],
+                          attacks=[EnemyFactory._make_attack(a) for a in t['attacks']],
+                          side=side, regen=t.get('regen', 0))
+            enemy = EnemyFactory._finish(enemy, speed=t.get('speed', 30))
+            enemy.multiattack = t.get('multiattack')
+            return enemy
 
         # 2) Встроенные типы
         if enemy_type == "гоблин":
@@ -68,11 +62,14 @@ class EnemyFactory:
                          Attack("Короткий лук", 4, 1, "d6", 2, "колющий")],
                 side=side), speed=30, ranges=(5, 80))
         elif enemy_type == "тролль":
-            return EnemyFactory._finish(Enemy(
+            e = EnemyFactory._finish(Enemy(
                 name=name, hp=84, ac=15,
                 attacks=[Attack("Когти", 7, 2, "d6", 3, "дробящий"),
                          Attack("Укус", 7, 2, "d6", 3, "пронзающий")],
                 side=side, regen=10), speed=30)
+            e.multiattack = [{'attack': 'Когти', 'count': 2},
+                             {'attack': 'Укус', 'count': 1}]  # 👈 витрина мультиатаки
+            return e
         elif enemy_type == "гном":
             return EnemyFactory._finish(Enemy(
                 name=name, hp=10, ac=16,
