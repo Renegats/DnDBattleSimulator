@@ -6,6 +6,7 @@ import re
 import threading
 from entities import Enemy, Attack
 from ui_components import ScrollableFrame, fit_window_to_screen
+from statblock_parser import parse_characteristics, extract_statblock_text, extract_battle_text
 
 
 class BestiaryImporter:
@@ -259,22 +260,33 @@ class BestiaryImporter:
             name = h1.get_text(strip=True)
         if not name and soup.title and soup.title.string:
             name = soup.title.string.split('/')[0].strip()
-        monster['name'] = re.sub(r'\s*\[.*?\]', '', name).strip() or 'Без имени'
-        text = soup.get_text()
-        spd = re.search(r'Скорость\s*(\d+)\s*футов', text, re.I)
+        name = re.sub(r'\s*\[.*?\]', '', name)
+        name = re.split(r'[—–-]\s*Бестиарий', name)[0]
+        name = re.sub(r'\s*\([A-Za-z]{2,6}\)\s*[—–-].*$', '', name)
+        monster['name'] = name.strip() or 'Без имени'
+
+        # ДВА окна активной редакции: ref (справочный+особенности+хиты/КД/скорость)
+        # и battle (Действия -> атаки/мультиатака). Парсим по окнам, НЕ по полному
+        # get_text(), иначе ловим обе редакции (5e24/5e14) -> дубль атак/хвостов.
+        ref = extract_statblock_text(soup)
+        battle = extract_battle_text(soup)
+
+        spd = re.search(r'Скорость\s*(\d+)\s*футов', ref, re.I)
         if spd:
             monster['speed'] = int(spd.group(1))
-        hp = re.search(r'(?:Хиты|Hit\s+Points)[^\d]{0,20}(\d+)', text, re.I)
+        hp = re.search(r'(?:Хиты|Hit\s+Points)[^\d]{0,20}(\d+)', ref, re.I)
         if hp:
             monster['hp'] = int(hp.group(1))
-        ac = re.search(r'(?:Класс\s+Доспеха|Armor\s+Class)[^\d]{0,20}(\d+)', text, re.I)
+        ac = re.search(r'(?:Класс\s+Доспеха|Armor\s+Class)[^\d]{0,20}(\d+)', ref, re.I)
         if ac:
             monster['ac'] = int(ac.group(1))
-        regen = re.search(r'(?:восстанавливает|регенерация)[^\d]{0,40}(\d+)\s+хитов', text, re.I)
+        regen = re.search(r'(?:восстанавливает|регенерация)[^\d]{0,40}(\d+)\s+хитов', ref, re.I)
         if regen:
             monster['regen'] = int(regen.group(1))
-        monster['attacks'] = self.parse_attacks(text)
-        monster['multiattack'] = self.parse_multiattack(text, monster['attacks'])
+
+        monster['attacks'] = self.parse_attacks(battle)
+        monster['multiattack'] = self.parse_multiattack(battle, monster['attacks'])
+        monster.update(parse_characteristics(soup, ref))
         return monster
 
     def parse_attacks(self, text):
@@ -317,15 +329,61 @@ class BestiaryImporter:
             widget.destroy()
         preview = self.preview_scroll.scrollable_frame
         ttk.Label(preview, text=f"👾 {monster['name']}", font=('Arial', 14, 'bold')).pack(pady=5)
-        ttk.Label(preview, text=f"❤️ Хиты: {monster['hp']}", font=('Arial', 11)).pack(anchor='w', padx=10)
-        ttk.Label(preview, text=f"🛡️ КД: {monster['ac']}", font=('Arial', 11)).pack(anchor='w', padx=10)
-        ttk.Label(preview, text=f"👟 Скорость: {monster['speed']} фт", font=('Arial', 11)).pack(anchor='w', padx=10)
+
+        head = []
+        if monster.get('size'): head.append(monster['size'])
+        if monster.get('type'): head.append(monster['type'])
+        if monster.get('cr'):   head.append(f"CR {monster['cr']}")
+        if monster.get('prof_bonus'): head.append(f"Бонус мастерства {monster['prof_bonus']}")
+        if head:
+            ttk.Label(preview, text=' · '.join(head), font=('Arial', 10, 'italic')).pack(anchor='w', padx=10)
+
+        ttk.Label(preview, text=f"❤️ Хиты: {monster['hp']}   🛡️ КД: {monster['ac']}   "
+                                f"👟 Скорость: {monster.get('speed', 30)} фт",
+                  font=('Arial', 11)).pack(anchor='w', padx=10)
+        if monster.get('regen'):
+            ttk.Label(preview, text=f"💚 Регенерация: {monster['regen']}", font=('Arial', 11)).pack(anchor='w', padx=10)
+
+        from statblock_parser import ABILITY_ORDER, ABILITY_LABEL
+        sc, md = monster.get('ability_scores') or {}, monster.get('ability_mods') or {}
+        if sc:
+            cells = []
+            for k in ABILITY_ORDER:
+                if k in sc:
+                    sign = '+' if md.get(k, 0) >= 0 else ''
+                    cells.append(f"{ABILITY_LABEL[k]} {sc[k]} ({sign}{md.get(k, 0)})")
+            ttk.Label(preview, text=' · '.join(cells), font=('Arial', 10, 'bold')).pack(anchor='w', padx=10,
+                                                                                        pady=(4, 0))
+        for label, key in [('Спасброски', 'saves'), ('Навыки', 'skills'), ('Чувства', 'senses')]:
+            d = monster.get(key) or {}
+            if d:
+                txt = ', '.join(f"{kk} {vv}".strip() for kk, vv in d.items())
+                ttk.Label(preview, text=f"{label}: {txt}", font=('Arial', 10)).pack(anchor='w', padx=10)
+        for label, key in [('Уязвимости', 'vulnerabilities'), ('Сопротивления', 'resistances'),
+                           ('Иммунитеты', 'immunities'), ('Иммун. к условиям', 'condition_immunities'),
+                           ('Языки', 'languages')]:
+            lst = monster.get(key) or []
+            if lst:
+                ttk.Label(preview, text=f"{label}: {', '.join(lst)}", font=('Arial', 10)).pack(anchor='w', padx=10)
+
+        traits = monster.get('traits') or []
+        if traits:
+            ttk.Label(preview, text="✨ Особенности:", font=('Arial', 12, 'bold')).pack(anchor='w', pady=(8, 2))
+            for tr in traits:
+                ttk.Label(preview, text=f"• {tr['name']}. {tr['desc']}",
+                          font=('Arial', 9), wraplength=560, justify='left').pack(anchor='w', padx=20)
+
         ttk.Label(preview, text="⚔️ Атаки:", font=('Arial', 12, 'bold')).pack(anchor='w', pady=(10, 5))
         for attack in monster['attacks']:
             attack_text = (f"• {attack['name']} ({attack['attack_bonus']:+d}, "
                            f"{attack['damage_dice_count']}{attack['damage_dice_type']}"
                            f"{attack['damage_modifier']:+d})")
             ttk.Label(preview, text=attack_text, font=('Arial', 10)).pack(anchor='w', padx=20)
+
+        if not sc and not traits and not (monster.get('saves') or monster.get('skills')):
+            ttk.Label(preview, text="⚠ В источнике не указаны характеристики/особенности "
+                                    "(описание дополняется на dnd.su)",
+                      font=('Arial', 9, 'italic'), foreground='#888888').pack(anchor='w', padx=10, pady=(8, 0))
 
     # ИМПОРТ
     def import_selected_monster(self):
@@ -342,13 +400,19 @@ class BestiaryImporter:
         } for a in self.selected_monster['attacks']]
 
         from factory import EnemyFactory
+        chars = {k: v for k, v in self.selected_monster.items()
+                 if k in ('ability_scores', 'ability_mods', 'saves', 'skills', 'senses',
+                          'vulnerabilities', 'resistances', 'immunities',
+                          'condition_immunities', 'languages', 'cr', 'prof_bonus',
+                          'size', 'type', 'traits')}
         EnemyFactory.register_type(monster_type,
                                    hp=self.selected_monster['hp'],
                                    ac=self.selected_monster['ac'],
                                    attacks=attacks_data,
                                    speed=self.selected_monster.get('speed', 30),
                                    regen=self.selected_monster.get('regen', 0),
-                                   multiattack=self.selected_monster.get('multiattack'))
+                                   multiattack=self.selected_monster.get('multiattack'),
+                                   **chars)
         if monster_type not in self.simulator.enemy_types:
             self.simulator.enemy_types.append(monster_type)
             messagebox.showinfo("Успех",

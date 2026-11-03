@@ -2,6 +2,7 @@ import tkinter as tk
 from tkinter import ttk, messagebox
 from ui_components import RoundedButton, ScrollableFrame, fit_window_to_screen
 from factory import EnemyFactory
+from characteristics_editor import CharacteristicsEditor
 
 
 class SideCreatorDialog:
@@ -15,6 +16,7 @@ class SideCreatorDialog:
         self.pal = simulator.theme_manager.palette()
         self.attacks = []
         self.multiattack_data = None
+        self.chars_data = {}
         self.win = tk.Toplevel(simulator.root)
         self.win.title("Кого ведём в бой?" if mode == 'create' else "Изменить состав")
         self.win.transient(simulator.root)
@@ -101,6 +103,11 @@ class SideCreatorDialog:
         ttk.Button(btns, text="✎ изменить", command=self._edit_attack).pack(side='left', padx=2)
         ttk.Button(btns, text="✕ удалить", command=self._del_attack).pack(side='left', padx=2)
         self._refresh_atk_box()
+        self._refresh_atk_box()
+
+        self.editor = CharacteristicsEditor(f, initial=self.chars_data, palette=self.pal)
+
+        bottom = ttk.Frame(f); bottom.pack(fill='x', pady=12)
 
         bottom = ttk.Frame(f); bottom.pack(fill='x', pady=12)
         RoundedButton(bottom, "Отмена", palette=self.pal, command=self.win.destroy,
@@ -111,6 +118,23 @@ class SideCreatorDialog:
     def _load_preset(self):
         tmp = EnemyFactory.create_enemy(self.preset_var.get(), "_preset_", 0)
         self.multiattack_data = getattr(tmp, 'multiattack', None)
+        self.chars_data = {
+            'ability_scores': dict(getattr(tmp, 'ability_scores', {}) or {}),
+            'ability_mods':   dict(getattr(tmp, 'ability_mods', {}) or {}),
+            'saves':          dict(getattr(tmp, 'saves', {}) or {}),
+            'skills':         dict(getattr(tmp, 'skills', {}) or {}),
+            'senses':         dict(getattr(tmp, 'senses', {}) or {}),
+            'vulnerabilities':list(getattr(tmp, 'vulnerabilities', []) or []),
+            'resistances':    list(getattr(tmp, 'resistances', []) or []),
+            'immunities':     list(getattr(tmp, 'immunities', []) or []),
+            'condition_immunities': list(getattr(tmp, 'condition_immunities', []) or []),
+            'languages':      list(getattr(tmp, 'languages', []) or []),
+            'cr':             getattr(tmp, 'cr', None),
+            'prof_bonus':     getattr(tmp, 'prof_bonus', None),
+            'size':           getattr(tmp, 'size', None),
+            'type':           getattr(tmp, 'type', None),
+            'traits':         [dict(tr) for tr in (getattr(tmp, 'traits', []) or [])],
+        }
         self.name_var.set(self.preset_var.get())
         self.hp_var.set(tmp.max_hp);
         self.ac_var.set(tmp.ac)
@@ -123,6 +147,8 @@ class SideCreatorDialog:
                          'damage_type': getattr(a, 'damage_type', ''),
                          'range_ft': getattr(a, 'range_ft', 5)} for a in tmp.attacks]
         self._refresh_atk_box()
+        self._refresh_atk_box()
+        self.editor.set_data(self.chars_data)   # этап 3: пресет доезжает до редактора
 
     def _refresh_atk_box(self):
         self.atk_box.delete(0, tk.END)
@@ -194,10 +220,13 @@ class SideCreatorDialog:
         if not self.attacks:
             messagebox.showwarning('Внимание', 'Добавьте хотя бы одну атаку!', parent=self.win);
             return
-        EnemyFactory.register_type(name, hp=self.hp_var.get(), ac=self.ac_var.get(),
+        self.chars_data = self.editor.get_data()
+        EnemyFactory.register_type(name,
+                                   hp=self.hp_var.get(), ac=self.ac_var.get(),
                                    attacks=self.attacks, speed=self.spd_var.get(),
                                    regen=self.regen_var.get(),
-                                   multiattack=self.multiattack_data)
+                                   multiattack=self.multiattack_data,
+                                   **self.chars_data)
         if name not in self.sim.enemy_types:
             self.sim.enemy_types.append(name)
         self.on_result({'army_type': name, 'strategy': self.strat_var.get()})

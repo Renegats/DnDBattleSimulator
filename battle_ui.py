@@ -1,8 +1,11 @@
 import tkinter as tk
 from tkinter import ttk, messagebox
+
+from battle_logic import ENGINE as _SPR_ENGINE
 from entities import Attack, Enemy
 from ui_components import ScrollableFrame, fit_window_to_screen
 from observer import Observer
+
 
 
 class UIUpdater(Observer):
@@ -113,6 +116,7 @@ class BattleUI:
 
         self.battle_results_text.pack(side='left', fill='both', expand=True)
         results_scrollbar.pack(side='right', fill='y')
+        self.battle_results_text.bind('<KeyPress>', self._on_results_keypress, add='+')
 
         # Управление битвой
         controls_frame = ttk.Frame(self.battle_frame)
@@ -126,6 +130,148 @@ class BattleUI:
         ttk.Button(button_container, text="Массовое редактирование", command=self.mass_edit).pack(side='left', padx=5)
         ttk.Button(button_container, text="Показать статус", command=self.show_status).pack(side='left', padx=5)
         ttk.Button(button_container, text="Очистить результаты", command=self.clear_results).pack(side='left', padx=5)
+        self.copy_btn = ttk.Button(button_container, text="📋 Копировать лог",
+                                   command=self.copy_results)
+        self.copy_btn.pack(side='left', padx=5)
+        ttk.Button(button_container, text="🔍 Анализ сражения",
+                   command=self.open_decision_analysis).pack(side='left', padx=5)
+
+    def _select_all_results(self, event=None):
+        w = self.battle_results_text
+        w.tag_remove('sel', '1.0', 'end')
+        w.tag_add('sel', '1.0', 'end-1c')
+        return 'break'
+
+    def _on_results_keypress(self, event):
+        # Раскладочно-независимый якорь: keycode = VK-код клавиши на Windows,
+        # НЕ зависит от раскладки/кодировки (в отличие от keysym, который на
+        # кириллице приходит как не-ASCII и в консоли печатается '??').
+        # Ctrl+C -> VK_C=67 всегда; Ctrl+A -> VK_A=65.
+        ctrl = bool(event.state & 0x0004)
+        kc = event.keycode
+        if ctrl:
+            if kc == 67:  # VK_C: Ctrl+C на любой раскладке
+                self.battle_results_text.after(0, self.copy_results)
+                return 'break'  # break ДО update() -> class-binding не спит
+            if kc == 65:  # VK_A: Ctrl+A
+                self.battle_results_text.after(0, self._select_all_results)
+                return 'break'
+            if kc in (37, 39, 38, 40, 36, 35, 33, 34):  # стрелки/Home/End/PgUp/PgDn (VK)
+                return None  # Ctrl+навигация - пропускаем
+            return 'break'  # Ctrl+V/X/Z и пр. - блок (read-only)
+        if kc in (8, 46):  # VK_BACK=8, VK_DELETE=46
+            return 'break'  # удаление - блок
+        ch = event.char
+        if ch and ch.isprintable():
+            return 'break'  # ввод текста - блок
+        return None
+
+    def copy_results(self):
+        w = self.battle_results_text
+        try:
+            sel = w.get('sel.first', 'sel.last')  # TclError, если выделения нет
+        except tk.TclError:
+            sel = ''
+        text = sel if sel else w.get('1.0', 'end-1c')  # fallback: весь лог
+
+        # Единственный рабочий канал: Tk clipboard + форс синхронизации.
+        # (txt-fallback убран: keycode-доказательство подтвердило, что clipboard
+        # доходит до Windows штатно, страховка от msy2-поломки стала лишней.)
+        try:
+            w.clipboard_clear()
+            w.clipboard_append(text)
+            w.update()  # обрабатываем очередь событий -> ownership уходит в Windows
+        except tk.TclError:
+            pass
+
+        # Тихий визуальный отклик кнопки (НЕ окно). Единственный сигнал успеха
+        # после удаления messagebox.showinfo - поэтому оставляем намеренно.
+        if hasattr(self, 'copy_btn'):
+            try:
+                self.copy_btn.configure(text='✓ Скопировано')
+                self.copy_btn.after(1200, lambda: self.copy_btn.configure(text='📋 Копировать лог'))
+            except tk.TclError:
+                pass
+
+    def open_decision_analysis(self):
+        """Окно объяснимости СПР: почему каждый юнит выбрал именно это действие.
+        Читает immutable-снимки ENGINE.get_round_log() (НЕ пересчёт - мир изменился).
+        Свёрнутые карточки-аккордеоны на юнита, на чистом ttk -> цвета подхватывают
+        активную тему (тёмно-фиолетовая схема) без хардкода. Graceful: нет раундов ->
+        заглушка, не краш."""
+        log = _SPR_ENGINE.get_round_log()
+        win = tk.Toplevel(self.root)
+        win.title("Анализ сражения — почему принято каждое решение")
+        fit_window_to_screen(win, 720, 640)
+
+        outer = ttk.Frame(win); outer.pack(fill='both', expand=True, padx=10, pady=10)
+        if not log:
+            ttk.Label(outer, text="Раундов ещё не проводилось — проведите бой и откройте анализ.",
+                      font=('Segoe UI', 11)).pack(pady=20)
+            return
+        ttk.Label(outer, text=f"Решений за последний раунд: {len(log)}",
+                  font=('Segoe UI', 10, 'bold')).pack(anchor='w', pady=(0, 6))
+
+        canvas = tk.Canvas(outer)
+        vsb = ttk.Scrollbar(outer, orient="vertical", command=canvas.yview)
+        body = ttk.Frame(canvas)
+        body.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.create_window((0, 0), window=body, anchor="nw")
+        canvas.configure(yscrollcommand=vsb.set)
+        canvas.bind("<MouseWheel>", lambda e: canvas.yview_scroll(int(-1 * (e.delta / 120)), "units"))
+        body.bind("<MouseWheel>", lambda e: canvas.yview_scroll(int(-1 * (e.delta / 120)), "units"))
+        canvas.pack(side="left", fill="both", expand=True)
+        vsb.pack(side="right", fill="y")
+
+        for snap in log:
+            self._decision_card(body, snap)
+
+    def _decision_card(self, parent, s):
+        """Одна сворачиваемая карточка юнита (паттерн аккордеона, как в editor)."""
+        wrap = ttk.Frame(parent, relief='groove', borderwidth=1)
+        wrap.pack(fill='x', pady=3, padx=2)
+        head = ttk.Frame(wrap); head.pack(fill='x')
+        arrow = ttk.Label(head, text='▸', width=2, cursor='hand2', font=('Segoe UI', 10, 'bold'))
+        arrow.pack(side='left')
+        int_txt = 'не указан' if s['int_score'] is None else str(s['int_score'])
+        title = f"{s['unit']}  ·  INT={int_txt} → Tier {s['tier']} ({s['tier_name']})  ·  {s['archetype']}"
+        ttk.Label(head, text=title, font=('Segoe UI', 10, 'bold'), cursor='hand2').pack(side='left', fill='x', expand=True)
+        detail = ttk.Frame(wrap)
+
+        st = {'open': False, 'body': detail, 'arrow': arrow}
+        def toggle(_e=None):
+            if st['open']:
+                st['body'].pack_forget(); st['arrow'].configure(text='▸'); st['open'] = False
+            else:
+                st['body'].pack(fill='x', padx=8, pady=(0, 4)); st['arrow'].configure(text='▾'); st['open'] = True
+        for w in (head, arrow):
+            w.bind('<Button-1>', toggle)
+        head.bind('<Button-1>', toggle)
+
+        # --- содержимое карточки ---
+        rows = [
+            ('🎯 Цель', f"{s['target_name'] or '—'}  ·  {s['target_reason']}"),
+            ('⚔️ Атака', (f"{s['attack_name'] or 'мультиатака/делегат'}  ·  {s['attack_reason']}")
+                          if not s['multiattack'] else s['attack_reason']),
+            ('👣 Движение', f"{s['move_intent']}  ·  {s['move_reason']}"),
+        ]
+        for label, val in rows:
+            ttk.Label(detail, text=label, font=('Segoe UI', 9, 'bold')).pack(anchor='w', pady=(4, 0))
+            ttk.Label(detail, text=val, font=('Segoe UI', 9), wraplength=640, justify='left').pack(anchor='w')
+        # таблица кандидатов (сердце "почему именно эта атака")
+        if s['candidates']:
+            ttk.Label(detail, text='📋 Разбор оружия (B1 дальность / B2 защиты / B3 EV):',
+                      font=('Segoe UI', 9, 'bold')).pack(anchor='w', pady=(6, 2))
+            grid = ttk.Frame(detail); grid.pack(fill='x')
+            for col, txt in enumerate(('Атака', 'Reach', 'Тип', 'Eff', 'EV', 'Вердикт')):
+                ttk.Label(grid, text=txt, font=('Segoe UI', 8, 'bold')).grid(
+                    row=0, column=col, sticky='w', padx=4)
+            for i, cd in enumerate(s['candidates'], start=1):
+                verdict = '✔ выбрана' if cd.get('chosen') else (cd['reject'] or 'проиграла по EV/reach')
+                for col, val in enumerate((cd['name'], cd['reach'], cd['dmg_type'],
+                                           cd['eff'], cd['ev'], verdict)):
+                    ttk.Label(grid, text=str(val), font=('Segoe UI', 8)).grid(
+                        row=i, column=col, sticky='w', padx=4)
 
     def clear_results(self):
         """Очистка текстового поля с результатами"""

@@ -54,17 +54,23 @@ class BattleStrategy(ABC):
         Без карты distance=0 для всех -> приоритет 1 = все -> как раньше."""
         if not candidates:
             return None
-        max_range = max((getattr(a, 'range_ft', 5) for a in attacker.attacks), default=5)
+        ma = getattr(attacker, 'multiattack', None)
+        if ma:
+            by_name = {a.name: getattr(a, 'range_ft', 5) for a in attacker.attacks}
+            ranges = [by_name[s['attack']] for s in ma if s.get('attack') in by_name]
+            max_range = min(ranges) if ranges else max(
+                (getattr(a, 'range_ft', 5) for a in attacker.attacks), default=5)
+        else:
+            max_range = max((getattr(a, 'range_ft', 5) for a in attacker.attacks), default=5)
         speed = getattr(attacker, 'speed', 30)
         d = lambda e: distance_ft_between(attacker, e)
-
-        tier1 = [e for e in candidates if d(e) <= max_range]          # ударь на месте
+        tier1 = [e for e in candidates if d(e) <= max_range]  # ударь на месте
         if tier1:
             return prefer_key(tier1)
         tier2 = [e for e in candidates if d(e) <= max_range + speed]  # подойди и ударь
         if tier2:
             return prefer_key(tier2)
-        return min(candidates, key=d)                                 # беги к ближайшему
+        return min(candidates, key=d)  # беги к ближайшему
 
 class AggressiveStrategy(BattleStrategy):
     """Агрессивная - бьёт самого слабого ИЗ ДОСТУПНЫХ, иначе бежит к ближайшему."""

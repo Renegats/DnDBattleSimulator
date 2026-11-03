@@ -27,7 +27,7 @@ class Attack:
             'damage_dice_type': self.damage_dice_type,
             'damage_modifier': self.damage_modifier,
             'damage_type': self.damage_type,
-            'range_ft': self.range_ft
+            'range_ft': self.range_ft,
         }
 
     @classmethod
@@ -64,6 +64,21 @@ class Enemy(Subject):
         self.pos = None             # позиция на карте (x, y) или None
         self.moved_ft = 0           # потрачено футов перемещения за раунд
         self.multiattack = None     # список ударов [{'attack': имя, 'count': n}] или None
+        self.ability_scores = {}      # {'str':8,'dex':14,...}
+        self.ability_mods = {}        # {'str':-1,'dex':2,...}
+        self.saves = {}               # {'Лов':'+3', ...}
+        self.skills = {}              # {'Скрытность':'+4', ...}
+        self.senses = {}              # {'Тёмное зрение':'60', ...}
+        self.vulnerabilities = []     # ['огонь', ...]
+        self.resistances = []
+        self.immunities = []
+        self.condition_immunities = []
+        self.languages = []
+        self.cr = None                # строкой: '1/4', '5', '—'
+        self.prof_bonus = None
+        self.size = None
+        self.type = None
+        self.traits = []              # [{'name':..,'desc':..}]
 
     def take_damage(self, damage: int):
         """Нанесение урона врага"""
@@ -124,6 +139,21 @@ class Enemy(Subject):
             'speed': self.speed,
             'pos': self.pos,
             'multiattack': self.multiattack,
+            'ability_scores': self.ability_scores,
+            'ability_mods': self.ability_mods,
+            'saves': self.saves,
+            'skills': self.skills,
+            'senses': self.senses,
+            'vulnerabilities': self.vulnerabilities,
+            'resistances': self.resistances,
+            'immunities': self.immunities,
+            'condition_immunities': self.condition_immunities,
+            'languages': self.languages,
+            'cr': self.cr,
+            'prof_bonus': self.prof_bonus,
+            'size': self.size,
+            'type': self.type,
+            'traits': self.traits,
         }
 
     @classmethod
@@ -143,6 +173,22 @@ class Enemy(Subject):
         enemy.speed = data.get('speed', 30)
         enemy.pos = data.get('pos')             # восстанавливаем позицию на карте
         enemy.multiattack = data.get('multiattack')
+        enemy.multiattack = data.get('multiattack')
+        enemy.ability_scores = dict(data.get('ability_scores') or {})
+        enemy.ability_mods = dict(data.get('ability_mods') or {})
+        enemy.saves = dict(data.get('saves') or {})
+        enemy.skills = dict(data.get('skills') or {})
+        enemy.senses = dict(data.get('senses') or {})
+        enemy.vulnerabilities = list(data.get('vulnerabilities') or [])
+        enemy.resistances = list(data.get('resistances') or [])
+        enemy.immunities = list(data.get('immunities') or [])
+        enemy.condition_immunities = list(data.get('condition_immunities') or [])
+        enemy.languages = list(data.get('languages') or [])
+        enemy.cr = data.get('cr')
+        enemy.prof_bonus = data.get('prof_bonus')
+        enemy.size = data.get('size')
+        enemy.type = data.get('type')
+        enemy.traits = [dict(tr) for tr in (data.get('traits') or [])]
 
         # Восстановление стратегии из сохранения
         strategy_type = data.get('strategy_type', 'RandomStrategy')

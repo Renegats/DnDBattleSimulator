@@ -21,7 +21,9 @@ class BattleMap:
         if not (0 <= x < self.width and 0 <= y < self.height):
             return False
         occ = self.cell_map.get((x, y))
-        return occ is None or id(occ) == ignore_id
+        if occ is None or id(occ) == ignore_id:
+            return True
+        return not occ.alive
 
     def place(self, enemy, x, y):
         old = self.positions.get(id(enemy))
@@ -279,7 +281,7 @@ class BattleMapUI:
         # Токены
         for i, side in enumerate(self.sides):
             color = SIDE_COLORS[i % len(SIDE_COLORS)]
-            for enemy in side:
+            for enemy in sorted(side, key=lambda e: e.alive):
                 pos = bm.get_pos(enemy)
                 if not pos:
                     continue

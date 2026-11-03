@@ -3,6 +3,9 @@ import tkinter as tk
 from tkinter import ttk, messagebox
 from entities import Enemy
 from battle_strategies import BattleStrategy, RandomStrategy, AggressiveStrategy, DefensiveStrategy, SupportStrategy
+from decision_engine import DecisionEngine, dmg_canon
+
+ENGINE = DecisionEngine()
 
 
 class BattleLogic:
@@ -19,6 +22,7 @@ class BattleLogic:
             return
 
         battle_log = "=== НОВЫЙ РАУНД БОЯ ===\n"
+        ENGINE.begin_round()   # сброс журнала объяснений на новый раунд (СПР-анализ)
 
         # Новый раунд - все очки движения восстанавливаются
         for side_enemies in self.sides:
@@ -36,26 +40,35 @@ class BattleLogic:
         for attacker_side_idx, side_enemies in enumerate(self.sides):
             alive_attackers = [e for e in side_enemies if e.alive]
             for attacker in alive_attackers:
-                # Используем стратегию для выбора цели
-                target = attacker.strategy.select_target(attacker, self.sides,
-                                                         self.ignore_sides.get(attacker_side_idx, set()))
-
+                # ===== v1 ИИ: мозг решает цель/атаку/намерение движения =====
+                decision = ENGINE.decide(attacker, self.sides,
+                                         self.ignore_sides.get(attacker_side_idx, set()))
+                target = decision.target
                 if not target:
                     battle_log += f"{attacker.name} - нет подходящих целей для атаки\n"
                     continue
+                if decision.rationale:
+                    battle_log += f"🧠 {attacker.name}: {decision.rationale}\n"
 
-                # ===== Удары воина: мультиатака (список) или одна атака =====
-                strikes = self._resolve_strikes(attacker, target)
-                if not strikes:
-                    battle_log += f"{attacker.name} - нет доступных атак\n"
-                    continue
-                reach = self._strike_reach(attacker, strikes)
+                if decision.attack is None:
+                    # делегат (tier0/1) или мультиатака - старый путь развёртки
+                    strikes = self._resolve_strikes(attacker, target)
+                    if not strikes:
+                        battle_log += f"{attacker.name} - нет доступных атак\n"
+                        continue
+                    reach = self._strike_reach(attacker, strikes)
+                else:
+                    # smart-одиночная (tier>=2): атака уже выбрана с учётом защиты/дальности
+                    strikes = [decision.attack]
+                    reach = decision.target_dist_ft
 
-                # --- Карта: подводимся на дистанцию reach (минимум среди ударов) ---
+                # --- Карта: движение по move_intent (approach / hold) ---
                 if getattr(self, 'battle_map', None) and \
                         self.battle_map.get_pos(attacker) and self.battle_map.get_pos(target):
                     dist = self.battle_map.distance_ft(attacker, target)
-                    if dist > reach and getattr(self, 'auto_move', False):
+                    if decision.move_intent == 'hold' and dist <= reach:
+                        pass  # держим дистанцию: уже достаём, не подбегаем (v1 C2-half)
+                    elif dist > reach and getattr(self, 'auto_move', False):
                         self.battle_map.move_towards(attacker, target, attacker.speed,
                                                      reach_ft=reach)
                         dist = self.battle_map.distance_ft(attacker, target)
@@ -63,14 +76,15 @@ class BattleLogic:
                         battle_log += (f"{attacker.name} не может достать {target.name} "
                                        f"({dist} фт > {reach} фт)\n")
                         continue
-                    # Воин БЕЗ мультиатаки: после подхода перевыбираем атаку по новой
-                    # дистанции (подошёл лучник в упор - пусть рубит мечом, если меч вблизи сильнее)
-                    if not getattr(attacker, 'multiattack', None):
+                    # перевыбор ДЛЯ ДЕЛЕГАТ-ОДИНОЧНЫХ (tier<=1): старый цикл после подхода
+                    # переспрашивал стратегию по новой дистанции - сохраняем ноль регрессии.
+                    if decision.attack is None and decision.tier <= 1 \
+                            and not getattr(attacker, 'multiattack', None):
                         strikes = self._resolve_strikes(attacker, target)
                         if not strikes:
                             continue
 
-                # ===== Выполнение ударов (мультиатака бьёт по списку) =====
+                # ===== Выполнение ударов =====
                 lines, _killed = self.execute_strikes(attacker, target, strikes)
                 for ln in lines:
                     battle_log += ln + "\n"
@@ -149,28 +163,35 @@ class BattleLogic:
         return distance_ft_between(attacker, target) <= need
 
     def execute_strikes(self, attacker, target, strikes):
+        # входной guard (defensible-in-depth: защищает от любой будущей регрессии
+        # в _run_round_inner, где target может стать None по третьей причине)
+        if target is None:
+            return [], False
         lines, any_killed = [], False
         ignore = self.ignore_sides.get(attacker.side, set())
         for atk in strikes:
-            # цель умерла (или изначально не достаётся этой атакой) - ищем новую
-            if not target.alive:
+            if target is None or not target.alive:
+                # цель погибла (или изначально не достаётся) - ищем нового соседа
                 target = self._nearest_in_range(attacker, atk, ignore)
                 if target is None:
-                    continue  # некого добить этой атакой - удар пропадает
+                    break  # мёртвую цель не добить, живой в радиусе нет -
+                    # все оставшиеся удары пропадают (без движения посреди замаха)
             if not self._in_range_of(attacker, target, atk):
+                # цель ЖИВАЯ, но далеко для ЭТОГО удара - ищем достижимого
                 alt = self._nearest_in_range(attacker, atk, ignore)
                 if alt is None:
-                    continue
+                    continue  # БЕЗОПАСНО: target живой, следующая атака (напр. лук) достанет
                 target = alt
             hit, damage, attack_roll, critical, damage_info = attacker.perform_attack(atk, target.ac)
             if hit:
+                damage, dmg_note = self._modify_damage(target, damage, atk.damage_type)
                 target.take_damage(damage)
                 crit_text = " КРИТИЧЕСКИЙ УДАР!" if critical else ""
                 lines.append(f"{attacker.name} → {target.name} ({atk.name}: "
-                             f"{attack_roll} vs AC {target.ac}) - ПОПАДАНИЕ!{crit_text} {damage_info}")
+                             f"{attack_roll} vs AC {target.ac}) - ПОПАДАНИЕ!{crit_text} {damage_info}{dmg_note}")
                 if not target.alive:
                     lines.append(f"☠️ {target.name} УНИЧТОЖЕН!")
-                    any_killed = True  # НЕ break - следующие удары добьют соседей
+                    any_killed = True
             else:
                 lines.append(f"{attacker.name} → {target.name} ({atk.name}: "
                              f"{attack_roll} vs AC {target.ac}) - ПРОМАХ!")
@@ -197,3 +218,21 @@ class BattleLogic:
                 if d <= need and (best_d is None or d < best_d):
                     best, best_d = e, d
         return best
+
+
+    def _modify_damage(self, target, raw, damage_type):
+        canon = dmg_canon(damage_type)
+        if not canon or raw <= 0:
+            return raw, ''
+        imm = {dmg_canon(x) for x in (getattr(target, 'immunities', []) or [])}
+        vul = {dmg_canon(x) for x in (getattr(target, 'vulnerabilities', []) or [])}
+        res = {dmg_canon(x) for x in (getattr(target, 'resistances', []) or [])}
+        if canon in imm:
+            return 0, f" → 0 (иммунитет: {damage_type})"
+        if canon in vul:
+            final = raw * 2
+            return final, f" → {final} (уязвимость: {damage_type})"
+        if canon in res:
+            final = raw // 2
+            return final, f" → {final} (сопротивление: {damage_type})"
+        return raw, ''
