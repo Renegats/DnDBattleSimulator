@@ -235,10 +235,19 @@ class DecisionEngine:
                 res = active_defenses(raw_res, magical)
                 eff = 0.0 if c in imm else (0.5 if c in res else 1.0)
             avg = a.damage_dice_count * _avg_dice(a.damage_dice_type) + a.damage_modifier
+            extra_avg = 0.0
+            for extra in getattr(a, 'extra_damage', None) or []:
+                part = (extra.get('dice_count', 0) * _avg_dice(extra.get('dice_type', 'd6'))
+                        + extra.get('modifier', 0))
+                if use_defense:
+                    extra_type = dmg_canon(extra.get('damage_type', ''))
+                    part_eff = 0.0 if extra_type in imm else (0.5 if extra_type in res else 1.0)
+                    part *= part_eff
+                extra_avg += part
             if use_hit:
                 p_hit = max(0.05, min(0.95, (21 - max(1, ac - a.attack_bonus)) / 20.0))
-                return avg * p_hit * eff, eff
-            return avg * eff, eff
+                return (avg * eff + extra_avg) * p_hit, eff
+            return avg * eff + extra_avg, eff
 
         from battle_strategies import is_healing_attack
         ally = getattr(target, 'side', None) == getattr(attacker, 'side', None)

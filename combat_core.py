@@ -82,6 +82,22 @@ def nearest_in_range(attacker, atk, ignore, sides, battle_map):
     return best
 
 
+def _roll_component(attacker, comp, critical, crit_mode):
+    """Дополнительный урон тем же режимом крита, что и основной бросок."""
+    import random
+    rng = getattr(attacker, '_rng', None) or random
+    sides = int(str(comp.get('dice_type') or 'd6').split('d')[-1] or 6)
+    count = int(comp.get('dice_count') or 0)
+    modifier = int(comp.get('modifier') or 0)
+    rolls = max(0, count)
+    if critical and crit_mode == 'dice_only':
+        rolls *= 2
+    total = sum(rng.randint(1, max(1, sides)) for _ in range(rolls)) + modifier
+    if critical and crit_mode != 'dice_only':
+        total *= 2
+    return max(0, total)
+
+
 def modify_damage(target, raw, damage_type, magical=False):
     """Чистая функция: считает итоговый урон, НЕ наносит его.
     magical=True снимает условные иммунитеты/сопротивления «от немагического»."""
@@ -154,13 +170,22 @@ def execute_strikes(attacker, target, strikes, sides, ignore_sides, battle_map,
         hit, damage, attack_roll, critical, damage_info = attacker.perform_attack(
             atk, target.ac, crit_mode=crit_mode)
         if hit:
-            damage, dmg_note = modify_damage(target, damage, atk.damage_type,
-                                             magical=bool(getattr(atk, 'magical', False)))
+            magical = bool(getattr(atk, 'magical', False))
+            damage, dmg_note = modify_damage(target, damage, atk.damage_type, magical=magical)
             target.take_damage(damage)
+            extra_notes = []
+            for extra in getattr(atk, 'extra_damage', None) or []:
+                raw = _roll_component(attacker, extra, critical, crit_mode)
+                final, note = modify_damage(target, raw, extra.get('damage_type', ''),
+                                            magical=magical)
+                target.take_damage(final)
+                label = extra.get('damage_type') or 'доп.'
+                extra_notes.append(f"+ {final} ({label}){note}")
             crit_text = " КРИТИЧЕСКИЙ УДАР!" if critical else ""
+            extra_text = (' ' + ' '.join(extra_notes)) if extra_notes else ''
             lines.append(f"{attacker.name} → {target.name} ({atk.name}: "
                          f"{attack_roll} vs AC {target.ac}) - ПОПАДАНИЕ!{crit_text} "
-                         f"{damage_info}{dmg_note}")
+                         f"{damage_info}{dmg_note}{extra_text}")
             if not target.alive:
                 lines.append(f"☠️ {target.name} УНИЧТОЖЕН!")
                 any_killed = True
@@ -168,3 +193,67 @@ def execute_strikes(attacker, target, strikes, sides, ignore_sides, battle_map,
             lines.append(f"{attacker.name} → {target.name} ({atk.name}: "
                          f"{attack_roll} vs AC {target.ac}) - ПРОМАХ!")
     return lines, any_killed
+
+
+def refresh_legendary_pool(enemy, reset=False):
+    """В начале хода существа пул полный; до первого хода — тоже, если ещё не задан."""
+    block = getattr(enemy, 'legendary_actions', None)
+    if not block:
+        return
+    if reset or getattr(enemy, 'legendary_remaining', None) is None:
+        enemy.legendary_remaining = int(block.get('per_round') or 0)
+
+
+def legendary_after_turn(just_acted, sides, ignore_sides, battle_map,
+                         crit_mode=DEFAULT_CRIT_MODE):
+    """Конец чужого хода: каждое другое легендарное существо тратит одно действие.
+
+    В бой уходит только вариант, который сводится к уже известной атаке и
+    достаёт цель. Спасброски, перемещение и действия логова здесь не считаются.
+    """
+    lines = []
+    for side in sides:
+        for enemy in side:
+            if enemy is just_acted or not getattr(enemy, 'alive', False):
+                continue
+            lines.extend(_spend_legendary(enemy, sides, ignore_sides, battle_map, crit_mode))
+    return lines
+
+
+def _spend_legendary(enemy, sides, ignore_sides, battle_map, crit_mode):
+    from battle_strategies import damage_score
+    block = getattr(enemy, 'legendary_actions', None)
+    if not block:
+        return []
+    refresh_legendary_pool(enemy, reset=False)
+    remaining = int(getattr(enemy, 'legendary_remaining', 0) or 0)
+    if remaining <= 0:
+        return []
+    ignore = ignore_sides.get(getattr(enemy, 'side', None), set())
+    by_name = {attack.name: attack for attack in getattr(enemy, 'attacks', []) or []}
+    best = None
+    for option in block.get('options') or []:
+        if not option.get('usable') or not option.get('attack'):
+            continue
+        cost = int(option.get('cost') or 1)
+        if cost > remaining:
+            continue
+        attack = by_name.get(option['attack'])
+        if attack is None:
+            continue
+        target = nearest_in_range(enemy, attack, ignore, sides, battle_map)
+        if target is None:
+            continue
+        score = damage_score(attack) * max(1, int(option.get('count') or 1))
+        if best is None or score > best[0]:
+            best = (score, option, attack, target, cost)
+    if best is None:
+        return []
+    _score, option, attack, target, cost = best
+    count = max(1, int(option.get('count') or 1))
+    strike_lines, _killed = execute_strikes(
+        enemy, target, [attack] * count, sides, ignore_sides, battle_map, crit_mode=crit_mode)
+    enemy.legendary_remaining = remaining - cost
+    header = (f"👑 {enemy.name} — легендарное действие «{option['name']}» "
+              f"(стоит {cost})")
+    return [header, *strike_lines]

@@ -23,7 +23,9 @@ from statblock_parser import ABILITY_ORDER, ABILITY_LABEL
 SPIN = '⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏'
 CHAR_KEYS = ('ability_scores', 'ability_mods', 'saves', 'skills', 'senses',
              'vulnerabilities', 'resistances', 'immunities', 'condition_immunities',
-             'languages', 'cr', 'prof_bonus', 'size', 'type', 'traits')
+             'languages', 'cr', 'prof_bonus', 'size', 'type', 'traits',
+             'legendary_actions', 'legendary_resistance', 'lair_actions',
+             'special_actions', 'bonus_actions', 'reactions')
 
 
 class BestiaryDialog(QDialog):
@@ -267,8 +269,11 @@ class BestiaryDialog(QDialog):
         self._render_monster(m)
         self.btn_import.setEnabled(True)
         pics = len(m.get('portraits') or [])
-        self.status.setText(f"Готов к импорту: {m['name']}"
-                            + (f'  ·  картинок в галерее: {pics}' if pics else '  ·  без галереи'))
+        notes = len(m.get('warnings') or []) + len(m.get('errors') or [])
+        tail = f'  ·  картинок в галерее: {pics}' if pics else '  ·  без галереи'
+        if notes:
+            tail += f'  ·  предупреждений: {notes}'
+        self.status.setText(f"Готов к импорту: {m['name']}{tail}")
 
     def _chip(self, text, tone):
         lab = QLabel(text)
@@ -299,6 +304,20 @@ class BestiaryDialog(QDialog):
     def _render_monster(self, m):
         p = self.pal
         self._clear_preview()
+        problems = [(p['danger'], item) for item in (m.get('errors') or [])]
+        problems += [(p['warning'], item) for item in (m.get('warnings') or [])]
+        if problems:
+            box = QLabel('\n'.join(f'⚠ {item}' for _tone, item in problems))
+            box.setObjectName('importWarnings')
+            box.setWordWrap(True)
+            box.setStyleSheet(
+                f"background: {p['field_bg']}; color: {p['fg']};"
+                f"border: 2px solid {p['warning']}; border-radius: 8px; padding: 8px;")
+            self.preview_lay.addWidget(box)
+            note = QLabel('Импорт не заблокирован: карточку можно забрать и поправить в редакторе.')
+            note.setWordWrap(True)
+            note.setProperty('role', 'muted')
+            self.preview_lay.addWidget(note)
 
         head = QHBoxLayout()
         head.setSpacing(12)
@@ -398,13 +417,53 @@ class BestiaryDialog(QDialog):
         hh.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
         for r, a in enumerate(atks):
             mark = ' ✦' if a.get('magical') else ''
-            dmg = f"{a['damage_dice_count']}{a['damage_dice_type']}{a['damage_modifier']:+d}"
+            dmg = bestiary_core.format_damage(a)
             for c, val in enumerate((a['name'] + mark, f"{a['attack_bonus']:+d}", dmg,
                                      a.get('damage_type') or '—',
                                      f"{a.get('range_ft', 5)} фт")):
                 table.setItem(r, c, QTableWidgetItem(str(val)))
         table.setFixedHeight(min(210, 30 * (len(atks) + 1) + 12))
         self.preview_lay.addWidget(table)
+
+        legendary = m.get('legendary_actions') or None
+        if legendary:
+            self._section('👑 Легендарные действия')
+            cap = QLabel(f"За раунд: {legendary.get('per_round')}. "
+                         'В конце чужого хода тратится вариант, который бьёт известной атакой.')
+            cap.setWordWrap(True)
+            self.preview_lay.addWidget(cap)
+            for option in legendary.get('options') or []:
+                mark = ' · в бою' if option.get('usable') else ' · только в карточке'
+                line = QLabel(f"{option.get('name')} (стоит {option.get('cost', 1)}){mark}. "
+                              f"{option.get('desc', '')}")
+                line.setWordWrap(True)
+                self.preview_lay.addWidget(line)
+        resist = m.get('legendary_resistance')
+        if resist:
+            self._kv('Легендарное сопротивление',
+                     f"{resist.get('count')}/день. {resist.get('desc', '')}")
+        lair = m.get('lair_actions') or None
+        if lair and (lair.get('actions') or lair.get('intro')):
+            self._section('🕳 Действия логова')
+            hint = QLabel('Сохранены в карточке. Симулятор их не разыгрывает.')
+            hint.setWordWrap(True)
+            hint.setProperty('role', 'muted')
+            self.preview_lay.addWidget(hint)
+            for action in (lair.get('actions') or [])[:6]:
+                line = QLabel(action)
+                line.setWordWrap(True)
+                self.preview_lay.addWidget(line)
+        specials = m.get('special_actions') or []
+        if specials:
+            self._section('Особые действия')
+            hint = QLabel('Нет броска атаки — в раунде не выполняются, текст сохранён.')
+            hint.setWordWrap(True)
+            hint.setProperty('role', 'muted')
+            self.preview_lay.addWidget(hint)
+            for action in specials:
+                line = QLabel(f"{action.get('name')}. {action.get('desc', '')}")
+                line.setWordWrap(True)
+                self.preview_lay.addWidget(line)
 
         self._section('🛡 Защиты и чувства')
         self._kv('Уязвимости', ', '.join(m.get('vulnerabilities') or []))

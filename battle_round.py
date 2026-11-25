@@ -9,7 +9,8 @@
 import random
 
 from combat_core import (execute_strikes, resolve_strikes, strike_reach,
-                         normalize_crit_mode)
+                         normalize_crit_mode, refresh_legendary_pool,
+                         legendary_after_turn)
 
 
 def dex_modifier(enemy) -> int:
@@ -88,9 +89,20 @@ def run_round(sides, side_names, ignore_sides, battle_map, engine, auto_move=Tru
         shown = ', '.join(f'{enemy.name} ({total})' for total, _dex, _tie, _idx, enemy in order)
         log.append(f'Инициатива: {shown}')
 
+    for side in sides:
+        for enemy in side:
+            refresh_legendary_pool(enemy, reset=False)
+
+    previous = None
     for _total, _dex, _tie, side_idx, attacker in order:
+        if previous is not None:
+            log.extend(legendary_after_turn(
+                previous, sides, ignore_sides, battle_map, crit_mode))
         if not attacker.alive:          # умер раньше в этом раунде — ход пропускает
+            previous = None
             continue
+        refresh_legendary_pool(attacker, reset=True)  # пул возвращается в начале своего хода
+        previous = attacker
         decision = engine.decide(attacker, sides, ignore_sides.get(side_idx, set()))
         target = decision.target
         if not target:
@@ -132,6 +144,9 @@ def run_round(sides, side_names, ignore_sides, battle_map, engine, auto_move=Tru
                                          sides, ignore_sides, battle_map,
                                          crit_mode=crit_mode)
         log.extend(lines)
+    if previous is not None:
+        log.extend(legendary_after_turn(
+            previous, sides, ignore_sides, battle_map, crit_mode))
     log.append('')
 
     for side in sides:                      # фаза регенерации

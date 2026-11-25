@@ -11,7 +11,7 @@ class Attack:
 
     def __init__(self, name: str, attack_bonus: int, damage_dice_count: int,
                  damage_dice_type: str, damage_modifier: int, damage_type: str = "",
-                 range_ft: int = 5, magical: bool = False):
+                 range_ft: int = 5, magical: bool = False, extra_damage=None):
         self.name = name
         self.attack_bonus = attack_bonus
         self.damage_dice_count = damage_dice_count
@@ -20,6 +20,7 @@ class Attack:
         self.damage_type = damage_type
         self.range_ft = range_ft
         self.magical = bool(magical)
+        self.extra_damage = [dict(part) for part in (extra_damage or [])]
 
     def to_dict(self):
         return {
@@ -31,6 +32,7 @@ class Attack:
             'damage_type': self.damage_type,
             'range_ft': self.range_ft,
             'magical': self.magical,
+            'extra_damage': [dict(part) for part in self.extra_damage],
         }
 
     @classmethod
@@ -44,6 +46,7 @@ class Attack:
             data.get('damage_type', ''),
             data.get('range_ft', 5),
             data.get('magical', False),
+            data.get('extra_damage') or None,
         )
 
 
@@ -82,6 +85,13 @@ class Enemy(Subject):
         self.size = None
         self.type = None
         self.traits = []
+        self.legendary_actions = None
+        self.legendary_resistance = None
+        self.lair_actions = None
+        self.special_actions = []
+        self.bonus_actions = []
+        self.reactions = []
+        self.legendary_remaining = None
         self._rng = rng if rng is not None else random
 
     def take_damage(self, damage: int):
@@ -171,6 +181,13 @@ class Enemy(Subject):
             'immunities': self.immunities, 'condition_immunities': self.condition_immunities,
             'languages': self.languages, 'cr': self.cr, 'prof_bonus': self.prof_bonus,
             'size': self.size, 'type': self.type, 'traits': self.traits,
+            'legendary_actions': self.legendary_actions,
+            'legendary_resistance': self.legendary_resistance,
+            'lair_actions': self.lair_actions,
+            'special_actions': self.special_actions,
+            'bonus_actions': self.bonus_actions,
+            'reactions': self.reactions,
+            'legendary_remaining': self.legendary_remaining,
         }
 
     @classmethod
@@ -199,6 +216,13 @@ class Enemy(Subject):
         enemy.size = data.get('size')
         enemy.type = data.get('type')
         enemy.traits = [dict(tr) for tr in (data.get('traits') or [])]
+        enemy.legendary_actions = data.get('legendary_actions')
+        enemy.legendary_resistance = data.get('legendary_resistance')
+        enemy.lair_actions = data.get('lair_actions')
+        enemy.special_actions = list(data.get('special_actions') or [])
+        enemy.bonus_actions = list(data.get('bonus_actions') or [])
+        enemy.reactions = list(data.get('reactions') or [])
+        enemy.legendary_remaining = data.get('legendary_remaining')
 
         strategy_type = data.get('strategy_type', 'RandomStrategy')
         from battle_strategies import (AggressiveStrategy, DefensiveStrategy,

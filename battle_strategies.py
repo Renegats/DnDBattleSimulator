@@ -27,10 +27,18 @@ def is_healing_attack(attack) -> bool:
     return any(marker in name for marker in _HEAL_MARKERS)
 
 
+def _component_average(count, dice, modifier):
+    sides = int(str(dice).split('d')[-1])
+    return count * (sides + 1) / 2.0 + modifier
+
+
 def damage_score(a):
-    """Средний урон атаки: count * (sides + 1) / 2 + mod."""
-    sides = int(str(a.damage_dice_type).split('d')[-1])
-    return a.damage_dice_count * (sides + 1) / 2.0 + a.damage_modifier
+    """Средний урон атаки: кости + модификатор, плюс дополнительный урон."""
+    total = _component_average(a.damage_dice_count, a.damage_dice_type, a.damage_modifier)
+    for extra in getattr(a, 'extra_damage', None) or []:
+        total += _component_average(extra.get('dice_count', 0), extra.get('dice_type', 'd6'),
+                                    extra.get('modifier', 0))
+    return total
 
 
 def _offensive_pool(attacker, target):
