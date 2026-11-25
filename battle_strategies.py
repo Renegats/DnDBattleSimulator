@@ -1,6 +1,13 @@
 from abc import ABC, abstractmethod
 import random
 
+from rng_channel import active as _active_rng
+
+
+def _rng():
+    """Случайная тактика. В пакете — генератор боя, иначе модульный random."""
+    return _active_rng(random)
+
 
 def distance_ft_between(a, b):
     """Дистанция между токенами в футах (0, если карты/позиций нет)"""
@@ -128,13 +135,13 @@ class RandomStrategy(BattleStrategy):
     """Случайная - случайная цель из доступных (или ближайшая, если вокруг пусто)."""
     def select_target(self, attacker, all_sides, ignore_sides):
         enemies = self._collect_enemies(attacker, all_sides, ignore_sides)
-        return self._pick_target(attacker, enemies, lambda pool: random.choice(pool))
+        return self._pick_target(attacker, enemies, lambda pool: _rng().choice(pool))
 
     def select_attack(self, attacker, target):
         pool = _offensive_pool(attacker, target)
         if not pool:
             return None
-        return random.choice(pool)
+        return _rng().choice(pool)
 
 
 class SupportStrategy(BattleStrategy):
