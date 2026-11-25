@@ -12,8 +12,8 @@ from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtGui import QPixmap
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QHBoxLayout, QGridLayout, QLabel, QLineEdit, QSpinBox,
-                             QComboBox, QPushButton, QCheckBox, QPlainTextEdit,
-                             QScrollArea, QStackedWidget, QGroupBox, QFrame,
+                             QComboBox, QPushButton, QCheckBox,
+                             QScrollArea, QSplitter, QStackedWidget, QGroupBox, QFrame,
                              QMessageBox, QFileDialog, QDialog, QTableWidget,
                              QTableWidgetItem, QHeaderView, QButtonGroup, QSlider)
 
@@ -21,11 +21,13 @@ import battle_round
 from battle_strategies import (AggressiveStrategy, DefensiveStrategy,
                                RandomStrategy, SupportStrategy)
 from combat_core import normalize_crit_mode
+from combat_log import dump_log, map_marks, render_log
 from decision_engine import DecisionEngine
 from factory import EnemyFactory
 from observer import Observer
 from qt_theme import QtTheme
 from qt_map_view import MapView, DEFAULT_OPTS, SIDE_PALETTES, BG_MODES
+from qt_combat_log import CombatLogPanel
 from qt_widgets import IconButton, PortraitCard
 import qt_async
 import portraits
@@ -89,6 +91,8 @@ class MainWindow(QMainWindow):
         self.sides, self.side_names, self.ignore_sides = [], [], {}
         self.alliance_settings = []
         self.battle_map = None
+        self.battle_events = []
+        self.round_no = 0
         self.selected = None
         self.cards, self.all_vars = [], []
         self.enemy_labels, self.side_checks = {}, []
@@ -462,13 +466,18 @@ class MainWindow(QMainWindow):
             self.battle_map = BattleMap(width=map_w, height=map_h)
             self.ignore_sides = {}
             self.selected = None
+            self.round_no = 0
+            self.battle_events = []
             self.battle_map.formation_placement(self.sides)
             self.rebuild_battle_lists()
             self.refresh_alliances()
             self.map_view.rebuild(self.battle_map, self.sides, self.selected)
-            self.log.clear()
+            self.map_view.set_round_lines([])
+            self.log_panel.clear()
+            self.log_panel.set_roster(self.sides, self.side_names)
             total = sum(len(s) for s in self.sides)
-            self.log.appendPlainText(f'Армии созданы: сторон {n}, существ {total}.')
+            self.battle_events.extend(self.log_panel.add_note(
+                f'Армии созданы: сторон {n}, существ {total}.'))
             self.status.showMessage(f'Армии созданы: {n} сторон, {total} существ.')
             self.select_tab(1)
         except Exception as e:
@@ -486,17 +495,14 @@ class MainWindow(QMainWindow):
         self.battle_lay = QVBoxLayout(self.battle_host)
         self.battle_scroll.setWidget(self.battle_host)
         lay.addWidget(self.battle_scroll, 2)
-        cap = QLabel('Результаты боя:')
-        cap.setProperty('role', 'title')
-        lay.addWidget(cap)
-        self.log = QPlainTextEdit()
-        self.log.setReadOnly(True)
-        self.log.setStyleSheet("font-family: 'Consolas', 'Courier New'; font-size: 9pt;")
-        lay.addWidget(self.log, 3)
+        self.log_panel = CombatLogPanel()
+        self.log_panel.entry_activated.connect(self.on_log_entry)
+        lay.addWidget(self.log_panel, 3)
         row = QHBoxLayout()
         for text, fn in (('▶  Провести раунд боя', self.run_round),
                          ('Массовое редактирование', self.mass_edit),
                          ('📋 Копировать лог', self.copy_log),
+                         ('💾 Экспорт журнала', self.export_log),
                          ('🔍 Анализ сражения', self.open_analysis)):
             b = QPushButton(text)
             b.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -586,21 +592,28 @@ class MainWindow(QMainWindow):
         self.dirty.clear()
 
     def run_round(self):
-        outcome, text = battle_round.run_round(
+        result = battle_round.run_round(
             self.sides, self.side_names, self.ignore_sides, self.battle_map,
             self.engine, auto_move=self.auto_move.isChecked(),
-            crit_mode=self.crit_mode.currentData())
+            crit_mode=self.crit_mode.currentData(), round_no=self.round_no + 1)
+        outcome, text = result
         if outcome == 'empty':
             QMessageBox.warning(self, 'Ошибка', text)
             return
+        self.round_no += 1
+        self.battle_events.extend(result.events)
         self.suspend = True
-        self.log.appendPlainText(text)
+        self.log_panel.append_round(result.events)
         self.suspend = False
         self.refresh_all_labels()
         self.map_view.rebuild(self.battle_map, self.sides, self.selected)
+        self.map_view.set_round_lines(map_marks(result.events, self._token_radius))
         alive = sum(1 for s in self.sides for e in s if e.alive)
-        self.status.showMessage(f'Живых существ: {alive}' +
-                                ('  ·  бой завершён' if outcome == 'over' else ''))
+        attacks = sum(1 for event in result.events if event.kind == 'attack')
+        self.status.showMessage(
+            f'Раунд {self.round_no}: живых {alive}, атак {attacks}' +
+            ('  ·  бой завершён' if outcome == 'over' else '') +
+            '  ·  линии атак на карте')
 
     def selected_enemies(self):
         out = []
@@ -641,17 +654,87 @@ class MainWindow(QMainWindow):
                 lines.append(f'  {e.name}: {e.hp}/{e.max_hp} HP '
                              f'[{self._enemy_text(e).split("[")[-1]} ({st}){ign}')
             lines.append('')
-        self.log.appendPlainText('\n'.join(lines))
+        notes = self.log_panel.add_note('\n'.join(lines))
+        self.battle_events.extend(notes)
 
     def clear_log(self):
-        self.log.clear()
+        self.battle_events = []
+        self.log_panel.clear()
+        self.map_view.set_round_lines([])
 
     def copy_log(self):
-        cur = self.log.textCursor()
-        text = cur.selectedText().replace('\u2029', '\n') or self.log.toPlainText()
-        QApplication.clipboard().setText(text)
+        QApplication.clipboard().setText(render_log(self.battle_events))
         self.copy_btn.setText('✓ Скопировано')
         QTimer.singleShot(1200, lambda: self.copy_btn.setText('📋 Копировать лог'))
+
+    def export_log(self):
+        if not self.battle_events:
+            QMessageBox.information(self, 'Экспорт', 'Журнал пуст — сначала проведите раунд.')
+            return
+        os.makedirs('battle_exports', exist_ok=True)
+        stamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        default = os.path.join('battle_exports', f'log_{stamp}.md')
+        path, chosen = QFileDialog.getSaveFileName(
+            self, 'Экспорт журнала боя', default,
+            'Markdown (*.md);;Текст (*.txt);;JSON (*.json)')
+        if not path:
+            return
+        ext = os.path.splitext(path)[1].lower()
+        if ext not in ('.md', '.markdown', '.txt', '.json'):
+            if chosen and 'JSON' in chosen:
+                path += '.json'
+            elif chosen and 'Текст' in chosen:
+                path += '.txt'
+            else:
+                path += '.md'
+        try:
+            dump_log(self.battle_events, path)
+        except OSError as exc:
+            QMessageBox.critical(self, 'Экспорт', f'Не удалось записать файл: {exc}')
+            return
+        self.status.showMessage(f'Журнал сохранён: {path}')
+
+    def on_log_entry(self, event):
+        if self.battle_map is None:
+            return
+        involved = []
+        seen = set()
+        ids = []
+        if event.kind == 'initiative':
+            ids = [roll.actor_id for roll in event.rolls]
+        else:
+            ids = [event.actor_id, event.target_id]
+        for creature_id in ids:
+            enemy = self._find_enemy(creature_id)
+            if enemy is not None and id(enemy) not in seen:
+                seen.add(id(enemy))
+                involved.append(enemy)
+        if involved:
+            self.selected = involved[0]
+            self.map_view.focus_creatures(involved)
+            pos = self.battle_map.get_pos(involved[0])
+            names = ' · '.join(enemy.name for enemy in involved[:4])
+            extra = '' if len(involved) <= 4 else f' +{len(involved) - 4}'
+            self.map_info.setText(f'{names}{extra} · клетка {pos}')
+        self.map_view.set_focus_lines(
+            map_marks([event], self._token_radius, include_moves=True))
+        who = event.actor or event.kind
+        self.status.showMessage(f'Журнал: {who}' + (f' → {event.target}' if event.target else ''))
+
+    def _find_enemy(self, creature_id):
+        if creature_id is None:
+            return None
+        for side in self.sides:
+            for enemy in side:
+                if id(enemy) == creature_id:
+                    return enemy
+        return None
+
+    def _token_radius(self, creature_id):
+        enemy = self._find_enemy(creature_id)
+        if enemy is None or self.battle_map is None:
+            return 0.45
+        return self.battle_map.cells_of(enemy) / 2
 
     def open_analysis(self):
         log = self.engine.get_round_log()
@@ -853,6 +936,13 @@ class MainWindow(QMainWindow):
         self.cb_glow.setChecked(True)
         self.cb_glow.toggled.connect(lambda v: self.map_view.set_opt('glow', v))
         pl.addWidget(self.cb_glow)
+        self.cb_attacks = QCheckBox('Линии атак')
+        self.cb_attacks.setChecked(True)
+        self.cb_attacks.setToolTip(
+            'Последний раунд: красный — попадание, золотой — крит, '
+            'серый пунктир — промах, фиолетовый — натуральная 1, зелёный — лечение')
+        self.cb_attacks.toggled.connect(lambda v: self.map_view.set_opt('attack_lines', v))
+        pl.addWidget(self.cb_attacks)
 
         pl.addWidget(QLabel('Подписи токенов:'))
         self.cmb_labels = QComboBox()
@@ -920,11 +1010,21 @@ class MainWindow(QMainWindow):
                       'клик по зелёной клетке — шаг · картинку можно бросить на поле мышью')
         hint.setProperty('role', 'muted')
         right.addWidget(hint)
+        split = QSplitter(Qt.Orientation.Vertical)
         self.map_view = MapView(self.theme.palette())
         self.map_view.token_clicked.connect(self.on_token)
         self.map_view.cell_clicked.connect(self.on_cell)
         self.map_view.image_dropped.connect(self._apply_background_path)
-        right.addWidget(self.map_view, 1)
+        split.addWidget(self.map_view)
+        mirror = QWidget()
+        mirror_lay = QVBoxLayout(mirror)
+        mirror_lay.setContentsMargins(0, 0, 0, 0)
+        self.log_panel.attach_mirror(mirror_lay)
+        split.addWidget(mirror)
+        split.setStretchFactor(0, 3)
+        split.setStretchFactor(1, 1)
+        split.setSizes([520, 200])
+        right.addWidget(split, 1)
         self.map_info = QLabel('Токен не выбран.')
         self.map_info.setProperty('role', 'muted')
         right.addWidget(self.map_info)
@@ -968,7 +1068,7 @@ class MainWindow(QMainWindow):
             s.blockSignals(False)
             cap.setText(f'{label}: {o[key]}{suffix}')
         for cb, key in ((self.cb_grid, 'grid'), (self.cb_reach, 'reach'),
-                        (self.cb_glow, 'glow')):
+                        (self.cb_glow, 'glow'), (self.cb_attacks, 'attack_lines')):
             cb.blockSignals(True)
             cb.setChecked(o[key])
             cb.blockSignals(False)

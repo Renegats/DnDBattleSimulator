@@ -7,6 +7,7 @@ decision_engine — единый источник истины, чтобы мо�
 from decision_engine import (dmg_canon, active_defenses, is_nonmagical_only)
 from battle_strategies import distance_ft_between, is_healing_attack
 from creature_size import space_distance_ft
+from combat_log import CombatEvent, DamagePart
 
 # Как стол удваивает крит. 'double_all' — историческое поведение и дефолт.
 CRIT_DOUBLE_ALL = 'double_all'
@@ -137,26 +138,68 @@ def _apply_heal(attacker, target, atk):
     return target.hp - before
 
 
+def _roll_details(roll, attack):
+    """5 значений контракта perform_attack и, если есть, натуральная кость."""
+    hit, damage, total, critical, info = roll
+    natural = getattr(roll, 'natural', None)
+    modifier = getattr(roll, 'modifier', None)
+    if modifier is None:
+        modifier = getattr(attack, 'attack_bonus', None)
+    return hit, damage, total, critical, info, natural, modifier
+
+
+def _strike_result(hit, critical, natural):
+    if critical:
+        return 'crit'
+    if natural == 1:
+        return 'nat1'
+    if hit:
+        return 'hit'
+    return 'miss'
+
+
+def _actor_fields(attacker, target, battle_map):
+    def pos_of(creature):
+        if creature is None:
+            return None
+        pos = None
+        if battle_map is not None and hasattr(battle_map, 'get_pos'):
+            pos = battle_map.get_pos(creature)
+        if not pos:
+            pos = getattr(creature, 'pos', None)
+        if not pos:
+            return None
+        return (pos[0], pos[1])
+
+    return {
+        'actor': getattr(attacker, 'name', None),
+        'actor_id': id(attacker) if attacker is not None else None,
+        'actor_side': getattr(attacker, 'side', None),
+        'target': getattr(target, 'name', None) if target is not None else None,
+        'target_id': id(target) if target is not None else None,
+        'target_side': getattr(target, 'side', None) if target is not None else None,
+        'actor_pos': pos_of(attacker),
+        'target_pos': pos_of(target),
+    }
+
+
 def execute_strikes(attacker, target, strikes, sides, ignore_sides, battle_map,
-                    crit_mode=DEFAULT_CRIT_MODE):
+                    crit_mode=DEFAULT_CRIT_MODE, *, round_no=None, events=None,
+                    legendary=False):
+    """Удары и лечение. Возврат — прежний (строки, было_ли_убийство).
+
+    Если передан events, туда дописываются CombatEvent. Строки собраны из
+    event.text, поэтому текст лога не расходится со структурой.
+    """
     if target is None:
         return [], False
     crit_mode = normalize_crit_mode(crit_mode)
-    lines, any_killed = [], False
-    ignore = ignore_sides.get(attacker.side, set())
+    produced, any_killed = [], False
+    ignore = ignore_sides.get(getattr(attacker, 'side', None), set())
     for atk in strikes:
         if is_healing_attack(atk):
-            if (target is None or not getattr(target, 'alive', False)
-                    or getattr(target, 'side', None) != getattr(attacker, 'side', None)):
-                lines.append(f'{attacker.name} не применяет {atk.name}: лечить некого')
-                continue
-            if not in_range_of(attacker, target, atk, battle_map):
-                lines.append(f'{attacker.name} не может достать {target.name} лечением '
-                             f'({atk.name})')
-                continue
-            gained = _apply_heal(attacker, target, atk)
-            lines.append(f'{attacker.name} → {target.name} ({atk.name}) - ЛЕЧЕНИЕ! '
-                         f'+{gained} HP ({target.hp}/{target.max_hp})')
+            produced.extend(_heal_strike(
+                attacker, target, atk, battle_map, round_no, legendary))
             continue
         if target is None or not target.alive:
             target = nearest_in_range(attacker, atk, ignore, sides, battle_map)
@@ -167,32 +210,90 @@ def execute_strikes(attacker, target, strikes, sides, ignore_sides, battle_map,
             if alt is None:
                 continue
             target = alt
-        hit, damage, attack_roll, critical, damage_info = attacker.perform_attack(
-            atk, target.ac, crit_mode=crit_mode)
-        if hit:
-            magical = bool(getattr(atk, 'magical', False))
-            damage, dmg_note = modify_damage(target, damage, atk.damage_type, magical=magical)
-            target.take_damage(damage)
-            extra_notes = []
-            for extra in getattr(atk, 'extra_damage', None) or []:
-                raw = _roll_component(attacker, extra, critical, crit_mode)
-                final, note = modify_damage(target, raw, extra.get('damage_type', ''),
-                                            magical=magical)
-                target.take_damage(final)
-                label = extra.get('damage_type') or 'доп.'
-                extra_notes.append(f"+ {final} ({label}){note}")
-            crit_text = " КРИТИЧЕСКИЙ УДАР!" if critical else ""
-            extra_text = (' ' + ' '.join(extra_notes)) if extra_notes else ''
-            lines.append(f"{attacker.name} → {target.name} ({atk.name}: "
-                         f"{attack_roll} vs AC {target.ac}) - ПОПАДАНИЕ!{crit_text} "
-                         f"{damage_info}{dmg_note}{extra_text}")
-            if not target.alive:
-                lines.append(f"☠️ {target.name} УНИЧТОЖЕН!")
-                any_killed = True
-        else:
-            lines.append(f"{attacker.name} → {target.name} ({atk.name}: "
-                         f"{attack_roll} vs AC {target.ac}) - ПРОМАХ!")
+        hit_events, killed = _attack_strike(
+            attacker, target, atk, battle_map, crit_mode, round_no, legendary)
+        produced.extend(hit_events)
+        any_killed = any_killed or killed
+    if events is not None:
+        events.extend(produced)
+    lines = [event.text for event in produced if event.text is not None]
     return lines, any_killed
+
+
+def _heal_strike(attacker, target, atk, battle_map, round_no, legendary):
+    common = _actor_fields(attacker, target, battle_map)
+    common.update(round=round_no, legendary=legendary, action=getattr(atk, 'name', None))
+    if (target is None or not getattr(target, 'alive', False)
+            or getattr(target, 'side', None) != getattr(attacker, 'side', None)):
+        text = f'{attacker.name} не применяет {atk.name}: лечить некого'
+        return [CombatEvent(kind='heal', result='no_target', text=text, **common)]
+    if not in_range_of(attacker, target, atk, battle_map):
+        text = (f'{attacker.name} не может достать {target.name} лечением '
+                f'({atk.name})')
+        return [CombatEvent(kind='heal', result='out_of_reach', text=text, **common)]
+    before = getattr(target, 'hp', None)
+    gained = _apply_heal(attacker, target, atk)
+    after = getattr(target, 'hp', None)
+    text = (f'{attacker.name} → {target.name} ({atk.name}) - ЛЕЧЕНИЕ! '
+            f'+{gained} HP ({target.hp}/{target.max_hp})')
+    return [CombatEvent(
+        kind='heal', result='heal', text=text, heal_amount=gained,
+        hp_before=before, hp_after=after,
+        max_hp=getattr(target, 'max_hp', None), **common)]
+
+
+def _attack_strike(attacker, target, atk, battle_map, crit_mode, round_no, legendary):
+    roll = attacker.perform_attack(atk, target.ac, crit_mode=crit_mode)
+    hit, damage, attack_roll, critical, damage_info, natural, modifier = _roll_details(roll, atk)
+    result = _strike_result(hit, critical, natural)
+    common = _actor_fields(attacker, target, battle_map)
+    before = getattr(target, 'hp', None)
+    if hit:
+        magical = bool(getattr(atk, 'magical', False))
+        final, dmg_note = modify_damage(target, damage, atk.damage_type, magical=magical)
+        target.take_damage(final)
+        parts = [DamagePart(getattr(atk, 'damage_type', '') or '', damage, final, dmg_note, False)]
+        extra_notes = []
+        for extra in getattr(atk, 'extra_damage', None) or []:
+            raw = _roll_component(attacker, extra, critical, crit_mode)
+            extra_final, note = modify_damage(target, raw, extra.get('damage_type', ''),
+                                              magical=magical)
+            target.take_damage(extra_final)
+            label = extra.get('damage_type') or 'доп.'
+            extra_notes.append(f"+ {extra_final} ({label}){note}")
+            parts.append(DamagePart(label, raw, extra_final, note, True))
+        crit_text = " КРИТИЧЕСКИЙ УДАР!" if critical else ""
+        extra_text = (' ' + ' '.join(extra_notes)) if extra_notes else ''
+        text = (f"{attacker.name} → {target.name} ({atk.name}: "
+                f"{attack_roll} vs AC {target.ac}) - ПОПАДАНИЕ!{crit_text} "
+                f"{damage_info}{dmg_note}{extra_text}")
+        after = getattr(target, 'hp', None)
+        event = CombatEvent(
+            kind='attack', result=result, crit=bool(critical), text=text,
+            action=getattr(atk, 'name', None), natural=natural, modifier=modifier,
+            attack_total=attack_roll, ac=getattr(target, 'ac', None),
+            damages=parts, hp_before=before, hp_after=after,
+            max_hp=getattr(target, 'max_hp', None),
+            round=round_no, legendary=legendary, **common)
+        produced = [event]
+        killed = not getattr(target, 'alive', True)
+        if killed:
+            produced.append(CombatEvent(
+                kind='death', result='death', text=f"☠️ {target.name} УНИЧТОЖЕН!",
+                action=getattr(atk, 'name', None), hp_before=before, hp_after=after,
+                max_hp=getattr(target, 'max_hp', None),
+                round=round_no, legendary=legendary, **common))
+        return produced, killed
+    text = (f"{attacker.name} → {target.name} ({atk.name}: "
+            f"{attack_roll} vs AC {target.ac}) - ПРОМАХ!")
+    event = CombatEvent(
+        kind='attack', result=result, crit=False, text=text,
+        action=getattr(atk, 'name', None), natural=natural, modifier=modifier,
+        attack_total=attack_roll, ac=getattr(target, 'ac', None),
+        damages=[], hp_before=before, hp_after=before,
+        max_hp=getattr(target, 'max_hp', None),
+        round=round_no, legendary=legendary, **common)
+    return [event], False
 
 
 def refresh_legendary_pool(enemy, reset=False):
@@ -205,22 +306,27 @@ def refresh_legendary_pool(enemy, reset=False):
 
 
 def legendary_after_turn(just_acted, sides, ignore_sides, battle_map,
-                         crit_mode=DEFAULT_CRIT_MODE):
+                         crit_mode=DEFAULT_CRIT_MODE, *, round_no=None, events=None):
     """Конец чужого хода: каждое другое легендарное существо тратит одно действие.
 
     В бой уходит только вариант, который сводится к уже известной атаке и
     достаёт цель. Спасброски, перемещение и действия логова здесь не считаются.
+    Возврат — список прежних текстовых строк. events, если передан, получает
+    те же CombatEvent.
     """
-    lines = []
+    produced = []
     for side in sides:
         for enemy in side:
             if enemy is just_acted or not getattr(enemy, 'alive', False):
                 continue
-            lines.extend(_spend_legendary(enemy, sides, ignore_sides, battle_map, crit_mode))
-    return lines
+            produced.extend(_spend_legendary(
+                enemy, sides, ignore_sides, battle_map, crit_mode, round_no=round_no))
+    if events is not None:
+        events.extend(produced)
+    return [event.text for event in produced if event.text is not None]
 
 
-def _spend_legendary(enemy, sides, ignore_sides, battle_map, crit_mode):
+def _spend_legendary(enemy, sides, ignore_sides, battle_map, crit_mode, round_no=None):
     from battle_strategies import damage_score
     block = getattr(enemy, 'legendary_actions', None)
     if not block:
@@ -251,9 +357,22 @@ def _spend_legendary(enemy, sides, ignore_sides, battle_map, crit_mode):
         return []
     _score, option, attack, target, cost = best
     count = max(1, int(option.get('count') or 1))
-    strike_lines, _killed = execute_strikes(
-        enemy, target, [attack] * count, sides, ignore_sides, battle_map, crit_mode=crit_mode)
+    strikes = []
+    execute_strikes(
+        enemy, target, [attack] * count, sides, ignore_sides, battle_map,
+        crit_mode=crit_mode, round_no=round_no, events=strikes, legendary=True)
     enemy.legendary_remaining = remaining - cost
-    header = (f"👑 {enemy.name} — легендарное действие «{option['name']}» "
-              f"(стоит {cost})")
-    return [header, *strike_lines]
+    for event in strikes:
+        if not event.reason:
+            event.reason = option['name']
+    header_text = (f"👑 {enemy.name} — легендарное действие «{option['name']}» "
+                   f"(стоит {cost})")
+    header = CombatEvent(
+        kind='legendary', round=round_no, legendary=True, cost=cost,
+        action=option['name'], text=header_text, reason=option.get('desc') or None,
+        actor=getattr(enemy, 'name', None), actor_id=id(enemy),
+        actor_side=getattr(enemy, 'side', None),
+        target=getattr(target, 'name', None), target_id=id(target),
+        target_side=getattr(target, 'side', None),
+    )
+    return [header, *strikes]

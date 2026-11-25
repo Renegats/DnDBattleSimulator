@@ -1,8 +1,9 @@
 """GUI-независимый оркестратор раунда (фаза 1 миграции на Qt).
 
 Семантика близка к прежнему BattleLogic._run_round_inner, но БЕЗ tkinter:
-ни messagebox, ни вставки в виджет. Возвращает (outcome, log_text); вывод решает
-вызывающий фронтенд. Оба фронтенда зависят от этого модуля.
+ни messagebox, ни вставки в виджет. Возвращает RoundResult: распаковка
+`outcome, text = run_round(...)` сохранена, текст собран из CombatEvent
+(`result.events`). Оба фронтенда зависят от этого модуля.
 
 Ход внутри раунда — по инициативе 5e (d20 + мод Ловкости), а не сторона за стороной.
 """
@@ -11,6 +12,8 @@ import random
 from combat_core import (execute_strikes, resolve_strikes, strike_reach,
                          normalize_crit_mode, refresh_legendary_pool,
                          legendary_after_turn)
+from combat_log import (CombatEvent, InitiativeEntry, InitiativeRoll,
+                        RoundResult, format_pos, render_log)
 
 
 def dex_modifier(enemy) -> int:
@@ -56,21 +59,36 @@ def living_initiative(sides, rng=None):
             source = rng
             if source is None:
                 source = getattr(enemy, '_rng', None) or random
-            roll = source.randint(1, 20)
-            total = roll + dex_modifier(enemy)
+            natural = source.randint(1, 20)
+            modifier = dex_modifier(enemy)
+            total = natural + modifier
             tie = source.randint(1, 20)
-            rows.append((total, dex_score(enemy), tie, side_idx, enemy))
+            rows.append(InitiativeEntry(
+                total, dex_score(enemy), tie, side_idx, enemy, natural, modifier))
     rows.sort(key=lambda row: (row[0], row[1], row[2]), reverse=True)
     return rows
 
 
-def run_round(sides, side_names, ignore_sides, battle_map, engine, auto_move=True,
-              crit_mode='double_all', rng=None):
-    """Один раунд боя. outcome: 'continue' | 'over' | 'empty'."""
-    if not sides or not any(any(e.alive for e in side) for side in sides):
-        return 'empty', 'Армии не созданы или все мертвы!'
+def _stamp_reason(events, start, reason):
+    if not reason:
+        return
+    for event in events[start:]:
+        if not event.reason:
+            event.reason = reason
 
-    log = ['=== НОВЫЙ РАУНД БОЯ ===']
+
+def run_round(sides, side_names, ignore_sides, battle_map, engine, auto_move=True,
+              crit_mode='double_all', rng=None, round_no=None):
+    """Один раунд боя. outcome: 'continue' | 'over' | 'empty'.
+
+    Результат распаковывается в (outcome, text). События — result.events.
+    text всегда равен render_log(events).
+    """
+    if not sides or not any(any(e.alive for e in side) for side in sides):
+        return RoundResult('empty', 'Армии не созданы или все мертвы!', [])
+
+    events = [CombatEvent(kind='round_start', round=round_no,
+                          text='=== НОВЫЙ РАУНД БОЯ ===')]
     crit_mode = normalize_crit_mode(crit_mode)
     engine.begin_round()
 
@@ -87,7 +105,13 @@ def run_round(sides, side_names, ignore_sides, battle_map, engine, auto_move=Tru
     order = living_initiative(sides, rng)
     if order:
         shown = ', '.join(f'{enemy.name} ({total})' for total, _dex, _tie, _idx, enemy in order)
-        log.append(f'Инициатива: {shown}')
+        rolls = [InitiativeRoll(
+            name=row.enemy.name, side=getattr(row.enemy, 'side', row.side_idx),
+            actor_id=id(row.enemy), natural=row.natural, modifier=row.modifier,
+            total=row.total, tie_roll=row.tie, dex=row.dex,
+        ) for row in order]
+        events.append(CombatEvent(
+            kind='initiative', round=round_no, text=f'Инициатива: {shown}', rolls=rolls))
 
     for side in sides:
         for enemy in side:
@@ -96,8 +120,9 @@ def run_round(sides, side_names, ignore_sides, battle_map, engine, auto_move=Tru
     previous = None
     for _total, _dex, _tie, side_idx, attacker in order:
         if previous is not None:
-            log.extend(legendary_after_turn(
-                previous, sides, ignore_sides, battle_map, crit_mode))
+            legendary_after_turn(
+                previous, sides, ignore_sides, battle_map, crit_mode,
+                round_no=round_no, events=events)
         if not attacker.alive:          # умер раньше в этом раунде — ход пропускает
             previous = None
             continue
@@ -106,15 +131,30 @@ def run_round(sides, side_names, ignore_sides, battle_map, engine, auto_move=Tru
         decision = engine.decide(attacker, sides, ignore_sides.get(side_idx, set()))
         target = decision.target
         if not target:
-            log.append(f'{attacker.name} - нет подходящих целей для атаки')
+            events.append(CombatEvent(
+                kind='no_target', round=round_no, actor=attacker.name,
+                actor_id=id(attacker), actor_side=getattr(attacker, 'side', None),
+                text=f'{attacker.name} - нет подходящих целей для атаки'))
             continue
         if decision.rationale:
-            log.append(f'🧠 {attacker.name}: {decision.rationale}')
+            events.append(CombatEvent(
+                kind='decision', round=round_no, actor=attacker.name,
+                actor_id=id(attacker), actor_side=getattr(attacker, 'side', None),
+                target=getattr(target, 'name', None), target_id=id(target),
+                target_side=getattr(target, 'side', None),
+                reason=decision.rationale,
+                action=getattr(decision.attack, 'name', None),
+                text=f'🧠 {attacker.name}: {decision.rationale}'))
 
         if decision.attack is None:     # делегат (tier0/1) или мультиатака
             strikes = resolve_strikes(attacker, target)
             if not strikes:
-                log.append(f'{attacker.name} - нет доступных атак')
+                events.append(CombatEvent(
+                    kind='no_attack', round=round_no, actor=attacker.name,
+                    actor_id=id(attacker), actor_side=getattr(attacker, 'side', None),
+                    target=getattr(target, 'name', None), target_id=id(target),
+                    target_side=getattr(target, 'side', None),
+                    text=f'{attacker.name} - нет доступных атак'))
                 continue
             reach = strike_reach(strikes)
         else:                           # smart-одиночная (tier>=2)
@@ -127,12 +167,31 @@ def run_round(sides, side_names, ignore_sides, battle_map, engine, auto_move=Tru
             if decision.move_intent == 'hold' and dist <= reach:
                 pass                    # держим дистанцию
             elif dist > reach and auto_move:
+                origin = battle_map.get_pos(attacker)
                 battle_map.move_towards(attacker, target, attacker.speed,
                                         reach_ft=reach)
+                dest = battle_map.get_pos(attacker)
+                if origin and dest and (origin[0], origin[1]) != (dest[0], dest[1]):
+                    events.append(CombatEvent(
+                        kind='move', round=round_no, actor=attacker.name,
+                        actor_id=id(attacker), actor_side=getattr(attacker, 'side', None),
+                        target=getattr(target, 'name', None), target_id=id(target),
+                        target_side=getattr(target, 'side', None),
+                        action='движение',
+                        from_pos=(origin[0], origin[1]), to_pos=(dest[0], dest[1]),
+                        reason=decision.rationale or None,
+                        text=(f'{attacker.name} перемещается {format_pos(origin)} → '
+                              f'{format_pos(dest)}')))
                 dist = battle_map.distance_ft(attacker, target)
             if dist > reach:
-                log.append(f'{attacker.name} не может достать {target.name} '
-                           f'({dist} фт > {reach} фт)')
+                events.append(CombatEvent(
+                    kind='out_of_reach', round=round_no, actor=attacker.name,
+                    actor_id=id(attacker), actor_side=getattr(attacker, 'side', None),
+                    target=getattr(target, 'name', None), target_id=id(target),
+                    target_side=getattr(target, 'side', None),
+                    reason=decision.rationale or None,
+                    text=(f'{attacker.name} не может достать {target.name} '
+                          f'({dist} фт > {reach} фт)')))
                 continue
             if decision.attack is None and decision.tier <= 1 \
                     and not getattr(attacker, 'multiattack', None):
@@ -140,14 +199,15 @@ def run_round(sides, side_names, ignore_sides, battle_map, engine, auto_move=Tru
                 if not strikes:
                     continue
 
-        lines, _killed = execute_strikes(attacker, target, strikes,
-                                         sides, ignore_sides, battle_map,
-                                         crit_mode=crit_mode)
-        log.extend(lines)
+        before = len(events)
+        execute_strikes(attacker, target, strikes, sides, ignore_sides, battle_map,
+                        crit_mode=crit_mode, round_no=round_no, events=events)
+        _stamp_reason(events, before, decision.rationale)
     if previous is not None:
-        log.extend(legendary_after_turn(
-            previous, sides, ignore_sides, battle_map, crit_mode))
-    log.append('')
+        legendary_after_turn(
+            previous, sides, ignore_sides, battle_map, crit_mode,
+            round_no=round_no, events=events)
+    events.append(CombatEvent(kind='spacer', round=round_no, text=''))
 
     for side in sides:                      # фаза регенерации
         for e in side:
@@ -155,15 +215,31 @@ def run_round(sides, side_names, ignore_sides, battle_map, engine, auto_move=Tru
                 prev = e.hp
                 e.regenerate()
                 if e.hp > prev:
-                    log.append(f'💚 {e.name} восстанавливает {e.hp - prev} HP '
-                               f'благодаря регенерации')
+                    gained = e.hp - prev
+                    events.append(CombatEvent(
+                        kind='heal', result='heal', round=round_no, action='регенерация',
+                        actor=e.name, actor_id=id(e), actor_side=getattr(e, 'side', None),
+                        heal_amount=gained, hp_before=prev, hp_after=e.hp,
+                        max_hp=getattr(e, 'max_hp', None),
+                        text=(f'💚 {e.name} восстанавливает {gained} HP '
+                              f'благодаря регенерации')))
 
     alive = [side_names[i] for i, s in enumerate(sides) if any(e.alive for e in s)]
     if len(alive) <= 1:
         if alive:
-            log.append(f'\n🎉 {alive[0]} ПОБЕДИЛА!\n')
+            events.append(CombatEvent(
+                kind='round_end', result='victory', round=round_no,
+                text=f'\n🎉 {alive[0]} ПОБЕДИЛА!\n'))
+            outcome = 'over'
         else:
-            log.append('\n⚔️ Все стороны уничтожены! Ничья.\n')
-        return 'over', '\n'.join(log)
-    log.append(f"\nБитва продолжается: {' vs '.join(alive)}\n")
-    return 'continue', '\n'.join(log)
+            events.append(CombatEvent(
+                kind='round_end', result='draw', round=round_no,
+                text='\n⚔️ Все стороны уничтожены! Ничья.\n'))
+            outcome = 'over'
+    else:
+        events.append(CombatEvent(
+            kind='round_end', result='continue', round=round_no,
+            text=f"\nБитва продолжается: {' vs '.join(alive)}\n"))
+        outcome = 'continue'
+    text = render_log(events)
+    return RoundResult(outcome, text, events)
