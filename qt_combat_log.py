@@ -347,6 +347,40 @@ class CombatLogPanel(QWidget):
     def clear(self):
         self.model.clear()
 
+    def load_events(self, events):
+        """Пересобирает дерево из плоского журнала: раунд — папка, заметки — строки.
+
+        Тихий режим, чтобы перерисовка не считалась кликом по записи.
+        """
+        self._quiet = True
+        self.model.clear()
+        batch = []
+        kind = None
+
+        def flush():
+            nonlocal batch, kind
+            if not batch:
+                return
+            if kind == 'note':
+                self.model.append_notes(batch)
+            else:
+                self.model.append_round(batch)
+            batch = []
+
+        for event in events or []:
+            if event is None:
+                continue
+            key = 'note' if event.kind == 'note' or event.round is None else event.round
+            if batch and key != kind:
+                flush()
+            kind = key
+            batch.append(event)
+        flush()
+        self._reveal_last()
+        for view in self._views:
+            view.expandAll()
+        self._quiet = False
+
     def _reveal_last(self):
         if self.model.rowCount() == 0:
             return
