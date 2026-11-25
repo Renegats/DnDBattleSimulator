@@ -60,7 +60,7 @@ class TestFactoryWarning(unittest.TestCase):
 class TestBestiaryCleanup(unittest.TestCase):
 
     def test_importer_num_words_has_no_duplicate_keys(self):
-        # Словарь остался один, в bestiary_core: Tk-импортёр больше не копирует его.
+        # Словарь числительных один и живёт в bestiary_core.
         tree = ast.parse((ROOT / 'bestiary_core.py').read_text(encoding='utf-8'))
         found = False
         for stmt in tree.body:
@@ -76,9 +76,6 @@ class TestBestiaryCleanup(unittest.TestCase):
             self.assertEqual(values['две'], 2)
             self.assertEqual(values['два'], 2)
         self.assertTrue(found)
-        importer = (ROOT / 'bestiary_importer.py').read_text(encoding='utf-8')
-        self.assertIn('bestiary_core.parse_statblock', importer)
-        self.assertNotIn('ATTACK_RE', importer)
 
     def test_search_query_is_passed_as_request_params(self):
         import tempfile
@@ -108,28 +105,6 @@ class TestBestiaryCleanup(unittest.TestCase):
             'GET', seen['url'], params=seen['params']).prepare().url
         self.assertNotIn(' ', prepared)
         self.assertNotIn('орк & маг', prepared)
-
-    def test_importer_search_uses_params(self):
-        import bestiary_importer
-        seen = {}
-
-        class Response:
-            status_code = 200
-            text = 'ok'
-            encoding = 'utf-8'
-
-        def fake_get(url, headers=None, timeout=None, params=None, **kwargs):
-            seen['url'] = url
-            seen['params'] = params
-            seen['headers'] = headers
-            return Response()
-
-        with mock.patch.object(bestiary_importer.requests, 'get', fake_get):
-            response = bestiary_importer.fetch_search_page('древний красный', {'User-Agent': 'test'})
-        self.assertEqual(response.text, 'ok')
-        self.assertEqual(seen['url'], 'https://dnd.su/bestiary/')
-        self.assertEqual(seen['params'], {'search': 'древний красный'})
-        self.assertEqual(seen['headers'], {'User-Agent': 'test'})
 
 
 if __name__ == '__main__':

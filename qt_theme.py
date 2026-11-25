@@ -1,7 +1,6 @@
-"""Темы Qt-фронтенда: порт theme_manager.py на QSS.
+"""Темы интерфейса на QSS.
 
-Палитры 1:1 из Tkinter-версии, файл темы общий (battle_settings/theme.json),
-поэтому переключение в любом фронтенде видно в обоих.
+Палитры и файл `battle_settings/theme.json`: выбор темы сохраняется между запусками.
 """
 import json
 import os

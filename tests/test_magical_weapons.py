@@ -1,7 +1,7 @@
 """Юнит-тесты магичности оружия: условные иммунитеты «от немагического оружия».
 
 Покрывают всю цепочку: Attack.magical -> сериализация -> modify_damage ->
-execute_strikes -> DecisionEngine (A5/B2). Без tkinter и без реальных бросков.
+execute_strikes -> DecisionEngine (A5/B2). Без интерфейса и без реальных бросков.
 """
 import unittest
 from types import SimpleNamespace

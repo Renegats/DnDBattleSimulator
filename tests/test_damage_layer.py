@@ -1,14 +1,11 @@
 """Юнит-тесты чистого слоя урона (combat_core.execute_strikes + modify_damage).
 
-Плод фронта Р (симметрия 2б): слой урона уехал из battle_logic.py (оркестратор,
-legitimately тянет tkinter для I/O: messagebox + вставка в tk.Text) в
-combat_core.py (без tkinter). Поэтому этот тест импортирует combat_core
-НАПРЯМУЮ, и в его графе импортов НЕТ tkinter вообще.
+Слой урона живёт в combat_core.py. Этот тест импортирует его напрямую,
+без интерфейса.
 
-DI на уровне функций: execute_strikes больше не читает self.sides/
-self.ignore_sides/self.battle_map миксина BattleSimulator - все внешние данные
-передаются явными аргументами. Тест подставляет sides/ignore_sides/battle_map
-явно и проверяет чистый расчёт без какого-либо GUI-контекста.
+DI на уровне функций: execute_strikes не читает состояние окна — все внешние
+данные передаются явными аргументами. Тест подставляет sides/ignore_sides/
+battle_map явно и проверяет чистый расчёт без GUI.
 
 Вид test double = Mock на границе (perform_attack - заглушка, фиксированный
 5-кортеж): слой урона изолирован от слоя бросков контрактом. Дополняет Т2-А

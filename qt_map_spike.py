@@ -1,14 +1,13 @@
-"""Qt-спайк карты боя (параллельный фронтенд поверх готового ядра).
+"""Пробный просмотр карты боя поверх ядра (не основное окно).
 
-Что доказывает:
-  1. Модель поля (BattleMap) и фабрика (EnemyFactory) не знают о GUI:
-     одни и те же объекты кормят и Tkinter-canvas, и QGraphicsScene.
-  2. Qt даёт из коробки то, что в Tkinter писали руками: зум колесом,
-     панорамирование, сглаживание — без canvasx/scrollregion.
+Что показывает:
+  1. Модель поля (BattleMap) и фабрика (EnemyFactory) не знают о GUI.
+  2. Зум колесом, панорамирование и сглаживание даёт QGraphicsView.
 
 Запуск из корня проекта:  python qt_map_spike.py
 Управление: колесо - зум к курсору, тянуть пустое место - панорама,
 клик по токену - данные существа внизу окна.
+Основное приложение: python main.py
 """
 import sys
 
@@ -17,17 +16,13 @@ from PyQt6.QtGui import QBrush, QColor, QFont, QPainter, QPen
 from PyQt6.QtWidgets import (QApplication, QGraphicsEllipseItem, QGraphicsScene,
                              QGraphicsView, QLabel, QVBoxLayout, QWidget)
 
-# Модель живёт в модуле без tkinter; fallback на случай старой раскладки.
-try:
-    from battle_map_model import BattleMap
-except ImportError:
-    from battle_map import BattleMap
+from battle_map_model import BattleMap
 from factory import EnemyFactory
 
-CELL = 28                        # как в Tkinter-версии, чтобы сравнивать на глаз
+CELL = 28
 SIDE_COLORS = ['#e74c3c', '#3498db', '#2ecc71', '#f1c40f', '#9b59b6', '#e67e22']
-BG = '#2b2d31'                   # палитра тёмной темы из theme_manager хардкодом:
-GRID = '#383b40'                 # импорт менеджера тем затянул бы tkinter в спайк
+BG = '#2b2d31'
+GRID = '#383b40'
 
 
 class MapView(QGraphicsView):
