@@ -5,7 +5,7 @@
 """
 from PyQt6.QtCore import Qt, QModelIndex, QAbstractItemModel, QSortFilterProxyModel, pyqtSignal
 from PyQt6.QtGui import QBrush, QColor, QFont
-from PyQt6.QtWidgets import (QAbstractItemView, QComboBox, QHBoxLayout, QLabel,
+from PyQt6.QtWidgets import (QAbstractItemView, QComboBox, QGridLayout, QLabel,
                              QLineEdit, QTreeView, QVBoxLayout, QWidget)
 
 from combat_log import event_visible
@@ -224,27 +224,27 @@ class CombatLogPanel(QWidget):
         cap.setProperty('role', 'title')
         lay.addWidget(cap)
 
-        filters = QHBoxLayout()
-        filters.setSpacing(6)
+        filters = QGridLayout()
+        filters.setHorizontalSpacing(6)
+        filters.setVerticalSpacing(6)
         self.side = QComboBox()
         self.creature = QComboBox()
         self.kind = QComboBox()
         for box in (self.side, self.creature, self.kind):
             box.setSizeAdjustPolicy(
                 QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
-            box.setMinimumContentsLength(12)
-        self.kind.setMinimumWidth(230)
-        self.kind.setMaximumWidth(280)
-        self.side.setMaximumWidth(180)
+            box.setMinimumContentsLength(8)
         for key, label in KIND_FILTERS:
             self.kind.addItem(label, key)
         self.search = QLineEdit()
         self.search.setPlaceholderText('Поиск по журналу')
         self.search.setClearButtonEnabled(True)
-        filters.addWidget(self.side)
-        filters.addWidget(self.creature)
-        filters.addWidget(self.kind)
-        filters.addWidget(self.search, 1)
+        filters.addWidget(self.side, 0, 0)
+        filters.addWidget(self.creature, 0, 1)
+        filters.addWidget(self.kind, 1, 0)
+        filters.addWidget(self.search, 1, 1)
+        filters.setColumnStretch(0, 1)
+        filters.setColumnStretch(1, 1)
         lay.addLayout(filters)
 
         self.view = self._make_view()
