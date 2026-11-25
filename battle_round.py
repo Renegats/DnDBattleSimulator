@@ -314,11 +314,12 @@ def _replacing_special(attacker, effect, sides, ignore, battle_map, focus, round
 
 
 def run_round(sides, side_names, ignore_sides, battle_map, engine, auto_move=True,
-              crit_mode='double_all', rng=None, round_no=None):
+              crit_mode='double_all', rng=None, round_no=None, *, quiet=False):
     """Один раунд боя. outcome: 'continue' | 'over' | 'empty'.
 
     Результат распаковывается в (outcome, text). События — result.events.
-    text всегда равен render_log(events).
+    text равен render_log(events). quiet=True не собирает этот текст: пакетный
+    прогон считает урон по событиям и не пишет журнал.
     """
     if not sides or not any(any(e.alive for e in side) for side in sides):
         return RoundResult('empty', 'Армии не созданы или все мертвы!', [])
@@ -419,5 +420,5 @@ def run_round(sides, side_names, ignore_sides, battle_map, engine, auto_move=Tru
             kind='round_end', result='continue', round=round_no,
             text=f"\nБитва продолжается: {' vs '.join(alive)}\n"))
         outcome = 'continue'
-    text = render_log(events)
+    text = '' if quiet else render_log(events)
     return RoundResult(outcome, text, events)

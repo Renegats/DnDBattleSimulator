@@ -41,6 +41,34 @@ def submit(fn, args=(), on_ok=None, on_fail=None, guard=None):
     threading.Thread(target=runner, daemon=True, name='bg-task').start()
 
 
+def submit_cancellable(fn, args=(), on_ok=None, on_fail=None, on_progress=None,
+                       guard=None):
+    """Как submit, но fn(*args, progress=..., cancel=...) и поток не демон.
+
+    progress(payload) из фонового потока кладёт колбэк в ту же очередь.
+    cancel — threading.Event; set() просит задачу остановиться.
+    Не-демон нужен, чтобы задача могла поднять дочерние процессы.
+    Возвращает cancel.
+    """
+    cancel = threading.Event()
+
+    def progress(payload):
+        if on_progress is not None:
+            _RESULTS.put((on_progress, guard, payload))
+
+    def runner():
+        try:
+            result = fn(*args, progress=progress, cancel=cancel)
+        except Exception as exc:
+            traceback.print_exc()
+            _RESULTS.put((on_fail, guard, str(exc)))
+            return
+        _RESULTS.put((on_ok, guard, result))
+
+    threading.Thread(target=runner, daemon=False, name='monte-carlo').start()
+    return cancel
+
+
 def _drain():
     for _ in range(MAX_PER_TICK):
         try:

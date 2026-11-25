@@ -10,6 +10,12 @@
 import random
 
 from creature_size import size_cells, size_label, size_space, half_cells
+from rng_channel import active as _active_rng
+
+
+def _rng():
+    """Кости расстановки и обхода. В пакете это генератор боя, иначе random."""
+    return _active_rng(random)
 
 
 def _clean(v):
@@ -167,7 +173,7 @@ class BattleMap:
                 cells = [(hx, hy)
                          for hx in range(x0 * 2, x1 * 2 - n + 1, step)
                          for hy in range(0, self.height * 2 - n + 1, step)]
-                random.shuffle(cells)
+                _rng().shuffle(cells)
                 for hx, hy in cells:
                     if self._area_free(hx, hy, n):
                         self.place(e, hx / 2, hy / 2)
@@ -229,7 +235,7 @@ class BattleMap:
             return []
         dirs = [(-1, -1), (0, -1), (1, -1), (-1, 0),
                 (1, 0), (-1, 1), (0, 1), (1, 1)]
-        random.shuffle(dirs)
+        _rng().shuffle(dirs)
         parents = {start: None}
         frontier = [start]
         best, best_gap = start, self._gap_h(start, n, goal, tn)
@@ -287,7 +293,7 @@ class BattleMap:
                         continue
                     free.append((hx, hy))
         if free:
-            hx, hy = random.choice(free)
+            hx, hy = _rng().choice(free)
             self.place(enemy, hx / 2, hy / 2)
             enemy.moved_ft = min(max_ft, getattr(enemy, 'moved_ft', 0) + step * 2.5)
 

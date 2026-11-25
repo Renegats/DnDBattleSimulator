@@ -105,6 +105,7 @@ class DecisionEngine:
 
     def __init__(self):
         self._round_log: List[dict] = []
+        self.explain = True
 
     def begin_round(self):
         self._round_log = []
@@ -113,7 +114,8 @@ class DecisionEngine:
         return list(self._round_log)
 
     def _log(self, **kw):
-        self._round_log.append(kw)
+        if self.explain:
+            self._round_log.append(kw)
 
     # ---------- главный вход ----------
     def decide(self, attacker, sides, ignore):

@@ -117,6 +117,8 @@ class MainWindow(QMainWindow):
         top.setColumnStretch(0, 1)
         top.setColumnStretch(2, 1)
         self._install_history_controls()
+        self._install_batch_menu()
+        self._batch_dialog = None
         left_host = QWidget()
         left = QHBoxLayout(left_host)
         left.setContentsMargins(0, 0, 0, 0)
@@ -266,6 +268,47 @@ class MainWindow(QMainWindow):
         self.btn_redo.setEnabled(self.redo_action.isEnabled())
         self.btn_undo.setToolTip(self.undo_action.toolTip())
         self.btn_redo.setToolTip(self.redo_action.toolTip())
+
+    def _install_batch_menu(self):
+        menu = self.menuBar().addMenu('Симуляция')
+        action = QAction('Пакетная симуляция…', self)
+        action.setObjectName('batch_sim_action')
+        action.triggered.connect(self.open_batch)
+        menu.addAction(action)
+        self.batch_action = action
+
+    def _forget_batch_dialog(self, *_args):
+        self._batch_dialog = None
+
+    def open_batch(self):
+        if not self.sides:
+            QMessageBox.warning(
+                self, 'Пакетная симуляция',
+                'Сначала создайте армии на вкладке «Настройка армий».')
+            return
+        app = QApplication.instance()
+        if app is not None:
+            qt_async.install(app)
+        dialog = getattr(self, '_batch_dialog', None)
+        if dialog is not None:
+            try:
+                visible = dialog.isVisible()
+            except RuntimeError:
+                visible = False
+                dialog = None
+            if dialog is not None and visible:
+                dialog.raise_()
+                dialog.activateWindow()
+                return
+        from qt_batch import BatchDialog
+        dialog = BatchDialog(
+            self, capture_battle(self),
+            auto_move=self.auto_move.isChecked(),
+            crit_mode=self.crit_mode.currentData() or 'double_all')
+        dialog.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
+        dialog.destroyed.connect(self._forget_batch_dialog)
+        self._batch_dialog = dialog
+        dialog.show()
 
     def _commit(self, label):
         if not self._history_ready or self._suspend_history:
@@ -702,6 +745,7 @@ class MainWindow(QMainWindow):
         lay.addWidget(self.log_panel, 3)
         row = QHBoxLayout()
         for text, fn in (('▶  Провести раунд боя', self.run_round),
+                         ('Пакетная симуляция…', self.open_batch),
                          ('Массовое редактирование', self.mass_edit),
                          ('📋 Копировать лог', self.copy_log),
                          ('💾 Экспорт журнала', self.export_log),
@@ -713,6 +757,9 @@ class MainWindow(QMainWindow):
                 b.setProperty('variant', 'primary')
                 b.setMinimumHeight(38)
                 self.round_btn = b
+            if text.startswith('Пакетная'):
+                b.setObjectName('batch_sim')
+                self.batch_btn = b
             if 'Копировать' in text:
                 self.copy_btn = b
             row.addWidget(b)
