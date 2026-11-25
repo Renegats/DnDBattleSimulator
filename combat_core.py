@@ -5,11 +5,33 @@ modify_damage уважает УСЛОВНЫЕ иммунитеты: запись
 decision_engine — единый источник истины, чтобы мозг и исполнитель не расходились.
 """
 from decision_engine import (dmg_canon, active_defenses, is_nonmagical_only)
-from battle_strategies import distance_ft_between
+from battle_strategies import distance_ft_between, is_healing_attack
 from creature_size import space_distance_ft
+
+# Как стол удваивает крит. 'double_all' — историческое поведение и дефолт.
+CRIT_DOUBLE_ALL = 'double_all'
+CRIT_DICE_ONLY = 'dice_only'
+DEFAULT_CRIT_MODE = CRIT_DOUBLE_ALL
+CRIT_MODE_LABELS = {
+    CRIT_DOUBLE_ALL: 'Удваивать весь урон',
+    CRIT_DICE_ONLY: 'Удваивать только кости',
+}
+
+
+def normalize_crit_mode(value):
+    """Ключ режима крита. Нет ключа, пусто или неизвестное значение → дефолт."""
+    if value in CRIT_MODE_LABELS:
+        return value
+    for key, label in CRIT_MODE_LABELS.items():
+        if value == label:
+            return key
+    return DEFAULT_CRIT_MODE
 
 
 def resolve_strikes(attacker, target):
+    if target is not None and getattr(target, 'side', None) == getattr(attacker, 'side', None):
+        attack = attacker.strategy.select_attack(attacker, target)
+        return [attack] if attack else []
     if getattr(attacker, 'multiattack', None):
         by_name = {a.name: a for a in attacker.attacks}
         strikes = []
@@ -84,12 +106,42 @@ def modify_damage(target, raw, damage_type, magical=False):
     return raw, ''
 
 
-def execute_strikes(attacker, target, strikes, sides, ignore_sides, battle_map):
+def _apply_heal(attacker, target, atk):
+    if hasattr(attacker, 'perform_heal'):
+        amount = attacker.perform_heal(atk)
+    else:
+        amount = 0
+    if hasattr(target, 'heal'):
+        return target.heal(amount)
+    if not getattr(target, 'alive', False):
+        return 0
+    before = target.hp
+    cap = getattr(target, 'max_hp', before)
+    target.hp = min(cap, before + max(0, int(amount)))
+    return target.hp - before
+
+
+def execute_strikes(attacker, target, strikes, sides, ignore_sides, battle_map,
+                    crit_mode=DEFAULT_CRIT_MODE):
     if target is None:
         return [], False
+    crit_mode = normalize_crit_mode(crit_mode)
     lines, any_killed = [], False
     ignore = ignore_sides.get(attacker.side, set())
     for atk in strikes:
+        if is_healing_attack(atk):
+            if (target is None or not getattr(target, 'alive', False)
+                    or getattr(target, 'side', None) != getattr(attacker, 'side', None)):
+                lines.append(f'{attacker.name} не применяет {atk.name}: лечить некого')
+                continue
+            if not in_range_of(attacker, target, atk, battle_map):
+                lines.append(f'{attacker.name} не может достать {target.name} лечением '
+                             f'({atk.name})')
+                continue
+            gained = _apply_heal(attacker, target, atk)
+            lines.append(f'{attacker.name} → {target.name} ({atk.name}) - ЛЕЧЕНИЕ! '
+                         f'+{gained} HP ({target.hp}/{target.max_hp})')
+            continue
         if target is None or not target.alive:
             target = nearest_in_range(attacker, atk, ignore, sides, battle_map)
             if target is None:
@@ -99,7 +151,8 @@ def execute_strikes(attacker, target, strikes, sides, ignore_sides, battle_map):
             if alt is None:
                 continue
             target = alt
-        hit, damage, attack_roll, critical, damage_info = attacker.perform_attack(atk, target.ac)
+        hit, damage, attack_roll, critical, damage_info = attacker.perform_attack(
+            atk, target.ac, crit_mode=crit_mode)
         if hit:
             damage, dmg_note = modify_damage(target, damage, atk.damage_type,
                                              magical=bool(getattr(atk, 'magical', False)))

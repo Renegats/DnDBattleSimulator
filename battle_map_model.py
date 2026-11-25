@@ -71,6 +71,19 @@ class BattleMap:
         gy = max(0, pa[1] - (pb[1] + nb), pb[1] - (pa[1] + na))
         return max(gx, gy)
 
+    @staticmethod
+    def _distance_from_gap(gap_h):
+        """Футы между краями пятен. gap=0 (пятна соседи) → 5 фт.
+
+        Та же формула, что у distance_ft: (gap + 2) * 2.5. Сравнивать сам gap
+        с reach в полуклетках нельзя: reach 5 фт — это 2 полуклетки, но в них
+        уже сидит эта «+2», и мили останавливались на gap=2 (10 фт).
+        """
+        return (gap_h + 2) * 2.5
+
+    def _within_reach(self, gap_h, reach_ft):
+        return self._distance_from_gap(gap_h) <= float(reach_ft) + 1e-9
+
     # ---------- занятость ----------
     def cell_free(self, x, y, ignore_id=None, cells=None, enemy=None):
         """Свободно ли место под пятно. enemy задаёт габариты, cells — явно."""
@@ -117,7 +130,8 @@ class BattleMap:
         pa, pb = self._anchor_h(a), self._anchor_h(b)
         if pa is None or pb is None:
             return 0.0
-        return (self._gap_h(pa, self.span_of(a), pb, self.span_of(b)) + 2) * 2.5
+        return self._distance_from_gap(
+            self._gap_h(pa, self.span_of(a), pb, self.span_of(b)))
 
     # ---------- расстановка ----------
     def _zone_for(self, side_idx, total):
@@ -198,17 +212,19 @@ class BattleMap:
             cur = parents[cur]
         return path[::-1][1:]
 
-    def find_path(self, enemy, target, max_steps, reach_steps=1):
+    def find_path(self, enemy, target, max_steps, reach_steps=1, reach_ft=None):
         """BFS с учётом габаритов: пятно должно помещаться в каждую клетку пути.
-        Возвращает список якорей в клетках (без стартового) или None."""
+        Возвращает список якорей в клетках (без стартового) или None.
+        reach_ft — досягаемость в футах (приоритетнее reach_steps)."""
         start, goal = self._anchor_h(enemy), self._anchor_h(target)
         if start is None or goal is None:
             return None
         n, tn = self.span_of(enemy), self.span_of(target)
         step = 1 if n == 1 else 2
-        reach_h = max(1, int(round(reach_steps * 2)))
+        if reach_ft is None:
+            reach_ft = max(0, int(reach_steps)) * 5
         levels = max(1, int(max_steps * 2) // step)
-        if self._gap_h(start, n, goal, tn) <= reach_h:
+        if self._within_reach(self._gap_h(start, n, goal, tn), reach_ft):
             return []
         dirs = [(-1, -1), (0, -1), (1, -1), (-1, 0),
                 (1, 0), (-1, 1), (0, 1), (1, 1)]
@@ -227,7 +243,7 @@ class BattleMap:
                         continue
                     parents[(nx, ny)] = (cx, cy)
                     gap = self._gap_h((nx, ny), n, goal, tn)
-                    if gap <= reach_h:
+                    if self._within_reach(gap, reach_ft):
                         return self._rebuild(parents, (nx, ny))
                     if gap < best_gap:
                         best_gap, best = gap, (nx, ny)
@@ -241,9 +257,8 @@ class BattleMap:
 
     def move_towards(self, enemy, target, max_ft, reach_ft=5):
         steps = max(0, int(max_ft) // 5)
-        reach_steps = max(1, int(reach_ft) // 5)
         before = self.get_pos(enemy)
-        path = self.find_path(enemy, target, steps, reach_steps)
+        path = self.find_path(enemy, target, steps, reach_ft=reach_ft)
         if path is not None:
             if path:
                 nx, ny = path[-1]

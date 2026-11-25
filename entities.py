@@ -97,17 +97,29 @@ class Enemy(Subject):
             self.notify()
         return self.alive
 
-    def perform_attack(self, attack: Attack, target_ac: int) -> Tuple[bool, int, int, bool, str]:
+    def perform_attack(self, attack: Attack, target_ac: int,
+                       crit_mode: str = 'double_all') -> Tuple[bool, int, int, bool, str]:
+        """Бросок атаки. crit_mode:
+        'double_all' (по умолчанию, так играет стол) — крит удваивает весь урон,
+        включая модификатор; 'dice_only' — кости дважды, модификатор один раз.
+        Натуральная 1 всегда промах, натуральная 20 всегда попадание.
+        """
         attack_roll = self._rng.randint(1, 20)
         total_attack = attack_roll + attack.attack_bonus
         critical = (attack_roll == 20)
-        hit = total_attack >= target_ac or critical
+        if attack_roll == 1:
+            hit = False
+        else:
+            hit = critical or total_attack >= target_ac
         damage_info = ""
         if hit:
             dice_type = int(attack.damage_dice_type.split('d')[1])
+            rolls = attack.damage_dice_count
+            if critical and crit_mode == 'dice_only':
+                rolls *= 2
             damage = sum(self._rng.randint(1, dice_type)
-                         for _ in range(attack.damage_dice_count)) + attack.damage_modifier
-            if critical:
+                         for _ in range(rolls)) + attack.damage_modifier
+            if critical and crit_mode != 'dice_only':
                 damage *= 2
             damage = max(0, damage)
             damage_info = f"{damage} урона"
@@ -117,6 +129,25 @@ class Enemy(Subject):
                 damage_info += " ✦маг."
             return True, damage, total_attack, critical, damage_info
         return False, 0, total_attack, critical, damage_info
+
+    def perform_heal(self, attack: Attack) -> int:
+        """Сколько хитов восстанавливает лечение: кости + модификатор, без броска атаки."""
+        dice_type = int(str(attack.damage_dice_type).split('d')[-1])
+        count = max(0, int(attack.damage_dice_count))
+        rolled = sum(self._rng.randint(1, dice_type) for _ in range(count))
+        return max(0, rolled + int(attack.damage_modifier))
+
+    def heal(self, amount: int) -> int:
+        """Лечит живое существо, не выше max_hp. Возвращает фактически полученное."""
+        if not self.alive:
+            return 0
+        amount = max(0, int(amount))
+        before = self.hp
+        self.hp = min(self.max_hp, self.hp + amount)
+        gained = self.hp - before
+        if gained:
+            self.notify()
+        return gained
 
     def regenerate(self):
         if self.alive and self.regen > 0:

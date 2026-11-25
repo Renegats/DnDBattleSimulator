@@ -20,6 +20,7 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
 import battle_round
 from battle_strategies import (AggressiveStrategy, DefensiveStrategy,
                                RandomStrategy, SupportStrategy)
+from combat_core import normalize_crit_mode
 from decision_engine import DecisionEngine
 from factory import EnemyFactory
 from observer import Observer
@@ -511,6 +512,12 @@ class MainWindow(QMainWindow):
         self.auto_move = QCheckBox('Автоперемещение в бою')
         self.auto_move.setChecked(True)
         row.addWidget(self.auto_move)
+        row.addWidget(QLabel('Крит:'))
+        self.crit_mode = QComboBox()
+        self.crit_mode.addItem('Удваивать весь урон', 'double_all')
+        self.crit_mode.addItem('Удваивать только кости', 'dice_only')
+        self.crit_mode.setCurrentIndex(0)
+        row.addWidget(self.crit_mode)
         lay.addLayout(row)
         return page
 
@@ -581,7 +588,8 @@ class MainWindow(QMainWindow):
     def run_round(self):
         outcome, text = battle_round.run_round(
             self.sides, self.side_names, self.ignore_sides, self.battle_map,
-            self.engine, auto_move=self.auto_move.isChecked())
+            self.engine, auto_move=self.auto_move.isChecked(),
+            crit_mode=self.crit_mode.currentData())
         if outcome == 'empty':
             QMessageBox.warning(self, 'Ошибка', text)
             return
@@ -1045,12 +1053,18 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, 'Движение',
                                     f'Не хватает скорости: нужно {dist} фт, осталось {left} фт')
             return
-        if not self.battle_map.cell_free(x, y, ignore_id=id(self.selected)):
+        if not self.battle_map.cell_free(x, y, ignore_id=id(self.selected),
+                                         enemy=self.selected):
             return
         self.battle_map.place(self.selected, x, y)
         self.selected.moved_ft = getattr(self.selected, 'moved_ft', 0) + dist
         self.map_view.rebuild(self.battle_map, self.sides, self.selected)
         self.on_token(self.selected)
+
+    def _apply_crit_mode(self, value):
+        mode = normalize_crit_mode(value)
+        idx = self.crit_mode.findData(mode)
+        self.crit_mode.setCurrentIndex(idx if idx >= 0 else 0)
 
     # ================= настройки =================
     def save_settings(self):
@@ -1067,6 +1081,7 @@ class MainWindow(QMainWindow):
                 'custom_types': dict(EnemyFactory.CUSTOM_TYPES),
                 'alliance_settings': self.alliance_settings,
                 'ignore_sides': {str(k): list(v) for k, v in self.ignore_sides.items()},
+                'crit_mode': self.crit_mode.currentData() or 'double_all',
                 'map_opts': dict(self.map_view.opts),
                 'map_bg': self.map_view.background_path,
             }
@@ -1104,6 +1119,7 @@ class MainWindow(QMainWindow):
                               strats[i] if i < len(strats) else 'случайная',
                               names[i] if i < len(names) else None,
                               counts[i] if i < len(counts) else 5)
+            self._apply_crit_mode(data.get('crit_mode'))
             self.alliance_settings = data.get('alliance_settings') or []
             self.ignore_sides = {int(k): set(v)
                                  for k, v in (data.get('ignore_sides') or {}).items()}
@@ -1127,6 +1143,7 @@ class MainWindow(QMainWindow):
 
 def main():
     app = QApplication(sys.argv)
+    qt_async.install(app)
     win = MainWindow()
     win.showMaximized()
     sys.exit(app.exec())
