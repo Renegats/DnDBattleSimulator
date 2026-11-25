@@ -11,7 +11,8 @@ class Attack:
 
     def __init__(self, name: str, attack_bonus: int, damage_dice_count: int,
                  damage_dice_type: str, damage_modifier: int, damage_type: str = "",
-                 range_ft: int = 5, magical: bool = False, extra_damage=None):
+                 range_ft: int = 5, magical: bool = False, extra_damage=None,
+                 riders=None):
         self.name = name
         self.attack_bonus = attack_bonus
         self.damage_dice_count = damage_dice_count
@@ -21,6 +22,7 @@ class Attack:
         self.range_ft = range_ft
         self.magical = bool(magical)
         self.extra_damage = [dict(part) for part in (extra_damage or [])]
+        self.riders = [dict(part) for part in (riders or [])]
 
     def to_dict(self):
         return {
@@ -33,6 +35,7 @@ class Attack:
             'range_ft': self.range_ft,
             'magical': self.magical,
             'extra_damage': [dict(part) for part in self.extra_damage],
+            'riders': [dict(part) for part in self.riders],
         }
 
     @classmethod
@@ -47,6 +50,7 @@ class Attack:
             data.get('range_ft', 5),
             data.get('magical', False),
             data.get('extra_damage') or None,
+            data.get('riders') or None,
         )
 
 
@@ -57,9 +61,11 @@ class AttackResult:
     как раньше: объект итерируется ровно пятью полями.
     """
 
-    __slots__ = ('hit', 'damage', 'total', 'critical', 'info', 'natural', 'modifier')
+    __slots__ = ('hit', 'damage', 'total', 'critical', 'info', 'natural', 'modifier',
+                 'naturals', 'advantage')
 
-    def __init__(self, hit, damage, total, critical, info, natural, modifier):
+    def __init__(self, hit, damage, total, critical, info, natural, modifier,
+                 naturals=None, advantage='normal'):
         self.hit = bool(hit)
         self.damage = damage
         self.total = total
@@ -67,6 +73,9 @@ class AttackResult:
         self.info = info
         self.natural = natural
         self.modifier = modifier
+        self.naturals = list(naturals if naturals is not None else
+                             ([natural] if natural is not None else []))
+        self.advantage = advantage or 'normal'
 
     def __iter__(self):
         yield self.hit
@@ -85,7 +94,9 @@ class AttackResult:
         if isinstance(other, AttackResult):
             return (tuple(self) == tuple(other)
                     and self.natural == other.natural
-                    and self.modifier == other.modifier)
+                    and self.modifier == other.modifier
+                    and list(self.naturals) == list(other.naturals)
+                    and self.advantage == other.advantage)
         if isinstance(other, tuple):
             return tuple(self) == tuple(other)
         return NotImplemented
@@ -93,7 +104,8 @@ class AttackResult:
     def __repr__(self):
         return (f'AttackResult(hit={self.hit}, damage={self.damage}, total={self.total}, '
                 f'critical={self.critical}, info={self.info!r}, natural={self.natural}, '
-                f'modifier={self.modifier})')
+                f'modifier={self.modifier}, naturals={self.naturals}, '
+                f'advantage={self.advantage})')
 
 
 class Enemy(Subject):
@@ -138,6 +150,12 @@ class Enemy(Subject):
         self.bonus_actions = []
         self.reactions = []
         self.legendary_remaining = None
+        self.legendary_resistance_remaining = None
+        self.conditions = []
+        self.recharge_state = {}
+        self.save_immunities = []
+        self.lair_index = 0
+        self.lair_warned = False
         self._rng = rng if rng is not None else random
 
     def take_damage(self, damage: int):
@@ -147,6 +165,8 @@ class Enemy(Subject):
         if self.hp <= 0:
             self.alive = False
             self.hp = 0
+            from conditions import clear_conditions
+            clear_conditions(self)
             self.notify()
             return False
         elif self.hp != previous_hp:
@@ -154,16 +174,23 @@ class Enemy(Subject):
         return self.alive
 
     def perform_attack(self, attack: Attack, target_ac: int,
-                       crit_mode: str = 'double_all') -> Tuple[bool, int, int, bool, str]:
+                       crit_mode: str = 'double_all', *, advantage=False,
+                       disadvantage=False, force_crit=False) -> Tuple[bool, int, int, bool, str]:
         """Бросок атаки. crit_mode:
         'double_all' (по умолчанию, так играет стол) — крит удваивает весь урон,
         включая модификатор; 'dice_only' — кости дважды, модификатор один раз.
         Натуральная 1 всегда промах, натуральная 20 всегда попадание.
+        Преимущество и помеха кидают два d20; вместе они гасятся в один бросок.
+        force_crit — попадание в упор по парализованному или без сознания
+        становится критом, даже если кость не 20.
 
         Возврат по-прежнему распаковывается в 5 значений. Натуральная кость
         и модификатор лежат в полях natural / modifier (AttackResult).
+        Кости преимущества — в naturals, режим — в advantage.
         """
-        natural = self._rng.randint(1, 20)
+        from conditions import _roll_d20
+        dice, mode, kept = _roll_d20(self._rng, bool(advantage), bool(disadvantage))
+        natural = dice[0] if mode == 'cancel' else kept
         modifier = attack.attack_bonus
         total_attack = natural + modifier
         critical = (natural == 20)
@@ -171,6 +198,8 @@ class Enemy(Subject):
             hit = False
         else:
             hit = critical or total_attack >= target_ac
+        if hit and force_crit:
+            critical = True
         damage_info = ""
         damage = 0
         if hit:
@@ -189,7 +218,7 @@ class Enemy(Subject):
             if getattr(attack, 'magical', False):
                 damage_info += " ✦маг."
         return AttackResult(hit, damage, total_attack, critical, damage_info,
-                            natural, modifier)
+                            natural, modifier, dice, mode)
 
     def perform_heal(self, attack: Attack) -> int:
         """Сколько хитов восстанавливает лечение: кости + модификатор, без броска атаки."""
@@ -202,9 +231,10 @@ class Enemy(Subject):
         """Лечит живое существо, не выше max_hp. Возвращает фактически полученное."""
         if not self.alive:
             return 0
+        from conditions import effective_max_hp
         amount = max(0, int(amount))
         before = self.hp
-        self.hp = min(self.max_hp, self.hp + amount)
+        self.hp = min(effective_max_hp(self), self.hp + amount)
         gained = self.hp - before
         if gained:
             self.notify()
@@ -239,6 +269,13 @@ class Enemy(Subject):
             'bonus_actions': self.bonus_actions,
             'reactions': self.reactions,
             'legendary_remaining': self.legendary_remaining,
+            'legendary_resistance_remaining': self.legendary_resistance_remaining,
+            'conditions': [dict(item) for item in (self.conditions or [])],
+            'recharge_state': {key: dict(value) for key, value in
+                               (self.recharge_state or {}).items()},
+            'save_immunities': list(self.save_immunities or []),
+            'lair_index': int(self.lair_index or 0),
+            'lair_warned': bool(self.lair_warned),
         }
 
     @classmethod
@@ -274,6 +311,14 @@ class Enemy(Subject):
         enemy.bonus_actions = list(data.get('bonus_actions') or [])
         enemy.reactions = list(data.get('reactions') or [])
         enemy.legendary_remaining = data.get('legendary_remaining')
+        enemy.legendary_resistance_remaining = data.get('legendary_resistance_remaining')
+        enemy.conditions = [dict(item) for item in (data.get('conditions') or [])]
+        enemy.recharge_state = {
+            key: dict(value) for key, value in (data.get('recharge_state') or {}).items()
+        }
+        enemy.save_immunities = list(data.get('save_immunities') or [])
+        enemy.lair_index = int(data.get('lair_index') or 0)
+        enemy.lair_warned = bool(data.get('lair_warned') or False)
 
         strategy_type = data.get('strategy_type', 'RandomStrategy')
         from battle_strategies import (AggressiveStrategy, DefensiveStrategy,

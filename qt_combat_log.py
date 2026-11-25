@@ -21,6 +21,7 @@ KIND_FILTERS = (
     ('move', 'Движение'),
     ('legendary', 'Легендарные'),
     ('initiative', 'Инициатива'),
+    ('conditions', 'Состояния и спасброски'),
 )
 
 
@@ -50,6 +51,10 @@ def color_of(event):
         return '#2471a3'
     if event.kind in ('round_start', 'initiative', 'round_end'):
         return '#3d4db7'
+    if event.kind == 'save':
+        return '#0e6655' if event.result == 'success' else '#6c3483'
+    if event.kind in ('condition', 'recharge', 'lair'):
+        return '#1a5276'
     if event.result == 'victory':
         return '#d4a017'
     return None
@@ -228,7 +233,8 @@ class CombatLogPanel(QWidget):
             box.setSizeAdjustPolicy(
                 QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
             box.setMinimumContentsLength(12)
-        self.kind.setMaximumWidth(190)
+        self.kind.setMinimumWidth(230)
+        self.kind.setMaximumWidth(280)
         self.side.setMaximumWidth(180)
         for key, label in KIND_FILTERS:
             self.kind.addItem(label, key)

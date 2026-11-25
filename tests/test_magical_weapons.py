@@ -40,7 +40,7 @@ def mock_attacker(result):
                         hp=20, max_hp=20, attacks=[], ignore_sides=set(),
                         multiattack=None, speed=30, moved_ft=0,
                         ability_scores={'int': 10})
-    a.perform_attack = lambda atk, ac, crit_mode='double_all': result
+    a.perform_attack = lambda atk, ac, crit_mode='double_all', **_extra: result
     return a
 
 

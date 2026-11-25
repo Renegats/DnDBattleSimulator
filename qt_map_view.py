@@ -45,6 +45,7 @@ ATTACK_STYLES = {
 
 class MapView(QGraphicsView):
     token_clicked = pyqtSignal(object)
+    token_menu = pyqtSignal(object, object)
     cell_clicked = pyqtSignal(float, float)
     token_dragged = pyqtSignal(object, float, float)
     image_dropped = pyqtSignal(str)
@@ -226,6 +227,13 @@ class MapView(QGraphicsView):
                 round(scene_pos.y() / cell * 2) / 2)
 
     def mousePressEvent(self, e):
+        if e.button() == Qt.MouseButton.RightButton:
+            enemy = self._token_at(e.pos())
+            if enemy is not None:
+                point = e.globalPosition().toPoint()
+                self.token_menu.emit(enemy, point)
+                e.accept()
+                return
         if e.button() == Qt.MouseButton.LeftButton:
             enemy = self._token_at(e.pos())
             if enemy is not None:
@@ -516,5 +524,36 @@ class MapView(QGraphicsView):
                     t.setPos(x0 + (box - b.width()) / 2, y0 + (box - b.height()) / 2)
                     if not en.alive:
                         t.setOpacity(max(0.1, o['dead_alpha'] / 100.0))
+                self._paint_condition_badges(item, en, x0, y0, box)
         self._paint_attack_lines()
         self._paint_focus_rings()
+
+    def _paint_condition_badges(self, item, enemy, x0, y0, box):
+        from conditions import (active_conditions, condition_color, condition_short,
+                                condition_tooltip)
+        item.setToolTip(condition_tooltip(enemy))
+        badges = [cond for cond in active_conditions(enemy) if isinstance(cond, dict)]
+        if not badges:
+            return
+        font = QFont('Arial', max(6, int(min(11, box * 0.2))), QFont.Weight.Bold)
+        gap = max(1.0, box * 0.04)
+        badge_w = max(16.0, min(box * 0.36, 30.0))
+        badge_h = max(11.0, min(box * 0.24, 16.0))
+        total = len(badges) * badge_w + max(0, len(badges) - 1) * gap
+        left = x0 + max(0.0, (box - total) / 2)
+        top = y0 + box - badge_h - 1
+        for index, cond in enumerate(badges[:6]):
+            color = QColor(condition_color(cond.get('id')))
+            badge = self.scene().addRect(
+                left + index * (badge_w + gap), top, badge_w, badge_h,
+                QPen(QColor('#ffffff'), 0.6), QBrush(color))
+            badge.setParentItem(item)
+            badge.setZValue(3)
+            label = self.scene().addSimpleText(
+                condition_short(cond.get('id'), cond.get('level')), font)
+            label.setParentItem(item)
+            label.setBrush(QBrush(QColor('#ffffff')))
+            bounds = label.boundingRect()
+            label.setPos(left + index * (badge_w + gap) + (badge_w - bounds.width()) / 2,
+                         top + (badge_h - bounds.height()) / 2)
+            label.setZValue(4)

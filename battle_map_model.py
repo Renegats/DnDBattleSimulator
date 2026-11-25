@@ -212,7 +212,8 @@ class BattleMap:
             cur = parents[cur]
         return path[::-1][1:]
 
-    def find_path(self, enemy, target, max_steps, reach_steps=1, reach_ft=None):
+    def find_path(self, enemy, target, max_steps, reach_steps=1, reach_ft=None,
+                  allow=None):
         """BFS с учётом габаритов: пятно должно помещаться в каждую клетку пути.
         Возвращает список якорей в клетках (без стартового) или None.
         reach_ft — досягаемость в футах (приоритетнее reach_steps)."""
@@ -241,6 +242,8 @@ class BattleMap:
                         continue
                     if not self._area_free(nx, ny, n, ignore_id=id(enemy)):
                         continue
+                    if allow is not None and not allow(nx, ny):
+                        continue
                     parents[(nx, ny)] = (cx, cy)
                     gap = self._gap_h((nx, ny), n, goal, tn)
                     if self._within_reach(gap, reach_ft):
@@ -255,10 +258,11 @@ class BattleMap:
             return None
         return self._rebuild(parents, best)
 
-    def move_towards(self, enemy, target, max_ft, reach_ft=5):
-        steps = max(0, int(max_ft) // 5)
+    def move_towards(self, enemy, target, max_ft, reach_ft=5, allow=None):
+        already = int(getattr(enemy, 'moved_ft', 0) or 0)
+        steps = max(0, (int(max_ft) - already) // 5)
         before = self.get_pos(enemy)
-        path = self.find_path(enemy, target, steps, reach_ft=reach_ft)
+        path = self.find_path(enemy, target, steps, reach_ft=reach_ft, allow=allow)
         if path is not None:
             if path:
                 nx, ny = path[-1]
@@ -279,6 +283,8 @@ class BattleMap:
                     continue
                 hx, hy = anchor[0] + dx * step, anchor[1] + dy * step
                 if self._area_free(hx, hy, n, ignore_id=id(enemy)):
+                    if allow is not None and not allow(hx, hy):
+                        continue
                     free.append((hx, hy))
         if free:
             hx, hy = random.choice(free)

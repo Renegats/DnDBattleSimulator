@@ -369,6 +369,25 @@ class CreatureEditDialog(QDialog):
         lay.addWidget(self.atk)
         self.chars = CharacteristicsEditor(initial={k: getattr(e0, k, None) for k in CHAR_KEYS})
         lay.addWidget(self.chars)
+        from conditions import MANUAL_IDS, active_conditions, condition_name, exhaustion_level
+        lay.addWidget(QLabel('Состояния (висят, пока не сняты):'))
+        grid_c = QGridLayout()
+        present = {item.get('id') for item in active_conditions(e0) if isinstance(item, dict)}
+        self.cond_boxes = {}
+        for index, condition_id in enumerate(MANUAL_IDS):
+            box = QCheckBox(condition_name(condition_id))
+            box.setChecked(condition_id in present)
+            self.cond_boxes[condition_id] = box
+            grid_c.addWidget(box, index // 3, index % 3)
+        lay.addLayout(grid_c)
+        exh = QHBoxLayout()
+        exh.addWidget(QLabel('Истощение (0–6):'))
+        self.exhaustion = QSpinBox()
+        self.exhaustion.setRange(0, 6)
+        self.exhaustion.setValue(exhaustion_level(e0))
+        exh.addWidget(self.exhaustion)
+        exh.addStretch()
+        lay.addLayout(exh)
         lay.addStretch()
         outer.addWidget(_scroll(inner), 1)
 
@@ -389,7 +408,9 @@ class CreatureEditDialog(QDialog):
         if not self.atk.attacks:
             QMessageBox.warning(self, 'Внимание', 'Нужна хотя бы одна атака!')
             return
+        from conditions import sync_manual_conditions
         chars = self.chars.get_data()
+        marked = [cid for cid, box in self.cond_boxes.items() if box.isChecked()]
         for e in self.enemies:
             e.name = self.name.text().strip() or e.name
             e.max_hp = self.hp.value()
@@ -398,13 +419,25 @@ class CreatureEditDialog(QDialog):
             e.speed = self.spd.value()
             e.regen = self.regen.value()
             e.alive = e.hp > 0
-            e.attacks = [Attack(a['name'], a['attack_bonus'], a['damage_dice_count'],
-                                a['damage_dice_type'], a['damage_modifier'],
-                                a.get('damage_type', ''), a.get('range_ft', 5),
-                                a.get('magical', False))
-                         for a in self.atk.attacks]
+            previous = {attack.name: attack for attack in e.attacks}
+            built = []
+            for raw in self.atk.attacks:
+                old = previous.get(raw['name'])
+                extra = raw.get('extra_damage')
+                riders = raw.get('riders')
+                if extra is None and old is not None:
+                    extra = getattr(old, 'extra_damage', None)
+                if riders is None and old is not None:
+                    riders = getattr(old, 'riders', None)
+                built.append(Attack(
+                    raw['name'], raw['attack_bonus'], raw['damage_dice_count'],
+                    raw['damage_dice_type'], raw['damage_modifier'],
+                    raw.get('damage_type', ''), raw.get('range_ft', 5),
+                    raw.get('magical', False), extra, riders))
+            e.attacks = built
             for k, v in chars.items():
                 setattr(e, k, v)
+            sync_manual_conditions(e, marked, self.exhaustion.value())
         self.accept()
 
 
