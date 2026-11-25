@@ -9,7 +9,7 @@ import sys
 from datetime import datetime
 
 from PyQt6.QtCore import Qt, QTimer
-from PyQt6.QtGui import QPixmap
+from PyQt6.QtGui import QAction, QKeySequence, QPixmap
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QHBoxLayout, QGridLayout, QLabel, QLineEdit, QSpinBox,
                              QComboBox, QPushButton, QCheckBox,
@@ -18,6 +18,7 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QTableWidgetItem, QHeaderView, QButtonGroup, QSlider)
 
 import battle_round
+from battle_history import BattleHistory, apply_snapshot, capture_battle, ensure_uid
 from battle_strategies import (AggressiveStrategy, DefensiveStrategy,
                                RandomStrategy, SupportStrategy)
 from combat_core import normalize_crit_mode
@@ -99,6 +100,10 @@ class MainWindow(QMainWindow):
         self.dirty, self.suspend = set(), False
         self.cols = 3
         self._icon_buttons = []
+        self.history = BattleHistory()
+        self._history_ready = False
+        self._suspend_history = False
+        self._current = None
 
         root = QWidget()
         self.setCentralWidget(root)
@@ -110,6 +115,15 @@ class MainWindow(QMainWindow):
         top.setContentsMargins(0, 0, 0, 0)
         top.setColumnStretch(0, 1)
         top.setColumnStretch(2, 1)
+        self._install_history_controls()
+        left_host = QWidget()
+        left = QHBoxLayout(left_host)
+        left.setContentsMargins(0, 0, 0, 0)
+        left.setSpacing(6)
+        left.addWidget(self.btn_undo)
+        left.addWidget(self.btn_redo)
+        left.addStretch()
+        top.addWidget(left_host, 0, 0, Qt.AlignmentFlag.AlignLeft)
         nav_host = QWidget()
         nav = QHBoxLayout(nav_host)
         nav.setContentsMargins(0, 0, 0, 0)
@@ -168,6 +182,9 @@ class MainWindow(QMainWindow):
         self.add_card()
         self.add_card()
         self.select_tab(0)
+        self._current = capture_battle(self)
+        self._history_ready = True
+        self._sync_history_actions()
 
     # ================= вкладки =================
     def select_tab(self, idx):
@@ -201,6 +218,165 @@ class MainWindow(QMainWindow):
             c['frame'].set_palette(pal)
         self.map_view.set_palette(pal)
         self.status.showMessage(f'Тема: {"тёмная" if name == "dark" else "светлая"}')
+
+    # ================= отмена / повтор =================
+    def _install_history_controls(self):
+        edit = self.menuBar().addMenu('Правка')
+        self.undo_action = QAction('Отменить', self)
+        self.undo_action.setObjectName('undo')
+        self.undo_action.setShortcut(QKeySequence('Ctrl+Z'))
+        self.undo_action.setShortcutContext(Qt.ShortcutContext.WindowShortcut)
+        self.undo_action.triggered.connect(self.do_undo)
+        self.redo_action = QAction('Повторить', self)
+        self.redo_action.setObjectName('redo')
+        self.redo_action.setShortcuts([
+            QKeySequence('Ctrl+Shift+Z'),
+            QKeySequence('Ctrl+Y'),
+        ])
+        self.redo_action.setShortcutContext(Qt.ShortcutContext.WindowShortcut)
+        self.redo_action.triggered.connect(self.do_redo)
+        edit.addAction(self.undo_action)
+        edit.addAction(self.redo_action)
+        self.addAction(self.undo_action)
+        self.addAction(self.redo_action)
+
+        self.btn_undo = QPushButton('Отменить')
+        self.btn_redo = QPushButton('Повторить')
+        for button, action in ((self.btn_undo, self.undo_action),
+                               (self.btn_redo, self.redo_action)):
+            button.setObjectName(action.objectName() + '_button')
+            button.setMinimumHeight(32)
+            button.setMinimumWidth(112)
+            button.setCursor(Qt.CursorShape.PointingHandCursor)
+            button.clicked.connect(action.trigger)
+
+    def _sync_history_actions(self):
+        undo = self.history.undo_label()
+        redo = self.history.redo_label()
+        self.undo_action.setEnabled(undo is not None)
+        self.redo_action.setEnabled(redo is not None)
+        self.undo_action.setText(f'Отменить: {undo}' if undo else 'Отменить')
+        self.redo_action.setText(f'Повторить: {redo}' if redo else 'Повторить')
+        self.undo_action.setToolTip(self.undo_action.text() if undo else 'Нечего отменять')
+        self.redo_action.setToolTip(self.redo_action.text() if redo else 'Нечего повторять')
+        self.undo_action.setStatusTip(self.undo_action.toolTip())
+        self.redo_action.setStatusTip(self.redo_action.toolTip())
+        self.btn_undo.setEnabled(self.undo_action.isEnabled())
+        self.btn_redo.setEnabled(self.redo_action.isEnabled())
+        self.btn_undo.setToolTip(self.undo_action.toolTip())
+        self.btn_redo.setToolTip(self.redo_action.toolTip())
+
+    def _commit(self, label):
+        if not self._history_ready or self._suspend_history:
+            return False
+        after = capture_battle(self)
+        if not self.history.commit(label, self._current, after):
+            return False
+        self._current = after
+        self._sync_history_actions()
+        return True
+
+    def _note_selection(self):
+        """Выбор токена не шаг истории, но повтор хода не должен его сбрасывать."""
+        if not self._history_ready or self._suspend_history or not self._current:
+            return
+        uid = ensure_uid(self.selected) if self.selected is not None else None
+        if self._current.get('selected_uid') == uid:
+            return
+        snap = dict(self._current)
+        snap['selected_uid'] = uid
+        self._current = snap
+
+    def _latest_round_events(self):
+        numbered = [event for event in self.battle_events if event.round]
+        if not numbered:
+            return []
+        last = max(event.round for event in numbered)
+        return [event for event in self.battle_events if event.round == last]
+
+    def _sync_cards(self, rows):
+        rows = list(rows or [])
+        if len(rows) != len(self.cards):
+            self._discard_cards()
+            for row in rows:
+                self.add_card(row.get('type'), row.get('strategy') or 'случайная',
+                              row.get('name'),
+                              row.get('count') if row.get('count') is not None else 5)
+            return
+        for card, row in zip(self.cards, rows):
+            card['name'].setText(row.get('name') or '')
+            new_type = row.get('type') or card['type']
+            changed = new_type != card['type']
+            card['type'] = new_type
+            card['type_lbl'].setText(new_type)
+            card['strat'].blockSignals(True)
+            card['strat'].setCurrentText(row.get('strategy') or card['strat'].currentText())
+            card['strat'].blockSignals(False)
+            card['count'].blockSignals(True)
+            card['count'].setValue(int(row.get('count') if row.get('count') is not None else 0))
+            card['count'].blockSignals(False)
+            if changed:
+                self._show_cached_portrait(card)
+
+    def _discard_cards(self):
+        for card in list(self.cards):
+            card['alive'] = False
+            guard = card.get('guard')
+            if guard is not None:
+                guard.drop()
+            for button in card['icons']:
+                if button in self._icon_buttons:
+                    self._icon_buttons.remove(button)
+            card['frame'].setParent(None)
+            card['frame'].deleteLater()
+        self.cards = []
+        self.cols = 0
+
+    def _restore(self, snapshot):
+        self._suspend_history = True
+        try:
+            info = apply_snapshot(snapshot, self)
+            self._sync_cards(snapshot.get('setup') or [])
+            if info.roster_changed:
+                self.rebuild_battle_lists()
+                self.log_panel.set_roster(self.sides, self.side_names)
+            else:
+                self.refresh_all_labels()
+            self.refresh_alliances()
+            if info.events_changed:
+                self.log_panel.load_events(self.battle_events)
+            self.selected = info.selected
+            self.map_view.rebuild(self.battle_map, self.sides, self.selected)
+            self.map_view.set_round_lines(
+                map_marks(self._latest_round_events(), self._token_radius))
+            self.map_view.set_focus_lines([])
+            if self.selected is not None:
+                pos = None if self.battle_map is None else self.battle_map.get_pos(self.selected)
+                left = self.selected.speed - getattr(self.selected, 'moved_ft', 0)
+                self.map_info.setText(
+                    f'{self.selected.name}: HP {self.selected.hp}/{self.selected.max_hp}, '
+                    f'AC {self.selected.ac}, клетка {pos}, скорость {self.selected.speed} фт, '
+                    f'остаток {left} фт')
+            else:
+                self.map_info.setText('Токен не выбран.')
+        finally:
+            self._suspend_history = False
+        self._current = snapshot
+        self._sync_history_actions()
+
+    def do_undo(self):
+        if not self.history.can_undo():
+            return
+        label = self.history.undo_label()
+        self._restore(self.history.undo())
+        self.status.showMessage(f'Отменено: {label}')
+
+    def do_redo(self):
+        if not self.history.can_redo():
+            return
+        label = self.history.redo_label()
+        self._restore(self.history.redo())
+        self.status.showMessage(f'Повторено: {label}')
 
     # ================= настройка армий =================
     def _build_setup(self):
@@ -268,7 +444,7 @@ class MainWindow(QMainWindow):
         hl = QGridLayout(header)
         hl.setContentsMargins(14, 8, 10, 6)
         hl.setSpacing(4)
-        title = QLineEdit(name or f'Сторона {chr(65 + i)}')
+        title = QLineEdit(f'Сторона {chr(65 + i)}' if name is None else name)
         title.setProperty('role', 'title')
         cross = IconButton('cross', pal, size=26, outline=True)
         cross.setToolTip('Удалить отряд')
@@ -330,6 +506,9 @@ class MainWindow(QMainWindow):
         change.clicked.connect(lambda: self.change_composition(card))
         dice.clicked.connect(lambda: self._portrait_async(card))
         find.clicked.connect(lambda: self._portrait_async(card, search=True))
+        title.editingFinished.connect(lambda c=card: self._on_side_name(c))
+        strat.currentTextChanged.connect(lambda _text, c=card: self._on_side_strategy(c))
+        cnt.editingFinished.connect(lambda c=card: self._on_side_count(c))
         self.cards.append(card)
 
         if not hasattr(self, 'plus_btn'):
@@ -342,6 +521,22 @@ class MainWindow(QMainWindow):
         self.cols = 0
         self.relayout_cards()
         self._show_cached_portrait(card)
+        self._commit(f'добавление стороны {card["name"].text()}')
+
+    def _on_side_name(self, card):
+        if not card.get('alive', True):
+            return
+        self._commit(f'имя стороны {card["name"].text()}')
+
+    def _on_side_strategy(self, card):
+        if not card.get('alive', True):
+            return
+        self._commit(f'тактика: {card["name"].text()}')
+
+    def _on_side_count(self, card):
+        if not card.get('alive', True):
+            return
+        self._commit(f'число существ: {card["name"].text()}')
 
     # ---------- портреты ----------
     def _show_cached_portrait(self, card):
@@ -413,7 +608,8 @@ class MainWindow(QMainWindow):
         if len(self.cards) <= 1:
             QMessageBox.information(self, 'Отряд', 'Должна остаться хотя бы одна сторона.')
             return
-        if QMessageBox.question(self, 'Удалить отряд?', f'Удалить «{card["name"].text()}»?',
+        side_name = card['name'].text()
+        if QMessageBox.question(self, 'Удалить отряд?', f'Удалить «{side_name}»?',
                                 QMessageBox.StandardButton.Yes |
                                 QMessageBox.StandardButton.No) != QMessageBox.StandardButton.Yes:
             return
@@ -428,6 +624,7 @@ class MainWindow(QMainWindow):
         card['frame'].deleteLater()
         self.cols = 0
         self.relayout_cards()
+        self._commit(f'удаление стороны {side_name}')
 
     def change_composition(self, card):
         d = SideCreatorDialog(self, types_available(), mode='edit', current_type=card['type'])
@@ -437,9 +634,12 @@ class MainWindow(QMainWindow):
     def _apply_composition(self, card, res):
         card['type'] = res['army_type']
         card['type_lbl'].setText(res['army_type'])
+        card['strat'].blockSignals(True)
         card['strat'].setCurrentText(res['strategy'])
+        card['strat'].blockSignals(False)
         self.status.showMessage(f'Состав обновлён: {res["army_type"]}')
         self._show_cached_portrait(card)
+        self._commit(f'состав: {res["army_type"]}')
         if portraits.local_path(card['type']) is None:
             self._portrait_async(card, search=not portraits.urls_for(card['type']))
 
@@ -479,6 +679,7 @@ class MainWindow(QMainWindow):
             self.battle_events.extend(self.log_panel.add_note(
                 f'Армии созданы: сторон {n}, существ {total}.'))
             self.status.showMessage(f'Армии созданы: {n} сторон, {total} существ.')
+            self._commit('создание армий')
             self.select_tab(1)
         except Exception as e:
             import traceback
@@ -614,6 +815,7 @@ class MainWindow(QMainWindow):
             f'Раунд {self.round_no}: живых {alive}, атак {attacks}' +
             ('  ·  бой завершён' if outcome == 'over' else '') +
             '  ·  линии атак на карте')
+        self._commit(f'раунд {self.round_no}')
 
     def selected_enemies(self):
         out = []
@@ -628,17 +830,22 @@ class MainWindow(QMainWindow):
         if not enemies:
             QMessageBox.warning(self, 'Внимание', 'Выберите хотя бы одно существо!')
             return
+        label = (f'правка: {enemies[0].name}' if len(enemies) == 1
+                 else f'правка: {len(enemies)} существ')
         d = CreatureEditDialog(self, enemies)
         if d.exec() == QDialog.DialogCode.Accepted:
             self.refresh_all_labels()
             self.map_view.rebuild(self.battle_map, self.sides, self.selected)
             self.status.showMessage(f'Обновлено существ: {len(enemies)}')
+            self._commit(label)
 
     def edit_one(self, enemy):
+        label = f'правка: {enemy.name}'
         d = CreatureEditDialog(self, [enemy])
         if d.exec() == QDialog.DialogCode.Accepted:
             self.refresh_all_labels()
             self.map_view.rebuild(self.battle_map, self.sides, self.selected)
+            self._commit(label)
 
     def show_status(self):
         lines = ['=== ТЕКУЩИЙ СТАТУС ===']
@@ -656,11 +863,13 @@ class MainWindow(QMainWindow):
             lines.append('')
         notes = self.log_panel.add_note('\n'.join(lines))
         self.battle_events.extend(notes)
+        self._commit('статус')
 
     def clear_log(self):
         self.battle_events = []
         self.log_panel.clear()
         self.map_view.set_round_lines([])
+        self._commit('очистка журнала')
 
     def copy_log(self):
         QApplication.clipboard().setText(render_log(self.battle_events))
@@ -870,6 +1079,7 @@ class MainWindow(QMainWindow):
                 for e in self.sides[i]:
                     e.ignore_sides.add(j)
         self.status.showMessage('Настройки альянсов применены.')
+        self._commit('альянсы')
 
     # ================= карта + панель отображения =================
     def _slider(self, lo, hi, val, label, key, suffix=''):
@@ -1007,13 +1217,15 @@ class MainWindow(QMainWindow):
 
         right = QVBoxLayout()
         hint = QLabel('Колесо — зум · тяни поле — панорама · клик по токену — выбрать · '
-                      'клик по зелёной клетке — шаг · картинку можно бросить на поле мышью')
+                      'перетащи токен или кликни по зелёной клетке — ход · Ctrl+Z — отмена · '
+                      'картинку можно бросить на поле мышью')
         hint.setProperty('role', 'muted')
         right.addWidget(hint)
         split = QSplitter(Qt.Orientation.Vertical)
         self.map_view = MapView(self.theme.palette())
         self.map_view.token_clicked.connect(self.on_token)
         self.map_view.cell_clicked.connect(self.on_cell)
+        self.map_view.token_dragged.connect(self.on_token_dragged)
         self.map_view.image_dropped.connect(self._apply_background_path)
         split.addWidget(self.map_view)
         mirror = QWidget()
@@ -1123,6 +1335,7 @@ class MainWindow(QMainWindow):
         self.battle_map.random_placement(self.sides)
         self.map_view.rebuild(self.battle_map, self.sides, self.selected)
         self.status.showMessage('Случайная расстановка выполнена.')
+        self._commit('случайная расстановка')
 
     def place_formation(self):
         if self.battle_map is None:
@@ -1130,6 +1343,7 @@ class MainWindow(QMainWindow):
         self.battle_map.formation_placement(self.sides)
         self.map_view.rebuild(self.battle_map, self.sides, self.selected)
         self.status.showMessage('Расстановка строем выполнена.')
+        self._commit('расстановка строем')
 
     def on_token(self, enemy):
         self.selected = enemy
@@ -1138,6 +1352,14 @@ class MainWindow(QMainWindow):
         left = enemy.speed - getattr(enemy, 'moved_ft', 0)
         self.map_info.setText(f'{enemy.name}: HP {enemy.hp}/{enemy.max_hp}, AC {enemy.ac}, '
                               f'клетка {pos}, скорость {enemy.speed} фт, остаток {left} фт')
+        self._note_selection()
+
+    def on_token_dragged(self, enemy, x, y):
+        if enemy is None:
+            return
+        self.selected = enemy
+        self._note_selection()
+        self.on_cell(x, y)
 
     def on_cell(self, x, y):
         if self.battle_map is None or self.selected is None or not self.selected.alive:
@@ -1159,7 +1381,9 @@ class MainWindow(QMainWindow):
         self.battle_map.place(self.selected, x, y)
         self.selected.moved_ft = getattr(self.selected, 'moved_ft', 0) + dist
         self.map_view.rebuild(self.battle_map, self.sides, self.selected)
+        name = self.selected.name
         self.on_token(self.selected)
+        self._commit(f'ход {name}')
 
     def _apply_crit_mode(self, value):
         mode = normalize_crit_mode(value)
@@ -1196,49 +1420,52 @@ class MainWindow(QMainWindow):
                                               'battle_settings', 'JSON files (*.json)')
         if not path:
             return
+        self._suspend_history = True
         try:
-            with open(path, 'r', encoding='utf-8') as f:
-                data = json.load(f)
-            for name, td in (data.get('custom_types') or {}).items():
-                EnemyFactory.CUSTOM_TYPES[name] = td
-            for c in self.cards:
-                for b in c['icons']:
-                    if b in self._icon_buttons:
-                        self._icon_buttons.remove(b)
-                c['frame'].setParent(None)
-                c['frame'].deleteLater()
-            self.cards = []
-            names = data.get('side_names') or []
-            counts = data.get('side_counts') or []
-            types = data.get('army_types') or []
-            strats = data.get('strategy_types') or []
-            n = int(data.get('num_sides') or len(names) or 2)
-            fallback = types_available()[0]
-            for i in range(n):
-                self.add_card(types[i] if i < len(types) else fallback,
-                              strats[i] if i < len(strats) else 'случайная',
-                              names[i] if i < len(names) else None,
-                              counts[i] if i < len(counts) else 5)
-            self._apply_crit_mode(data.get('crit_mode'))
-            self.alliance_settings = data.get('alliance_settings') or []
-            self.ignore_sides = {int(k): set(v)
-                                 for k, v in (data.get('ignore_sides') or {}).items()}
-            opts = data.get('map_opts')
-            if opts:
-                self.map_view.opts.update({k: v for k, v in opts.items()
-                                           if k in DEFAULT_OPTS})
-            bg = data.get('map_bg')
-            if bg and os.path.exists(bg):
-                self.map_view.set_background(bg)
-            else:
-                self.map_view.clear_background()
-            self.map_view.set_opt('zoom', self.map_view.opts['zoom'])
-            self._sync_map_controls()
-            self.cols = 0
-            self.relayout_cards()
-            self.status.showMessage(f'Настройки загружены: сторон {n}. Нажмите «Создать армии».')
-        except Exception as e:
-            QMessageBox.critical(self, 'Ошибка', f'Ошибка при загрузке: {e}')
+            try:
+                with open(path, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                for name, td in (data.get('custom_types') or {}).items():
+                    EnemyFactory.CUSTOM_TYPES[name] = td
+                self._discard_cards()
+                names = data.get('side_names') or []
+                counts = data.get('side_counts') or []
+                types = data.get('army_types') or []
+                strats = data.get('strategy_types') or []
+                n = int(data.get('num_sides') or len(names) or 2)
+                fallback = types_available()[0]
+                for i in range(n):
+                    self.add_card(types[i] if i < len(types) else fallback,
+                                  strats[i] if i < len(strats) else 'случайная',
+                                  names[i] if i < len(names) else None,
+                                  counts[i] if i < len(counts) else 5)
+                self._apply_crit_mode(data.get('crit_mode'))
+                self.alliance_settings = data.get('alliance_settings') or []
+                self.ignore_sides = {int(k): set(v)
+                                     for k, v in (data.get('ignore_sides') or {}).items()}
+                opts = data.get('map_opts')
+                if opts:
+                    self.map_view.opts.update({k: v for k, v in opts.items()
+                                               if k in DEFAULT_OPTS})
+                bg = data.get('map_bg')
+                if bg and os.path.exists(bg):
+                    self.map_view.set_background(bg)
+                else:
+                    self.map_view.clear_background()
+                self.map_view.set_opt('zoom', self.map_view.opts['zoom'])
+                self._sync_map_controls()
+                self.cols = 0
+                self.relayout_cards()
+                self.status.showMessage(
+                    f'Настройки загружены: сторон {n}. Нажмите «Создать армии».')
+            except Exception as e:
+                QMessageBox.critical(self, 'Ошибка', f'Ошибка при загрузке: {e}')
+                return
+        finally:
+            self._suspend_history = False
+        self.history.clear()
+        self._current = capture_battle(self)
+        self._sync_history_actions()
 
 
 def main():

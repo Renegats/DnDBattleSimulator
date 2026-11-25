@@ -46,6 +46,7 @@ ATTACK_STYLES = {
 class MapView(QGraphicsView):
     token_clicked = pyqtSignal(object)
     cell_clicked = pyqtSignal(float, float)
+    token_dragged = pyqtSignal(object, float, float)
     image_dropped = pyqtSignal(str)
 
     def __init__(self, palette, parent=None):
@@ -62,6 +63,9 @@ class MapView(QGraphicsView):
         self._press = None
         self._last = None
         self._dragged = False
+        self._token_drag = None
+        self._token_press = None
+        self._token_moved = False
         self._bm = None
         self._sides = []
         self._selected = None
@@ -208,13 +212,28 @@ class MapView(QGraphicsView):
         f = self.opts['zoom'] / 100.0
         self.scale(f, f)
 
+    def _token_at(self, pos):
+        it = self.itemAt(pos)
+        while it is not None and it.data(0) is None and it.parentItem() is not None:
+            it = it.parentItem()
+        if it is not None and it.data(0) is not None:
+            return it.data(0)
+        return None
+
+    @staticmethod
+    def _cell_at(scene_pos, cell):
+        return (round(scene_pos.x() / cell * 2) / 2,
+                round(scene_pos.y() / cell * 2) / 2)
+
     def mousePressEvent(self, e):
         if e.button() == Qt.MouseButton.LeftButton:
-            it = self.itemAt(e.pos())
-            while it is not None and it.data(0) is None and it.parentItem() is not None:
-                it = it.parentItem()
-            if it is not None and it.data(0) is not None:
-                self.token_clicked.emit(it.data(0))
+            enemy = self._token_at(e.pos())
+            if enemy is not None:
+                self._token_drag = enemy
+                self._token_press = e.pos()
+                self._token_moved = False
+                self.token_clicked.emit(enemy)
+                e.accept()
                 return
             self._press = e.pos()
             self._last = e.pos()
@@ -223,6 +242,12 @@ class MapView(QGraphicsView):
         super().mousePressEvent(e)
 
     def mouseMoveEvent(self, e):
+        if self._token_drag is not None and self._token_press is not None:
+            if (e.pos() - self._token_press).manhattanLength() > 6:
+                self._token_moved = True
+                self.setCursor(Qt.CursorShape.ClosedHandCursor)
+            e.accept()
+            return
         if self._press is not None:
             if (e.pos() - self._press).manhattanLength() > 4:
                 self._dragged = True
@@ -235,12 +260,25 @@ class MapView(QGraphicsView):
         super().mouseMoveEvent(e)
 
     def mouseReleaseEvent(self, e):
+        if self._token_drag is not None:
+            enemy = self._token_drag
+            moved = self._token_moved
+            press = self._token_press
+            self._token_drag = None
+            self._token_press = None
+            self._token_moved = False
+            self.setCursor(Qt.CursorShape.ArrowCursor)
+            if moved and press is not None:
+                sp = self.mapToScene(e.pos())
+                x, y = self._cell_at(sp, self.opts['cell'])
+                self.token_dragged.emit(enemy, x, y)
+            e.accept()
+            return
         if self._press is not None:
             if not self._dragged:
                 sp = self.mapToScene(self._press)
-                c = self.opts['cell']
-                self.cell_clicked.emit(round(sp.x() / c * 2) / 2,
-                                       round(sp.y() / c * 2) / 2)
+                x, y = self._cell_at(sp, self.opts['cell'])
+                self.cell_clicked.emit(x, y)
             self._press = None
             self.setCursor(Qt.CursorShape.ArrowCursor)
         super().mouseReleaseEvent(e)
