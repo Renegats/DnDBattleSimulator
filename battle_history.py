@@ -165,6 +165,8 @@ def _event_record(event, id_to_uid):
     for key in ('actor_id', 'target_id'):
         if data.get(key) in id_to_uid:
             data[key] = id_to_uid[data[key]]
+    if data.get('area_ids'):
+        data['area_ids'] = [id_to_uid.get(item, item) for item in data['area_ids']]
     for roll in data.get('rolls') or []:
         if isinstance(roll, dict) and roll.get('actor_id') in id_to_uid:
             roll['actor_id'] = id_to_uid[roll['actor_id']]
@@ -256,6 +258,8 @@ def _remap_event(data, uid_to_id):
     for key in ('actor_id', 'target_id'):
         if payload.get(key) in uid_to_id:
             payload[key] = uid_to_id[payload[key]]
+    if payload.get('area_ids'):
+        payload['area_ids'] = [uid_to_id.get(item, item) for item in payload['area_ids']]
     for roll in payload.get('rolls') or []:
         if isinstance(roll, dict) and roll.get('actor_id') in uid_to_id:
             roll['actor_id'] = uid_to_id[roll['actor_id']]

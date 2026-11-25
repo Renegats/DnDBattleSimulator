@@ -159,10 +159,108 @@ def _opening_specials(attacker, sides, ignore, battle_map, focus, round_no):
     return events
 
 
+class ManualAction:
+    """Решение игрока вместо мозга. kind: attack, effect, skip, auto."""
+
+    __slots__ = ('kind', 'attack', 'effect', 'target', 'placement', 'include')
+
+    def __init__(self, kind, attack=None, effect=None, target=None,
+                 placement=None, include=None):
+        self.kind = kind
+        self.attack = attack
+        self.effect = effect
+        self.target = target
+        self.placement = placement
+        self.include = include
+
+
+def _manual_note(attacker, text, round_no, target=None):
+    return CombatEvent(
+        kind='decision', round=round_no, actor=attacker.name, actor_id=id(attacker),
+        actor_side=getattr(attacker, 'side', None),
+        target=getattr(target, 'name', None) if target is not None else None,
+        target_id=id(target) if target is not None else None,
+        target_side=getattr(target, 'side', None) if target is not None else None,
+        reason='ручное управление', text=text)
+
+
+def _act_manual(attacker, manual, side_idx, sides, ignore_sides, battle_map,
+                auto_move, crit_mode, round_no, events, effective_speed):
+    """Ход по выбору игрока: одна атака, область или пропуск."""
+    ignore = ignore_sides.get(side_idx, set())
+    if manual.kind == 'skip':
+        events.append(_manual_note(
+            attacker, f'🎛 {attacker.name} пропускает ход (ручное управление)', round_no))
+        return
+    if manual.kind == 'effect':
+        effect = manual.effect
+        if not effect:
+            events.append(_manual_note(
+                attacker, f'🎛 {attacker.name}: нет выбранной области', round_no))
+            return
+        from effects import consume_recharge, execute_effect
+        title = effect.get('name') or 'область'
+        events.append(_manual_note(
+            attacker, f'🎛 {attacker.name}: ручной выбор «{title}»', round_no))
+        produced = execute_effect(
+            attacker, effect, sides, ignore, battle_map, round_no=round_no,
+            placement=manual.placement, include=manual.include)
+        if effect.get('recharge') and any(event.result == 'area' for event in produced):
+            consume_recharge(attacker, effect.get('name'))
+        events.extend(produced)
+        return
+    target = manual.target
+    attack = manual.attack
+    if attack is None:
+        attacks = list(getattr(attacker, 'attacks', None) or [])
+        attack = attacks[0] if attacks else None
+    if target is None or attack is None or not getattr(target, 'alive', False):
+        events.append(_manual_note(
+            attacker, f'{attacker.name} - нет подходящих целей для атаки', round_no))
+        return
+    events.append(_manual_note(
+        attacker,
+        f'🎛 {attacker.name}: ручная атака «{getattr(attack, "name", "удар")}» '
+        f'по {target.name}',
+        round_no, target))
+    reach = int(getattr(attack, 'range_ft', 5) or 5)
+    budget = effective_speed(attacker)
+    allow = _fear_allow(battle_map, attacker, sides)
+    if battle_map is not None and battle_map.get_pos(attacker) and battle_map.get_pos(target):
+        dist = battle_map.distance_ft(attacker, target)
+        if dist > reach and auto_move and budget - int(getattr(attacker, 'moved_ft', 0) or 0) >= 5:
+            origin = battle_map.get_pos(attacker)
+            battle_map.move_towards(attacker, target, budget, reach_ft=reach, allow=allow)
+            dest = battle_map.get_pos(attacker)
+            if origin and dest and (origin[0], origin[1]) != (dest[0], dest[1]):
+                events.append(CombatEvent(
+                    kind='move', round=round_no, actor=attacker.name,
+                    actor_id=id(attacker), actor_side=getattr(attacker, 'side', None),
+                    target=target.name, target_id=id(target),
+                    target_side=getattr(target, 'side', None), action='движение',
+                    from_pos=(origin[0], origin[1]), to_pos=(dest[0], dest[1]),
+                    reason='ручное управление',
+                    text=(f'{attacker.name} перемещается {format_pos(origin)} → '
+                          f'{format_pos(dest)}')))
+            dist = battle_map.distance_ft(attacker, target)
+        if dist > reach:
+            events.append(CombatEvent(
+                kind='out_of_reach', round=round_no, actor=attacker.name,
+                actor_id=id(attacker), actor_side=getattr(attacker, 'side', None),
+                target=target.name, target_id=id(target),
+                target_side=getattr(target, 'side', None),
+                reason='ручное управление',
+                text=(f'{attacker.name} не может достать {target.name} '
+                      f'({dist} фт > {reach} фт)')))
+            return
+    execute_strikes(attacker, target, [attack], sides, ignore_sides, battle_map,
+                    crit_mode=crit_mode, round_no=round_no, events=events)
+
+
 def _act_turn(attacker, side_idx, sides, side_names, ignore_sides, battle_map,
               engine, auto_move, crit_mode, round_no, events,
               effective_speed, is_incapacitated, try_stand,
-              replacing_effect, should_replace_attacks):
+              replacing_effect, should_replace_attacks, controller=None):
     """Ход одного существа: состояния, особое действие или удары.
 
     side_names не используется: сигнатура совпадает с вызовом из раунда,
@@ -185,6 +283,12 @@ def _act_turn(attacker, side_idx, sides, side_names, ignore_sides, battle_map,
             actor_side=getattr(attacker, 'side', None),
             text=(f'{attacker.name} встаёт, тратя {cost} фт (половина скорости). '
                   f'Состояние «сбит с ног» снято')))
+
+    manual = controller(attacker, side_idx) if controller is not None else None
+    if manual is not None and getattr(manual, 'kind', None) not in (None, 'auto'):
+        _act_manual(attacker, manual, side_idx, sides, ignore_sides, battle_map,
+                    auto_move, crit_mode, round_no, events, effective_speed)
+        return
 
     ignore = ignore_sides.get(side_idx, set())
     decision = engine.decide(attacker, sides, ignore)
@@ -314,7 +418,8 @@ def _replacing_special(attacker, effect, sides, ignore, battle_map, focus, round
 
 
 def run_round(sides, side_names, ignore_sides, battle_map, engine, auto_move=True,
-              crit_mode='double_all', rng=None, round_no=None, *, quiet=False):
+              crit_mode='double_all', rng=None, round_no=None, *, quiet=False,
+              controller=None):
     """Один раунд боя. outcome: 'continue' | 'over' | 'empty'.
 
     Результат распаковывается в (outcome, text). События — result.events.
@@ -379,7 +484,7 @@ def run_round(sides, side_names, ignore_sides, battle_map, engine, auto_move=Tru
             _act_turn(attacker, side_idx, sides, side_names, ignore_sides, battle_map,
                       engine, auto_move, crit_mode, round_no, events,
                       effective_speed, is_incapacitated, try_stand,
-                      replacing_effect, should_replace_attacks)
+                      replacing_effect, should_replace_attacks, controller)
         finally:
             events.extend(_close_turn(attacker, sides, round_no))
     if previous is not None:

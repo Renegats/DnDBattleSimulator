@@ -8,7 +8,7 @@ import random
 import sys
 from datetime import datetime
 
-from PyQt6.QtCore import Qt, QTimer
+from PyQt6.QtCore import Qt, QEventLoop, QTimer
 from PyQt6.QtGui import QAction, QKeySequence, QPixmap
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QHBoxLayout, QGridLayout, QLabel, QLineEdit, QSpinBox,
@@ -102,6 +102,9 @@ class MainWindow(QMainWindow):
         self.cols = 3
         self._icon_buttons = []
         self.history = BattleHistory()
+        self._manual_loop = None
+        self._manual_subjects = set()
+        self._manual_choices = []
         self._history_ready = False
         self._suspend_history = False
         self._current = None
@@ -717,6 +720,9 @@ class MainWindow(QMainWindow):
             self.refresh_alliances()
             self.map_view.rebuild(self.battle_map, self.sides, self.selected)
             self.map_view.set_round_lines([])
+            self.map_view.set_area_cells([])
+            self.map_view.set_preview_cells([])
+            self.map_view.set_focus_areas([])
             self.log_panel.clear()
             self.log_panel.set_roster(self.sides, self.side_names)
             total = sum(len(s) for s in self.sides)
@@ -764,6 +770,18 @@ class MainWindow(QMainWindow):
                 self.copy_btn = b
             row.addWidget(b)
         row.addStretch()
+        self.manual_toggle = QCheckBox('Ручное управление')
+        self.manual_toggle.setObjectName('manual_toggle')
+        self.manual_toggle.setToolTip(
+            'На ходу выбранного существа или его стороны раунд останавливается: '
+            'цель и область выбираете вы')
+        self.manual_scope = QComboBox()
+        self.manual_scope.setObjectName('manual_scope')
+        self.manual_scope.addItems(['Выбранное существо', 'Сторона выбранного'])
+        self.manual_toggle.toggled.connect(self._sync_manual_toggle)
+        self.manual_scope.currentIndexChanged.connect(self._sync_manual_scope)
+        row.addWidget(self.manual_toggle)
+        row.addWidget(self.manual_scope)
         self.auto_move = QCheckBox('Автоперемещение в бою')
         self.auto_move.setChecked(True)
         row.addWidget(self.auto_move)
@@ -910,10 +928,18 @@ class MainWindow(QMainWindow):
         self.dirty.clear()
 
     def run_round(self):
-        result = battle_round.run_round(
-            self.sides, self.side_names, self.ignore_sides, self.battle_map,
-            self.engine, auto_move=self.auto_move.isChecked(),
-            crit_mode=self.crit_mode.currentData(), round_no=self.round_no + 1)
+        self._manual_subjects = self._manual_subject_ids()
+        self.round_btn.setEnabled(False)
+        try:
+            result = battle_round.run_round(
+                self.sides, self.side_names, self.ignore_sides, self.battle_map,
+                self.engine, auto_move=self.auto_move.isChecked(),
+                crit_mode=self.crit_mode.currentData(), round_no=self.round_no + 1,
+                controller=self._manual_controller)
+        finally:
+            self.round_btn.setEnabled(True)
+            self._manual_subjects = set()
+            self._close_manual_ui()
         outcome, text = result
         if outcome == 'empty':
             QMessageBox.warning(self, 'Ошибка', text)
@@ -926,6 +952,9 @@ class MainWindow(QMainWindow):
         self.refresh_all_labels()
         self.map_view.rebuild(self.battle_map, self.sides, self.selected)
         self.map_view.set_round_lines(map_marks(result.events, self._token_radius))
+        self.map_view.set_preview_cells([])
+        self.map_view.set_focus_areas([])
+        self.map_view.set_area_cells(self._area_cells(result.events))
         alive = sum(1 for s in self.sides for e in s if e.alive)
         attacks = sum(1 for event in result.events if event.kind == 'attack')
         self.status.showMessage(
@@ -933,6 +962,271 @@ class MainWindow(QMainWindow):
             ('  ·  бой завершён' if outcome == 'over' else '') +
             '  ·  линии атак на карте')
         self._commit(f'раунд {self.round_no}')
+
+    def _sync_manual_toggle(self, checked):
+        if getattr(self, 'manual_map_toggle', None) is None:
+            return
+        self.manual_map_toggle.blockSignals(True)
+        self.manual_map_toggle.setChecked(bool(checked))
+        self.manual_map_toggle.blockSignals(False)
+
+    def _sync_manual_toggle_from_map(self, checked):
+        self.manual_toggle.blockSignals(True)
+        self.manual_toggle.setChecked(bool(checked))
+        self.manual_toggle.blockSignals(False)
+
+    def _sync_manual_scope(self, index):
+        if getattr(self, 'manual_map_scope', None) is None:
+            return
+        self.manual_map_scope.blockSignals(True)
+        self.manual_map_scope.setCurrentIndex(index)
+        self.manual_map_scope.blockSignals(False)
+
+    def _sync_manual_scope_from_map(self, index):
+        self.manual_scope.blockSignals(True)
+        self.manual_scope.setCurrentIndex(index)
+        self.manual_scope.blockSignals(False)
+
+    def _manual_subject_ids(self):
+        if not self.manual_toggle.isChecked() or self.selected is None:
+            return set()
+        if self.manual_scope.currentIndex() == 1:
+            side = getattr(self.selected, 'side', None)
+            return {id(enemy) for group in self.sides for enemy in group
+                    if getattr(enemy, 'side', None) == side and enemy.alive}
+        if getattr(self.selected, 'alive', False):
+            return {id(self.selected)}
+        return set()
+
+    def _manual_controller(self, attacker, side_idx):
+        del side_idx
+        if id(attacker) not in self._manual_subjects:
+            return None
+        return self._ask_manual(attacker)
+
+    def _close_manual_ui(self):
+        loop = self._manual_loop
+        self._manual_loop = None
+        if loop is not None and loop.isRunning():
+            loop.quit()
+        if getattr(self, 'manual_bar', None) is not None:
+            self.manual_bar.hide()
+        if getattr(self, 'map_view', None) is not None:
+            self.map_view.set_aiming(False)
+
+    def _ask_manual(self, attacker):
+        self._manual_actor = attacker
+        self._manual_order = battle_round.ManualAction('auto')
+        self._manual_target = None
+        self._manual_placement = None
+        self._manual_include = None
+        self._aim_locked = False
+        self._fill_manual_actions(attacker)
+        self.select_tab(3)
+        self.selected = attacker
+        self.map_view.rebuild(self.battle_map, self.sides, attacker)
+        pos = self.battle_map.get_pos(attacker) if self.battle_map is not None else None
+        self.manual_title.setText(f'Ход: {attacker.name}' + (f' · клетка {pos}' if pos else ''))
+        self.map_info.setText(
+            f'Ручной ход {attacker.name}. Клетка задаёт направление или точку области, '
+            'токен — цель атаки.')
+        self.manual_bar.show()
+        self._apply_manual_action()
+        self.map_view.set_aiming(True)
+        loop = QEventLoop()
+        self._manual_loop = loop
+        loop.exec()
+        order = self._manual_order
+        self._manual_actor = None
+        return order
+
+    def _fill_manual_actions(self, attacker):
+        from effects import (_area_phrase, opening_effects, recharge_ready,
+                             replacing_effect)
+        self.manual_action.blockSignals(True)
+        self.manual_action.clear()
+        self._manual_choices = []
+        for attack in getattr(attacker, 'attacks', None) or []:
+            self.manual_action.addItem(f'Атака: {attack.name}')
+            self._manual_choices.append(('attack', attack, None))
+        breath = replacing_effect(attacker)
+        effects = []
+        if breath:
+            effects.append(breath)
+        for effect in opening_effects(attacker):
+            if effect is breath:
+                continue
+            if effect.get('recharge') and not recharge_ready(attacker, effect.get('name')):
+                continue
+            effects.append(effect)
+        for effect in effects:
+            phrase = _area_phrase(effect, None, None)
+            self.manual_action.addItem(f'Область: {effect.get("name")} ({phrase})')
+            self._manual_choices.append(('effect', None, effect))
+        if not self._manual_choices:
+            self.manual_action.addItem('Нет действий')
+            self._manual_choices.append(('skip', None, None))
+        prefer = next((index for index, item in enumerate(self._manual_choices)
+                       if item[0] == 'effect'), 0)
+        self.manual_action.setCurrentIndex(prefer)
+        self.manual_action.blockSignals(False)
+
+    def _apply_manual_action(self):
+        if not self._manual_choices or getattr(self, '_manual_actor', None) is None:
+            return
+        kind, attack, effect = self._manual_choices[self.manual_action.currentIndex()]
+        self._manual_kind = kind
+        self._manual_attack = attack
+        self._manual_effect = effect
+        self._manual_target = None
+        self._manual_placement = None
+        self._manual_include = None
+        self._aim_locked = False
+        self.map_view.set_preview_cells([])
+        if kind == 'effect' and effect is not None:
+            from effects import best_placement
+            side = getattr(self._manual_actor, 'side', 0)
+            placement = best_placement(
+                self._manual_actor, effect, self.sides,
+                self.ignore_sides.get(side, set()), self.battle_map)
+            self._manual_placement = placement
+            if placement is not None:
+                self.map_view.set_preview_cells(placement.cells)
+            self.manual_hint.setText(
+                'Клик по клетке или токену задаёт направление или точку. '
+                'Повторный клик по существу в области «на выбор» включает и исключает его.')
+            self.manual_go.setEnabled(True)
+        elif kind == 'attack':
+            self.manual_hint.setText('Кликните по токену — это цель атаки.')
+            self.manual_go.setEnabled(False)
+        else:
+            self.manual_hint.setText('У существа нет действий. Ход можно пропустить.')
+            self.manual_go.setEnabled(False)
+        self._refresh_manual_hit()
+
+    def _refresh_manual_hit(self):
+        attacker = getattr(self, '_manual_actor', None)
+        if attacker is None:
+            self.manual_hit.setText('')
+            return
+        if self._manual_kind == 'attack':
+            target = self._manual_target
+            self.manual_hit.setText(
+                f'Цель: {target.name}' if target is not None else 'Цель: не выбрана')
+            return
+        placement = self._manual_placement
+        effect = self._manual_effect
+        if placement is None or effect is None:
+            self.manual_hit.setText('В этом направлении никого нет.')
+            return
+        creatures = list(placement.creatures)
+        if effect.get('choice'):
+            if self._manual_include is None:
+                self._manual_include = [
+                    creature for creature in creatures
+                    if getattr(creature, 'side', None) != getattr(attacker, 'side', None)]
+            names = ', '.join(creature.name for creature in self._manual_include) or 'никого'
+            self.manual_hit.setText(f'На выбор: {names}')
+            return
+        names = ', '.join(creature.name for creature in creatures) or 'никого'
+        allies = [creature.name for creature in creatures
+                  if getattr(creature, 'side', None) == getattr(attacker, 'side', None)]
+        tail = f' · свои: {", ".join(allies)}' if allies else ''
+        self.manual_hit.setText(f'Задеты: {names}{tail}')
+
+    def _manual_aim(self, point):
+        from effects import aim_at
+        attacker = self._manual_actor
+        effect = self._manual_effect
+        if attacker is None or effect is None or self.battle_map is None:
+            return
+        side = getattr(attacker, 'side', 0)
+        placement = aim_at(
+            attacker, effect, self.battle_map, point, self.sides,
+            self.ignore_sides.get(side, set()))
+        self._manual_placement = placement
+        self.map_view.set_preview_cells(placement.cells if placement is not None else [])
+        self._manual_include = None
+        self._refresh_manual_hit()
+
+    def on_aim(self, x, y):
+        if self._manual_loop is None or self._aim_locked or self._manual_kind != 'effect':
+            return
+        self._manual_aim((x, y))
+
+    def _manual_click_cell(self, x, y):
+        if self._manual_kind != 'effect':
+            return
+        self._aim_locked = True
+        self._manual_aim((x, y))
+
+    def _manual_click_token(self, enemy):
+        if enemy is None or enemy is self._manual_actor or not getattr(enemy, 'alive', False):
+            return
+        if self._manual_kind == 'attack':
+            self._manual_target = enemy
+            self.manual_go.setEnabled(True)
+            self.selected = enemy
+            self.map_view.rebuild(self.battle_map, self.sides, self._manual_actor)
+            self._refresh_manual_hit()
+            return
+        if self._manual_kind != 'effect':
+            return
+        placement = self._manual_placement
+        effect = self._manual_effect
+        if (effect is not None and effect.get('choice') and placement is not None
+                and enemy in placement.creatures):
+            if self._manual_include is None:
+                self._refresh_manual_hit()
+            if enemy in self._manual_include:
+                self._manual_include = [item for item in self._manual_include if item is not enemy]
+            else:
+                self._manual_include = list(self._manual_include) + [enemy]
+            self._refresh_manual_hit()
+            return
+        pos = self.battle_map.get_pos(enemy) if self.battle_map is not None else None
+        if pos is not None:
+            self._aim_locked = True
+            self._manual_aim(pos)
+
+    def _manual_confirm(self):
+        kind = getattr(self, '_manual_kind', None)
+        if kind == 'attack':
+            self._manual_order = battle_round.ManualAction(
+                'attack', attack=self._manual_attack, target=self._manual_target)
+        elif kind == 'effect':
+            include = self._manual_include if (
+                self._manual_effect is not None and self._manual_effect.get('choice')) else None
+            self._manual_order = battle_round.ManualAction(
+                'effect', effect=self._manual_effect, placement=self._manual_placement,
+                include=include)
+        else:
+            self._manual_order = battle_round.ManualAction('skip')
+        self._close_manual_ui()
+
+    def _manual_as_ai(self):
+        self._manual_order = battle_round.ManualAction('auto')
+        self._close_manual_ui()
+
+    def _manual_skip_turn(self):
+        self._manual_order = battle_round.ManualAction('skip')
+        self._close_manual_ui()
+
+    @staticmethod
+    def _area_cells(events):
+        seen = set()
+        cells = []
+        for event in events or []:
+            if getattr(event, 'result', None) != 'area':
+                continue
+            for cell in event.area_cells or []:
+                if cell is None or len(cell) < 2:
+                    continue
+                key = (int(cell[0]), int(cell[1]))
+                if key not in seen:
+                    seen.add(key)
+                    cells.append(key)
+        return cells
 
     def selected_enemies(self):
         out = []
@@ -986,6 +1280,9 @@ class MainWindow(QMainWindow):
         self.battle_events = []
         self.log_panel.clear()
         self.map_view.set_round_lines([])
+        self.map_view.set_area_cells([])
+        self.map_view.set_preview_cells([])
+        self.map_view.set_focus_areas([])
         self._commit('очистка журнала')
 
     def copy_log(self):
@@ -1030,6 +1327,7 @@ class MainWindow(QMainWindow):
             ids = [roll.actor_id for roll in event.rolls]
         else:
             ids = [event.actor_id, event.target_id]
+            ids.extend(event.area_ids or [])
         for creature_id in ids:
             enemy = self._find_enemy(creature_id)
             if enemy is not None and id(enemy) not in seen:
@@ -1044,6 +1342,7 @@ class MainWindow(QMainWindow):
             self.map_info.setText(f'{names}{extra} · клетка {pos}')
         self.map_view.set_focus_lines(
             map_marks([event], self._token_radius, include_moves=True))
+        self.map_view.set_focus_areas(event.area_cells)
         who = event.actor or event.kind
         self.status.showMessage(f'Журнал: {who}' + (f' → {event.target}' if event.target else ''))
 
@@ -1270,6 +1569,15 @@ class MainWindow(QMainWindow):
             'серый пунктир — промах, фиолетовый — натуральная 1, зелёный — лечение')
         self.cb_attacks.toggled.connect(lambda v: self.map_view.set_opt('attack_lines', v))
         pl.addWidget(self.cb_attacks)
+        self.manual_map_toggle = QCheckBox('Ручное управление')
+        self.manual_map_toggle.setObjectName('manual_map_toggle')
+        self.manual_map_toggle.toggled.connect(self._sync_manual_toggle_from_map)
+        pl.addWidget(self.manual_map_toggle)
+        self.manual_map_scope = QComboBox()
+        self.manual_map_scope.setObjectName('manual_map_scope')
+        self.manual_map_scope.addItems(['Выбранное существо', 'Сторона выбранного'])
+        self.manual_map_scope.currentIndexChanged.connect(self._sync_manual_scope_from_map)
+        pl.addWidget(self.manual_map_scope)
 
         pl.addWidget(QLabel('Подписи токенов:'))
         self.cmb_labels = QComboBox()
@@ -1345,6 +1653,7 @@ class MainWindow(QMainWindow):
         self.map_view.cell_clicked.connect(self.on_cell)
         self.map_view.token_dragged.connect(self.on_token_dragged)
         self.map_view.image_dropped.connect(self._apply_background_path)
+        self.map_view.aim_moved.connect(self.on_aim)
         split.addWidget(self.map_view)
         mirror = QWidget()
         mirror_lay = QVBoxLayout(mirror)
@@ -1355,9 +1664,50 @@ class MainWindow(QMainWindow):
         split.setStretchFactor(1, 1)
         split.setSizes([520, 200])
         right.addWidget(split, 1)
+        self.manual_bar = QFrame()
+        self.manual_bar.setObjectName('manual_bar')
+        self.manual_bar.setProperty('role', 'card')
+        self.manual_bar.hide()
+        bar_lay = QVBoxLayout(self.manual_bar)
+        bar_lay.setContentsMargins(8, 6, 8, 6)
+        bar_lay.setSpacing(4)
+        self.manual_title = QLabel('Ход')
+        self.manual_title.setProperty('role', 'title')
+        bar_lay.addWidget(self.manual_title)
+        pick = QHBoxLayout()
+        self.manual_action = QComboBox()
+        self.manual_action.setObjectName('manual_action')
+        self.manual_action.currentIndexChanged.connect(lambda _index: self._apply_manual_action())
+        pick.addWidget(self.manual_action, 1)
+        self.manual_go = QPushButton('Выполнить')
+        self.manual_go.setObjectName('manual_go')
+        self.manual_go.setProperty('variant', 'primary')
+        self.manual_ai = QPushButton('Как решит ИИ')
+        self.manual_ai.setObjectName('manual_ai')
+        self.manual_skip = QPushButton('Пропустить ход')
+        self.manual_skip.setObjectName('manual_skip')
+        self.manual_go.clicked.connect(self._manual_confirm)
+        self.manual_ai.clicked.connect(self._manual_as_ai)
+        self.manual_skip.clicked.connect(self._manual_skip_turn)
+        for button in (self.manual_go, self.manual_ai, self.manual_skip):
+            button.setCursor(Qt.CursorShape.PointingHandCursor)
+            pick.addWidget(button)
+        bar_lay.addLayout(pick)
+        self.manual_hint = QLabel('')
+        self.manual_hint.setWordWrap(True)
+        self.manual_hint.setProperty('role', 'muted')
+        self.manual_hit = QLabel('')
+        self.manual_hit.setWordWrap(True)
+        self.manual_hit.setObjectName('manual_hit')
+        bar_lay.addWidget(self.manual_hint)
+        bar_lay.addWidget(self.manual_hit)
+        right.addWidget(self.manual_bar)
         self.map_info = QLabel('Токен не выбран.')
         self.map_info.setProperty('role', 'muted')
         right.addWidget(self.map_info)
+        self._manual_loop = None
+        self._manual_subjects = set()
+        self._manual_choices = []
         outer.addLayout(right, 1)
         self._sync_bg_info()
         return page
@@ -1464,6 +1814,9 @@ class MainWindow(QMainWindow):
         self._commit('расстановка строем')
 
     def on_token(self, enemy):
+        if self._manual_loop is not None:
+            self._manual_click_token(enemy)
+            return
         self.selected = enemy
         self.map_view.rebuild(self.battle_map, self.sides, self.selected)
         from conditions import condition_marks, effective_speed
@@ -1477,13 +1830,16 @@ class MainWindow(QMainWindow):
         self._note_selection()
 
     def on_token_dragged(self, enemy, x, y):
-        if enemy is None:
+        if self._manual_loop is not None or enemy is None:
             return
         self.selected = enemy
         self._note_selection()
         self.on_cell(x, y)
 
     def on_cell(self, x, y):
+        if self._manual_loop is not None:
+            self._manual_click_cell(x, y)
+            return
         if self.battle_map is None or self.selected is None or not self.selected.alive:
             return
         pos = self.battle_map.get_pos(self.selected)

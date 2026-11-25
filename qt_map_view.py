@@ -49,6 +49,7 @@ class MapView(QGraphicsView):
     cell_clicked = pyqtSignal(float, float)
     token_dragged = pyqtSignal(object, float, float)
     image_dropped = pyqtSignal(str)
+    aim_moved = pyqtSignal(float, float)
 
     def __init__(self, palette, parent=None):
         super().__init__(parent)
@@ -78,6 +79,11 @@ class MapView(QGraphicsView):
         self._focus_enemies = []
         self._attack_items = []
         self._focus_items = []
+        self._area_cells = []
+        self._preview_cells = []
+        self._focus_cells = []
+        self._area_items = []
+        self._aiming = False
 
     # ---------- фон ----------
     def set_background(self, path):
@@ -236,10 +242,14 @@ class MapView(QGraphicsView):
                 return
         if e.button() == Qt.MouseButton.LeftButton:
             enemy = self._token_at(e.pos())
-            if enemy is not None:
+            if enemy is not None and not self._aiming:
                 self._token_drag = enemy
                 self._token_press = e.pos()
                 self._token_moved = False
+                self.token_clicked.emit(enemy)
+                e.accept()
+                return
+            if enemy is not None and self._aiming:
                 self.token_clicked.emit(enemy)
                 e.accept()
                 return
@@ -249,7 +259,21 @@ class MapView(QGraphicsView):
             self.setCursor(Qt.CursorShape.ClosedHandCursor)
         super().mousePressEvent(e)
 
+    def set_aiming(self, on):
+        """Клик и движение мыши выбирают клетку прицела, а не тащат карту."""
+        self._aiming = bool(on)
+        self.setMouseTracking(bool(on))
+        if not on:
+            self.setCursor(Qt.CursorShape.ArrowCursor)
+
     def mouseMoveEvent(self, e):
+        if self._aiming and self._token_drag is None:
+            sp = self.mapToScene(e.pos())
+            x, y = self._cell_at(sp, self.opts['cell'])
+            self.aim_moved.emit(x, y)
+            if self._press is not None:
+                e.accept()
+                return
         if self._token_drag is not None and self._token_press is not None:
             if (e.pos() - self._token_press).manhattanLength() > 6:
                 self._token_moved = True
@@ -283,12 +307,13 @@ class MapView(QGraphicsView):
             e.accept()
             return
         if self._press is not None:
-            if not self._dragged:
-                sp = self.mapToScene(self._press)
+            if self._aiming or not self._dragged:
+                sp = self.mapToScene(e.pos() if self._aiming else self._press)
                 x, y = self._cell_at(sp, self.opts['cell'])
                 self.cell_clicked.emit(x, y)
             self._press = None
-            self.setCursor(Qt.CursorShape.ArrowCursor)
+            if not self._aiming:
+                self.setCursor(Qt.CursorShape.ArrowCursor)
         super().mouseReleaseEvent(e)
 
     # ---------- отрисовка ----------
@@ -311,6 +336,21 @@ class MapView(QGraphicsView):
                     for xx in range(hx, hx + n):
                         covered.add((xx, yy))
         return covered
+
+    def set_area_cells(self, cells):
+        """Клетки уже сыгранной области. Сцену не пересобирает."""
+        self._area_cells = [tuple(cell) for cell in cells or []]
+        self._paint_areas()
+
+    def set_preview_cells(self, cells):
+        """Живой прицел: клетки, которые накроет выбранное направление."""
+        self._preview_cells = [tuple(cell) for cell in cells or []]
+        self._paint_areas()
+
+    def set_focus_areas(self, cells):
+        """Клетки одной записи журнала поверх области раунда."""
+        self._focus_cells = [tuple(cell) for cell in cells or []]
+        self._paint_areas()
 
     def set_round_lines(self, lines):
         """Линии последнего раунда. Снимает прежние стрелки, сцену не чистит."""
@@ -423,12 +463,43 @@ class MapView(QGraphicsView):
             ring.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
             self._focus_items.append(ring)
 
+    def _paint_areas(self):
+        scene = self.scene()
+        for item in self._area_items:
+            scene.removeItem(item)
+        self._area_items = []
+        if self._bm is None:
+            return
+        cell = self.opts['cell']
+        layers = (
+            (self._area_cells, QColor(230, 126, 34, 110), QColor(192, 86, 12, 180), -1),
+            (self._preview_cells, QColor(241, 196, 15, 150), QColor(241, 196, 15, 230), 0),
+            (self._focus_cells, QColor(241, 196, 15, 80), QColor(255, 230, 120, 240), 5),
+        )
+        for cells, fill, edge, z_value in layers:
+            pen = QPen(edge, 1.4)
+            pen.setCosmetic(True)
+            brush = QBrush(fill)
+            for cx, cy in cells:
+                try:
+                    left, top = float(cx) * cell, float(cy) * cell
+                except (TypeError, ValueError):
+                    continue
+                rect = scene.addRect(left + 1, top + 1, cell - 2, cell - 2, pen, brush)
+                rect.setZValue(z_value)
+                rect.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
+                self._area_items.append(rect)
+
     def rebuild(self, bm, sides, selected=None):
         lines = list(self._round_lines)
         focus_lines = list(self._focus_lines)
         focus_enemies = [enemy for enemy in self._focus_enemies if enemy is not None]
+        area_cells = list(self._area_cells)
+        preview_cells = list(self._preview_cells)
+        focus_cells = list(self._focus_cells)
         self._attack_items = []
         self._focus_items = []
+        self._area_items = []
         self._bm, self._sides, self._selected = bm, sides or [], selected
         sc = self.scene()
         sc.clear()
@@ -436,6 +507,9 @@ class MapView(QGraphicsView):
         self._round_lines = lines
         self._focus_lines = focus_lines
         self._focus_enemies = focus_enemies
+        self._area_cells = area_cells
+        self._preview_cells = preview_cells
+        self._focus_cells = focus_cells
         if bm is None:
             return
         o = self.opts
@@ -525,6 +599,7 @@ class MapView(QGraphicsView):
                     if not en.alive:
                         t.setOpacity(max(0.1, o['dead_alpha'] / 100.0))
                 self._paint_condition_badges(item, en, x0, y0, box)
+        self._paint_areas()
         self._paint_attack_lines()
         self._paint_focus_rings()
 

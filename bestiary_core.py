@@ -315,7 +315,7 @@ def _attach_effect(action, warnings):
     effect, warning = parse_special_effect(action.get('name'), action.get('desc'))
     if effect:
         action['effect'] = effect
-    elif warning:
+    if warning:
         warnings.append(warning)
     return action
 
