@@ -1,0 +1,4316 @@
+
+==================== alliance_ui.py ====================
+
+import tkinter as tk
+from tkinter import ttk, messagebox
+from ui_components import ScrollableFrame
+
+
+class AllianceUI:
+    """Класс для управления интерфейсом альянсов"""
+
+    def __init__(self):
+        """Инициализация UI альянсов"""
+        pass
+
+    def setup_alliance_ui(self):
+        """Настройка интерфейса для управления альянсами"""
+        # Очистка фрейма альянсов
+        for widget in self.alliance_frame.winfo_children():
+            widget.destroy()
+
+        if self.num_sides <= 2:
+            ttk.Label(self.alliance_frame, text="Для настройки альянсов требуется минимум 3 стороны",
+                      font=('Arial', 12)).pack(pady=50)
+            return
+
+        # Создание прокручиваемого фрейма для альянсов
+        alliance_scroll_frame = ScrollableFrame(self.alliance_frame)
+        alliance_scroll_frame.pack(fill='both', expand=True)
+
+        ttk.Label(alliance_scroll_frame.scrollable_frame,
+                  text="Настройка альянсов - выберите, какие стороны игнорируют друг друга",
+                  font=('Arial', 12, 'bold')).pack(pady=10)
+
+        # Создание матрицы альянсов
+        alliance_frame = ttk.Frame(alliance_scroll_frame.scrollable_frame)
+        alliance_frame.pack(pady=20)
+
+        # Заголовок строки
+        for i in range(self.num_sides):
+            ttk.Label(alliance_frame, text=self.side_names[i], font=('Arial', 10, 'bold')).grid(row=0, column=i + 1,
+                                                                                                padx=10, pady=5)
+
+        # Матрица альянсов
+        self.alliance_vars = []
+        for i in range(self.num_sides):
+            row_vars = []
+            ttk.Label(alliance_frame, text=self.side_names[i], font=('Arial', 10, 'bold')).grid(row=i + 1, column=0,
+                                                                                                padx=10, pady=5)
+            for j in range(self.num_sides):
+                if i == j:
+                    ttk.Label(alliance_frame, text="-").grid(row=i + 1, column=j + 1, padx=5, pady=2)
+                    row_vars.append(None)
+                else:
+                    var = tk.BooleanVar()
+                    # Восстановление предыдущих настроек альянсов если они существуют
+                    if hasattr(self, 'alliance_settings') and self.alliance_settings:
+                        if i < len(self.alliance_settings) and j < len(self.alliance_settings[i]):
+                            var.set(self.alliance_settings[i][j])
+                    cb = ttk.Checkbutton(alliance_frame, variable=var)
+                    cb.grid(row=i + 1, column=j + 1, padx=5, pady=2)
+                    row_vars.append(var)
+            self.alliance_vars.append(row_vars)
+
+        ttk.Button(alliance_scroll_frame.scrollable_frame, text="Применить настройки альянсов",
+                   command=self.apply_alliances).pack(pady=20)
+
+    def apply_alliances(self):
+        """Применение настроек альянсов к врагам"""
+        # Сохранение настроек альянсов
+        self.alliance_settings = []
+        self.ignore_sides = {}  # Сброс глобальных настроек
+
+        for i in range(self.num_sides):
+            row_settings = []
+            ignore_set = set()
+            for j in range(self.num_sides):
+                if i == j:
+                    row_settings.append(False)
+                else:
+                    is_ignored = self.alliance_vars[i][j].get()
+                    row_settings.append(is_ignored)
+                    if is_ignored:
+                        ignore_set.add(j)
+            self.alliance_settings.append(row_settings)
+            self.ignore_sides[i] = ignore_set
+
+        # Сброс всех списков игнорирования у врагов
+        for side in self.sides:
+            for enemy in side:
+                enemy.ignore_sides.clear()
+
+        # Применение новых альянсов к врагам
+        for i in range(self.num_sides):
+            for j in self.ignore_sides.get(i, set()):
+                for enemy in self.sides[i]:
+                    enemy.ignore_sides.add(j)
+
+        messagebox.showinfo("Успех", "Настройки альянсов применены!")
+
+
+==================== battle_logic.py ====================
+
+import random
+import tkinter as tk
+from tkinter import ttk, messagebox
+from entities import Enemy
+from battle_strategies import BattleStrategy, RandomStrategy, AggressiveStrategy, DefensiveStrategy, SupportStrategy
+from decision_engine import DecisionEngine, dmg_canon
+
+ENGINE = DecisionEngine()
+
+
+class BattleLogic:
+    """Класс для управления логикой битвы"""
+
+    def __init__(self):
+        """Инициализация логики битвы"""
+        pass
+
+    def _run_round_inner(self):
+        """Проведение одного раунда битвы"""
+        if not self.sides or not any(any(enemy.alive for enemy in side) for side in self.sides):
+            messagebox.showerror("Ошибка", "Армии не созданы или все мертвы!")
+            return
+
+        battle_log = "=== НОВЫЙ РАУНД БОЯ ===\n"
+        ENGINE.begin_round()   # сброс журнала объяснений на новый раунд (СПР-анализ)
+
+        # Новый раунд - все очки движения восстанавливаются
+        for side_enemies in self.sides:
+            for enemy in side_enemies:
+                enemy.moved_ft = 0
+
+        if getattr(self, 'battle_map', None):
+            for side_enemies in self.sides:
+                for enemy in side_enemies:
+                    real = self.battle_map.get_pos(enemy)
+                    if real is not None:
+                        enemy.pos = real
+
+        # Обработка атак для каждой стороны
+        for attacker_side_idx, side_enemies in enumerate(self.sides):
+            alive_attackers = [e for e in side_enemies if e.alive]
+            for attacker in alive_attackers:
+                # ===== v1 ИИ: мозг решает цель/атаку/намерение движения =====
+                decision = ENGINE.decide(attacker, self.sides,
+                                         self.ignore_sides.get(attacker_side_idx, set()))
+                target = decision.target
+                if not target:
+                    battle_log += f"{attacker.name} - нет подходящих целей для атаки\n"
+                    continue
+                if decision.rationale:
+                    battle_log += f"🧠 {attacker.name}: {decision.rationale}\n"
+
+                if decision.attack is None:
+                    # делегат (tier0/1) или мультиатака - старый путь развёртки
+                    strikes = self._resolve_strikes(attacker, target)
+                    if not strikes:
+                        battle_log += f"{attacker.name} - нет доступных атак\n"
+                        continue
+                    reach = self._strike_reach(attacker, strikes)
+                else:
+                    # smart-одиночная (tier>=2): атака уже выбрана с учётом защиты/дальности
+                    strikes = [decision.attack]
+                    reach = decision.target_dist_ft
+
+                # --- Карта: движение по move_intent (approach / hold) ---
+                if getattr(self, 'battle_map', None) and \
+                        self.battle_map.get_pos(attacker) and self.battle_map.get_pos(target):
+                    dist = self.battle_map.distance_ft(attacker, target)
+                    if decision.move_intent == 'hold' and dist <= reach:
+                        pass  # держим дистанцию: уже достаём, не подбегаем (v1 C2-half)
+                    elif dist > reach and getattr(self, 'auto_move', False):
+                        self.battle_map.move_towards(attacker, target, attacker.speed,
+                                                     reach_ft=reach)
+                        dist = self.battle_map.distance_ft(attacker, target)
+                    if dist > reach:
+                        battle_log += (f"{attacker.name} не может достать {target.name} "
+                                       f"({dist} фт > {reach} фт)\n")
+                        continue
+                    # перевыбор ДЛЯ ДЕЛЕГАТ-ОДИНОЧНЫХ (tier<=1): старый цикл после подхода
+                    # переспрашивал стратегию по новой дистанции - сохраняем ноль регрессии.
+                    if decision.attack is None and decision.tier <= 1 \
+                            and not getattr(attacker, 'multiattack', None):
+                        strikes = self._resolve_strikes(attacker, target)
+                        if not strikes:
+                            continue
+
+                # ===== Выполнение ударов =====
+                lines, _killed = self.execute_strikes(attacker, target, strikes)
+                for ln in lines:
+                    battle_log += ln + "\n"
+
+            battle_log += "\n"
+
+        # Фаза регенерации для существ с особой способностью
+        for side_enemies in self.sides:
+            for enemy in side_enemies:
+                if enemy.alive and enemy.regen > 0:
+                    prev_hp = enemy.hp
+                    enemy.regenerate()
+                    if enemy.hp > prev_hp:
+                        battle_log += f"💚 {enemy.name} восстанавливает {enemy.hp - prev_hp} HP благодаря регенерации\n"
+
+        # Проверка исхода битвы
+        alive_sides = []
+        for i, side_enemies in enumerate(self.sides):
+            if any(enemy.alive for enemy in side_enemies):
+                alive_sides.append(self.side_names[i])
+
+        if len(alive_sides) <= 1:
+            if alive_sides:
+                battle_log += f"\n🎉 {alive_sides[0]} ПОБЕДИЛА!\n"
+            else:
+                battle_log += f"\n⚔️ Все стороны уничтожены! Ничья.\n"
+        else:
+            battle_log += f"\nБитва продолжается: {' vs '.join(alive_sides)}\n"
+
+        # Вставляем результаты в текстовое поле
+        if hasattr(self, 'battle_results_text'):
+            self.battle_results_text.insert(tk.END, battle_log + "\n")
+
+        self.battle_results_text.see(tk.END)
+        if int(self.battle_results_text.index('end-1c').split('.')[0]) > 3000:
+            self.battle_results_text.delete('1.0', 'end-2500l')
+
+    def run_battle_round(self):
+        self.ui_suspend = True
+        try:
+            self._run_round_inner()
+        finally:
+            self.ui_suspend = False
+            self.update_battle_ui()
+            if getattr(self, 'battle_map', None):
+                self.draw_map()
+
+    def _resolve_strikes(self, attacker, target):
+        if getattr(attacker, 'multiattack', None):
+            by_name = {a.name: a for a in attacker.attacks}
+            strikes = []
+            for s in attacker.multiattack:
+                atk = by_name.get(s['attack'])
+                if atk is None:
+                    continue                      # имя не распознано парсером - тихо пропускаем
+                strikes.extend([atk] * max(1, int(s.get('count', 1))))
+            if strikes:
+                return strikes
+        # нет мультиатаки (или она пустая) - одна атака по стратегии
+        a = attacker.strategy.select_attack(attacker, target)
+        return [a] if a else []
+
+    def _strike_reach(self, attacker, strikes):
+        """Дистанция, на которую надо подойти, чтобы нанести ВСЕ удары = минимум range среди них."""
+        if not strikes:
+            return 5
+        return min(getattr(a, 'range_ft', 5) for a in strikes)
+
+    def _in_range_of(self, attacker, target, atk):
+        """Достаёт ли КОНКРЕТНЫЙ удар цель прямо сейчас (страховка внутри мультиатаки)."""
+        need = getattr(atk, 'range_ft', 5)
+        if getattr(self, 'battle_map', None) and self.battle_map.get_pos(attacker) \
+                and self.battle_map.get_pos(target):
+            return self.battle_map.distance_ft(attacker, target) <= need
+        from battle_strategies import distance_ft_between
+        return distance_ft_between(attacker, target) <= need
+
+    def execute_strikes(self, attacker, target, strikes):
+        # входной guard (defensible-in-depth: защищает от любой будущей регрессии
+        # в _run_round_inner, где target может стать None по третьей причине)
+        if target is None:
+            return [], False
+        lines, any_killed = [], False
+        ignore = self.ignore_sides.get(attacker.side, set())
+        for atk in strikes:
+            if target is None or not target.alive:
+                # цель погибла (или изначально не достаётся) - ищем нового соседа
+                target = self._nearest_in_range(attacker, atk, ignore)
+                if target is None:
+                    break  # мёртвую цель не добить, живой в радиусе нет -
+                    # все оставшиеся удары пропадают (без движения посреди замаха)
+            if not self._in_range_of(attacker, target, atk):
+                # цель ЖИВАЯ, но далеко для ЭТОГО удара - ищем достижимого
+                alt = self._nearest_in_range(attacker, atk, ignore)
+                if alt is None:
+                    continue  # БЕЗОПАСНО: target живой, следующая атака (напр. лук) достанет
+                target = alt
+            hit, damage, attack_roll, critical, damage_info = attacker.perform_attack(atk, target.ac)
+            if hit:
+                damage, dmg_note = self._modify_damage(target, damage, atk.damage_type)
+                target.take_damage(damage)
+                crit_text = " КРИТИЧЕСКИЙ УДАР!" if critical else ""
+                lines.append(f"{attacker.name} → {target.name} ({atk.name}: "
+                             f"{attack_roll} vs AC {target.ac}) - ПОПАДАНИЕ!{crit_text} {damage_info}{dmg_note}")
+                if not target.alive:
+                    lines.append(f"☠️ {target.name} УНИЧТОЖЕН!")
+                    any_killed = True
+            else:
+                lines.append(f"{attacker.name} → {target.name} ({atk.name}: "
+                             f"{attack_roll} vs AC {target.ac}) - ПРОМАХ!")
+        return lines, any_killed
+
+    def _nearest_in_range(self, attacker, atk, ignore):
+        need = getattr(atk, 'range_ft', 5)
+        has_map = getattr(self, 'battle_map', None) is not None \
+            and self.battle_map.get_pos(attacker) is not None
+        best, best_d = None, None
+        for side_idx, side_enemies in enumerate(self.sides):
+            if side_idx == attacker.side:
+                continue
+            if side_idx in ignore or side_idx in attacker.ignore_sides:
+                continue
+            for e in side_enemies:
+                if not e.alive:
+                    continue
+                if not has_map:
+                    return e                      # без карты - любой живой «в радиусе»
+                if self.battle_map.get_pos(e) is None:
+                    continue
+                d = self.battle_map.distance_ft(attacker, e)
+                if d <= need and (best_d is None or d < best_d):
+                    best, best_d = e, d
+        return best
+
+
+    def _modify_damage(self, target, raw, damage_type):
+        canon = dmg_canon(damage_type)
+        if not canon or raw <= 0:
+            return raw, ''
+        imm = {dmg_canon(x) for x in (getattr(target, 'immunities', []) or [])}
+        vul = {dmg_canon(x) for x in (getattr(target, 'vulnerabilities', []) or [])}
+        res = {dmg_canon(x) for x in (getattr(target, 'resistances', []) or [])}
+        if canon in imm:
+            return 0, f" → 0 (иммунитет: {damage_type})"
+        if canon in vul:
+            final = raw * 2
+            return final, f" → {final} (уязвимость: {damage_type})"
+        if canon in res:
+            final = raw // 2
+            return final, f" → {final} (сопротивление: {damage_type})"
+        return raw, ''
+
+
+==================== battle_map.py ====================
+
+import tkinter as tk
+from tkinter import ttk, messagebox
+import random
+from theme_manager import current_palette
+
+CELL_PX = 28  # размер клетки в пикселях
+SIDE_COLORS = ['#e74c3c', '#3498db', '#2ecc71', '#f1c40f', '#9b59b6', '#e67e22']
+
+
+class BattleMap:
+    """Модель поля боя: сетка клеток и позиции токенов"""
+
+    def __init__(self, width=24, height=16):
+        self.width = width
+        self.height = height
+        self.positions = {}   # id(enemy) -> (x, y)
+        self._enemies = {}    # id(enemy) -> enemy
+        self.cell_map = {}  # (x, y) -> enemy
+
+    def cell_free(self, x, y, ignore_id=None):
+        if not (0 <= x < self.width and 0 <= y < self.height):
+            return False
+        occ = self.cell_map.get((x, y))
+        if occ is None or id(occ) == ignore_id:
+            return True
+        return not occ.alive
+
+    def place(self, enemy, x, y):
+        old = self.positions.get(id(enemy))
+        if old:
+            self.cell_map.pop(old, None)
+        self.positions[id(enemy)] = (x, y)
+        self.cell_map[(x, y)] = enemy
+        self._enemies[id(enemy)] = enemy
+        enemy.pos = (x, y)
+
+    def get_pos(self, enemy):
+        """Возвращает позицию токена (x, y) или None, если он не на карте"""
+        return self.positions.get(id(enemy))
+
+    def enemy_at(self, x, y):
+        return self.cell_map.get((x, y))
+
+    def distance_ft(self, a, b):
+        """Дистанция в футах: в 5e диагональ = 5 фт, поэтому берём максимум разниц"""
+        pa, pb = self.get_pos(a), self.get_pos(b)
+        if not pa or not pb:
+            return 0
+        return max(abs(pa[0] - pb[0]), abs(pa[1] - pb[1])) * 5
+
+    def _zone_for(self, side_idx, total):
+        """Каждая сторона получает свою вертикальную полосу поля"""
+        w = max(3, self.width // max(1, total))
+        x0 = side_idx * w
+        x1 = min(self.width, (side_idx + 1) * w) if side_idx < total - 1 else self.width
+        return x0, x1
+
+    def _find_any_free(self):
+        """Первая свободная клетка где угодно на карте, или None, если карта забита"""
+        for yy in range(self.height):
+            for xx in range(self.width):
+                if self.cell_free(xx, yy):
+                    return xx, yy
+        return None
+
+    def random_placement(self, sides):
+        """Случайная расстановка, но каждая сторона в своей зоне"""
+        self.positions.clear()
+        self.cell_map.clear()
+        self._enemies.clear()
+        for i, side in enumerate(sides):
+            x0, x1 = self._zone_for(i, len(sides))
+            cells = [(x, y) for x in range(x0, x1) for y in range(self.height)]
+            random.shuffle(cells)
+            for enemy in side:
+                enemy.moved_ft = 0
+                if not enemy.alive:
+                    continue
+                while cells:
+                    x, y = cells.pop()
+                    if self.cell_free(x, y):
+                        self.place(enemy, x, y)
+                        break
+                else:
+                    spot = self._find_any_free()  # зона переполнена - селим куда угодно
+                    if spot:
+                        self.place(enemy, spot[0], spot[1])
+
+    def formation_placement(self, sides):
+        """Расстановка шеренгами в своей зоне; переполнение зоны больше НЕ вешает программу"""
+        self.positions.clear()
+        self.cell_map.clear()
+        self._enemies.clear()
+        for i, side in enumerate(sides):
+            x0, x1 = self._zone_for(i, len(sides))
+            for enemy in side:
+                enemy.moved_ft = 0
+                if not enemy.alive:
+                    continue
+                spot = None
+                # Первая свободная клетка в своей зоне, ряд за рядом (шеренги!)
+                for yy in range(self.height):
+                    for xx in range(x0, x1):
+                        if self.cell_free(xx, yy):
+                            spot = (xx, yy)
+                            break
+                    if spot:
+                        break
+                if spot is None:  # зона забита под завязку
+                    spot = self._find_any_free()
+                if spot is None:  # вся карта забита - пропускаем бойца
+                    continue
+                self.place(enemy, spot[0], spot[1])
+
+    def find_path(self, enemy, target, max_steps, reach_steps=1):
+        """BFS-поиск кратчайшего пути (до max_steps шагов) до ближайшей клетки,
+        с которой цель досягаема (чебышевское расстояние <= reach_steps).
+        Если такой клетки нет - возвращает путь, приближающий к цели максимально.
+        Возвращает список клеток БЕЗ стартовой, или None, если идти некуда."""
+        start = self.get_pos(enemy)
+        tpos = self.get_pos(target)
+        if not start or not tpos:
+            return None
+        eid = id(enemy)
+        # 8 направлений, перемешанные - чтобы воины не ходили одной колонной
+        dirs = [(-1, -1), (0, -1), (1, -1), (-1, 0),
+                (1, 0), (-1, 1), (0, 1), (1, 1)]
+        random.shuffle(dirs)
+
+        parents = {start: None}
+        frontier = [start]
+        best_cell = start
+        best_dist = max(abs(start[0] - tpos[0]), abs(start[1] - tpos[1]))
+
+        def rebuild(cell):
+            path = []
+            cur = cell
+            while cur is not None:
+                path.append(cur)
+                cur = parents[cur]
+            return path[::-1][1:]  # без стартовой клетки
+
+        for _ in range(max_steps):
+            next_frontier = []
+            for (cx, cy) in frontier:
+                for dx, dy in dirs:
+                    nx, ny = cx + dx, cy + dy
+                    if (nx, ny) in parents:
+                        continue
+                    if not self.cell_free(nx, ny, ignore_id=eid):
+                        continue
+                    parents[(nx, ny)] = (cx, cy)
+                    d = max(abs(nx - tpos[0]), abs(ny - tpos[1]))
+                    if d <= reach_steps:
+                        return rebuild((nx, ny))  # нашли клетку атаки!
+                    if d < best_dist:
+                        best_dist = d
+                        best_cell = (nx, ny)
+                    next_frontier.append((nx, ny))
+            frontier = next_frontier
+            if not frontier:
+                break
+        # Цель недоступна - ползем максимально близко по лучшему пути
+        if best_cell == start:
+            return None
+        return rebuild(best_cell)
+
+    def move_towards(self, enemy, target, max_ft, reach_ft=5):
+        """Умное движение: BFS-маршрут в обход союзников до клетки атаки.
+        Если путь намертво заблокирован толпой - делает случайный 'дрейф'-шаг,
+        чтобы пробка понемногу рассасывалась, а не стояла насмерть."""
+        steps = max_ft // 5
+        reach_steps = max(1, reach_ft // 5)
+        path = self.find_path(enemy, target, steps, reach_steps)
+        if path:
+            self.place(enemy, path[-1][0], path[-1][1])
+            return
+        # Путь не найден - ерзаем в случайную свободную соседнюю клетку (анти-пробка)
+        pos = self.get_pos(enemy)
+        if not pos:
+            return
+        x, y = pos
+        free = []
+        for dx in (-1, 0, 1):
+            for dy in (-1, 0, 1):
+                if dx == 0 and dy == 0:
+                    continue
+                if self.cell_free(x + dx, y + dy, ignore_id=id(enemy)):
+                    free.append((x + dx, y + dy))
+        if free:
+            nx, ny = random.choice(free)
+            self.place(enemy, nx, ny)
+
+
+class BattleMapUI:
+    """Вкладка с картой боя: токены, клетки, перемещения по скорости"""
+
+    def __init__(self):
+        self.battle_map = None
+        self.selected_enemy = None
+        self.auto_move = True  # авто-продвижение к цели в бою
+
+    def setup_map_ui(self):
+        for w in self.map_frame.winfo_children():
+            w.destroy()
+        self.selected_enemy = None
+
+        if not getattr(self, 'sides', None) or not any(self.sides):
+            ttk.Label(self.map_frame,
+                      text="Сначала создайте армии на вкладке «Настройка армий»",
+                      font=('Arial', 12)).pack(pady=50)
+            return
+
+        if self.battle_map is None:
+            self.battle_map = BattleMap()
+
+        top = ttk.Frame(self.map_frame)
+        top.pack(fill='x', pady=5)
+        ttk.Button(top, text="🎲 Расставить случайно", command=self.place_random).pack(side='left', padx=5)
+        ttk.Button(top, text="🛡 Расставить строем", command=self.place_formation).pack(side='left', padx=5)
+        self.auto_move_var = tk.BooleanVar(value=self.auto_move)
+        ttk.Checkbutton(top, text="Автоперемещение в бою", variable=self.auto_move_var,
+                        command=self._sync_auto_move).pack(side='left', padx=10)
+        ttk.Label(top, text="Клетка = 5 фт. Клик по токену — выбрать, клик по зелёной клетке — шаг.",
+                  font=('Arial', 9)).pack(side='left', padx=10)
+
+        map_wrap = ttk.Frame(self.map_frame)
+        map_wrap.pack(fill='both', expand=True, pady=5)
+        map_wrap.grid_rowconfigure(0, weight=1)
+        map_wrap.grid_columnconfigure(0, weight=1)
+        p = current_palette(self)
+        self.map_canvas = tk.Canvas(map_wrap, bg=p['canvas_map'], highlightthickness=1,
+                                    highlightbackground=p['border'])
+        vbar = ttk.Scrollbar(map_wrap, orient='vertical', command=self.map_canvas.yview)
+        hbar = ttk.Scrollbar(map_wrap, orient='horizontal', command=self.map_canvas.xview)
+        self.map_canvas.configure(yscrollcommand=vbar.set, xscrollcommand=hbar.set)
+        self.map_canvas.grid(row=0, column=0, sticky='nsew')
+        vbar.grid(row=0, column=1, sticky='ns')
+        hbar.grid(row=1, column=0, sticky='ew')
+        self.map_canvas.configure(scrollregion=(0, 0,
+                                                self.battle_map.width * CELL_PX,
+                                                self.battle_map.height * CELL_PX))
+        self.map_canvas.bind('<Button-1>', self.on_map_click)
+        self.draw_map()
+
+    def _sync_auto_move(self):
+        self.auto_move = self.auto_move_var.get()
+
+    def place_random(self):
+        self.battle_map.random_placement(self.sides)
+        self.draw_map()
+
+    def place_formation(self):
+        self.battle_map.formation_placement(self.sides)
+        self.draw_map()
+
+    def draw_map(self):
+        if not hasattr(self, 'map_canvas'):
+            return
+        p = current_palette(self)
+        c = self.map_canvas
+        c.delete('all')
+        bm = self.battle_map
+        for x in range(bm.width + 1):
+            c.create_line(x * CELL_PX, 0, x * CELL_PX, bm.height * CELL_PX, fill=p['canvas_grid'])
+        for y in range(bm.height + 1):
+            c.create_line(0, y * CELL_PX, bm.width * CELL_PX, y * CELL_PX, fill=p['canvas_grid'])
+
+        # Подсветка клеток, достижимых с остатком скорости выбранного токена
+        if self.selected_enemy and self.selected_enemy.alive:
+            pos = bm.get_pos(self.selected_enemy)
+            if pos:
+                reach = (self.selected_enemy.speed - getattr(self.selected_enemy, 'moved_ft', 0)) // 5
+                for dy in range(-reach, reach + 1):
+                    for dx in range(-reach, reach + 1):
+                        nx, ny = pos[0] + dx, pos[1] + dy
+                        if bm.cell_free(nx, ny, ignore_id=id(self.selected_enemy)):
+                            c.create_rectangle(nx * CELL_PX + 1, ny * CELL_PX + 1,
+                                               (nx + 1) * CELL_PX - 1, (ny + 1) * CELL_PX - 1,
+                                               fill=p['canvas_reach'], outline='')
+        # Токены
+        for i, side in enumerate(self.sides):
+            color = SIDE_COLORS[i % len(SIDE_COLORS)]
+            for enemy in sorted(side, key=lambda e: e.alive):
+                pos = bm.get_pos(enemy)
+                if not pos:
+                    continue
+                x, y = pos
+                cx, cy = x * CELL_PX + CELL_PX // 2, y * CELL_PX + CELL_PX // 2
+                r = CELL_PX // 2 - 3
+                fill = color if enemy.alive else '#555555'
+                c.create_oval(cx - r, cy - r, cx + r, cy + r, fill=fill,
+                              outline='white' if enemy is self.selected_enemy else 'black',
+                              width=2 if enemy is self.selected_enemy else 1)
+                label = enemy.name.split('_')[-1][:2]
+                c.create_text(cx, cy, text=label, fill='white', font=('Arial', 8, 'bold'))
+
+    def on_map_click(self, event):
+        """Обрабатывает клик по карте: сначала переводим координаты экрана в координаты карты"""
+        bm = self.battle_map
+        cx = self.map_canvas.canvasx(event.x)
+        cy = self.map_canvas.canvasy(event.y)
+        x, y = int(cx) // CELL_PX, int(cy) // CELL_PX
+
+        clicked = bm.enemy_at(x, y)
+        if clicked and clicked.alive:
+            self.selected_enemy = clicked
+            self.draw_map()
+            return
+        if self.selected_enemy and self.selected_enemy.alive:
+            pos = bm.get_pos(self.selected_enemy)
+            if not pos:
+                return
+            dist = max(abs(x - pos[0]), abs(y - pos[1])) * 5
+            left = self.selected_enemy.speed - getattr(self.selected_enemy, 'moved_ft', 0)
+            if dist == 0:
+                return
+            if dist > left:
+                messagebox.showinfo("Движение",
+                                    f"Не хватает скорости: нужно {dist} фт, осталось {left} фт")
+                return
+            if bm.cell_free(x, y, ignore_id=id(self.selected_enemy)):
+                bm.place(self.selected_enemy, x, y)
+                self.selected_enemy.moved_ft = getattr(self.selected_enemy, 'moved_ft', 0) + dist
+                self.draw_map()
+
+
+==================== battle_simulator.py ====================
+
+import tkinter as tk
+from tkinter import ttk, messagebox
+from entities import Attack, Enemy
+from ui_components import ScrollableFrame, fit_window_to_screen, EditableLabel
+from battle_ui import BattleUI
+from battle_logic import BattleLogic
+from alliance_ui import AllianceUI
+from settings_ui import SettingsUI
+from factory import EnemyFactory
+from battle_strategies import AggressiveStrategy, DefensiveStrategy, RandomStrategy, SupportStrategy
+from battle_map import BattleMapUI, BattleMap
+from theme_manager import ThemeManager, ThemeUI
+from side_creator import SideCreatorDialog
+
+
+class BattleSimulator(BattleUI, BattleLogic, AllianceUI, SettingsUI, BattleMapUI, ThemeUI):
+    MAX_SIDES = 26
+    """Основной класс симулятора битв"""
+    def __init__(self, root):
+        BattleUI.__init__(self)
+        BattleLogic.__init__(self)
+        AllianceUI.__init__(self)
+        SettingsUI.__init__(self)
+        BattleMapUI.__init__(self)
+        ThemeUI.__init__(self)
+
+        self.root = root
+        self.root.title("Мастер Подземелий - Симулятор Битв")
+        self.theme_manager = ThemeManager(root)   #  создаём ДО интерфейса!
+        self.theme_manager.apply()                #  красим окно до постройки
+        fit_window_to_screen(self.root, 1600, 800)
+        self.root.minsize(800, 480)
+
+        self.sides = []
+        self.num_sides = 2
+        self.side_names = ["Сторона А", "Сторона Б", "Сторона В", "Сторона Г", "Сторона Д", "Сторона Е"]
+        self.alliance_settings = []
+        self.ignore_sides = {}
+        self.enemy_types = ["обычный", "гоблин", "орк", "скелет", "тролль", "гном", "эльф", "дротик"]
+        self.strategy_types = ["случайная", "агрессивная", "защитная", "поддержка"]
+        self.side_army_types = []
+        self.side_strategy_vars = []
+        self.side_type_labels = []
+        self.side_cols = 3
+        self.MAX_SIDES = 26
+
+        self.setup_ui()
+
+    def setup_ui(self):
+        """Настройка пользовательского интерфейса"""
+        # ===== Верхняя панель: навигация по центру, тема справа =====
+        p = self.theme_manager.palette()
+        self.top_bar = tk.Frame(self.root, bg=p['bg'])
+        self.top_bar.pack(fill='x', side='top', pady=(8, 4))
+        self.top_bar.grid_columnconfigure(0, weight=1)
+        self.top_bar.grid_columnconfigure(2, weight=1)
+
+        self.nav_frame = tk.Frame(self.top_bar, bg=p['bg'])  # центр: кнопки вкладок
+        self.nav_frame.grid(row=0, column=1)
+
+        self.theme_holder = tk.Frame(self.top_bar, bg=p['bg'])  # право: кнопка темы
+        self.theme_holder.grid(row=0, column=2, sticky='e')
+        self.setup_theme_button(self.theme_holder)
+
+        # Нижняя панель: персональные кнопки вкладки
+        self.sub_bar = tk.Frame(self.root, bg=p['bg_secondary'])
+        self.sub_bar.pack(fill='x', side='bottom')
+        self.sub_sep = tk.Frame(self.sub_bar, bg=p['border'], height=2)  # линия-разделитель!
+        self.sub_sep.pack(fill='x', side='top')
+        self.sub_holder = tk.Frame(self.sub_bar, bg=p['bg_secondary'])
+        self.sub_holder.pack(expand=True, pady=6)
+
+        self.tabs_container = ttk.Frame(self.root)
+        self.tabs_container.pack(fill='both', expand=True, padx=10, pady=10)
+
+        # Вкладка настройки
+        setup_frame = ttk.Frame(self.tabs_container)
+        self.setup_frame = setup_frame
+
+        setup_scroll_frame = ScrollableFrame(setup_frame)
+        setup_scroll_frame.pack(fill='both', expand=True)
+        self.setup_scroll_frame = setup_scroll_frame
+
+        # Количество сторон
+        self.num_sides_var = tk.IntVar(value=2)
+
+        # Контейнер карточек сторон (сами карточки создаются по требованию!)
+        self.side_frames = []
+        self.side_count_vars = []
+        self.side_name_vars = []
+        sides_container = ttk.Frame(setup_scroll_frame.scrollable_frame)
+        sides_container.pack(fill='x', pady=10)
+        self.sides_container = sides_container
+        for i in range(8):
+            sides_container.grid_columnconfigure(i, weight=1 if i < 3 else 0)
+        self.side_cols = 3
+        sides_container.bind('<Configure>', self.relayout_sides)
+        # Круглая кнопка-плюс: добавляет новую сторону в следующий свободный слот
+        from ui_components import RoundedButton
+        self.add_side_btn = RoundedButton(sides_container, icon='plus',
+                                          palette=self.theme_manager.palette(),
+                                          command=self.add_side,
+                                          width=44, height=44, radius=22,
+                                          outline=True, surface_key='bg')
+
+        ttk.Button(setup_scroll_frame.scrollable_frame, text="Создать армии",
+                   command=self.create_armies).pack(pady=20)
+
+        # Вкладка битвы
+        self.battle_frame = ttk.Frame(self.tabs_container)
+        self.battle_frame.grid_rowconfigure(0, weight=1)
+        self.battle_frame.grid_rowconfigure(1, weight=0)
+
+        # Вкладка альянсов
+        self.alliance_frame = ttk.Frame(self.tabs_container)
+
+        # Вкладка карты боя
+        self.map_frame = ttk.Frame(self.tabs_container)
+
+        # Список вкладок для переключения круглыми кнопками
+        self.tab_frames = [self.setup_frame, self.battle_frame,
+                           self.alliance_frame, self.map_frame]
+        # Какие кнопки второго яруса принадлежат какой вкладке
+        self.tab_sub_buttons = {
+            self.setup_frame: [
+                ("Сохранить настройки", self.save_settings),
+                ("Загрузить настройки", self.load_settings),
+            ],
+            self.battle_frame: [],
+            self.alliance_frame: [],
+            self.map_frame: [],
+        }
+
+        self._build_nav()
+        self.update_sides_layout()
+
+    def _build_nav(self):
+        """Создаёт закруглённые кнопки навигации по центру верхней панели"""
+        from ui_components import RoundedButton
+        p = self.theme_manager.palette()
+        for w in self.nav_frame.winfo_children():
+            w.destroy()
+        self.nav_buttons = []
+        tabs = [("Настройка армий", self.setup_frame),
+                ("Битва", self.battle_frame),
+                ("Альянсы", self.alliance_frame),
+                ("Карта боя", self.map_frame)]
+        for text, frame in tabs:
+            btn = RoundedButton(self.nav_frame, text, palette=p,
+                                command=lambda f=frame: self.select_tab(f),
+                                width=150, height=34)
+            btn.pack(side='left', padx=4)
+            self.nav_buttons.append((btn, frame))
+        self.select_tab(self.setup_frame)
+
+    def _build_sub_bar(self, frame):
+        """Нижняя панель: контурные кнопки-инструменты выбранной вкладки"""
+        from ui_components import RoundedButton
+        for w in self.sub_holder.winfo_children():
+            w.destroy()
+        for text, command in self.tab_sub_buttons.get(frame, []):
+            btn = RoundedButton(self.sub_holder, text,
+                                palette=self.theme_manager.palette(),
+                                command=command,
+                                width=180, height=30, radius=10,
+                                font=('Segoe UI', 9, 'bold'),
+                                outline=True, surface_key='bg_secondary')
+            btn.pack(side='left', padx=4)
+
+    def select_tab(self, frame):
+        """Переключение вкладки: фрейм, подсветка главной кнопки и кнопки второго яруса"""
+        for f in self.tab_frames:
+            f.pack_forget()
+        frame.pack(fill='both', expand=True)
+        for btn, f in self.nav_buttons:
+            btn.set_active(f is frame)
+        self._build_sub_bar(frame)
+
+    @staticmethod
+    def side_letter(i):
+        """Имя стороны: A-Z, а дальше цифрами"""
+        return chr(65 + i) if i < 26 else str(i + 1)
+
+    def create_side_card(self, i, army_type, strategy):
+        """Карточка стороны: имя-заголовок + состав + тактика + количество + крестик удаления"""
+        frame = ttk.LabelFrame(self.sides_container, text="")
+        frame.grid(row=i // self.side_cols, column=i % self.side_cols, padx=5, pady=5, sticky='ew')
+
+        name_var = tk.StringVar(value=f"Сторона {self.side_letter(i)}")
+        title = EditableLabel(frame, name_var, palette=self.theme_manager.palette())
+        title.grid(row=0, column=0, columnspan=2, sticky='w', padx=6, pady=(4, 2))
+        cross = ttk.Label(frame, text="✕", cursor="hand2",
+                          foreground=self.theme_manager.palette()['fg_muted'],
+                          font=('Segoe UI', 10, 'bold'))
+        cross.grid(row=0, column=2, padx=(0, 6), pady=(4, 0), sticky='e')
+        cross.bind('<Button-1>', lambda e, f=frame, w=cross: self._show_delete_confirm(w, f))
+        cross.bind('<Enter>', lambda e, w=cross: w.configure(foreground='#e74c3c'))
+        cross.bind('<Leave>', lambda e, w=cross: w.configure(
+            foreground=self.theme_manager.palette()['fg_muted']))
+
+        # Состав: read-only лейбл + кнопка смены (индекс ищем по frame в момент клика!)
+        ttk.Label(frame, text="Состав:").grid(row=1, column=0, sticky='w', pady=2)
+        type_lbl = ttk.Label(frame, text=army_type,
+                             foreground=self.theme_manager.palette()['accent'])
+        type_lbl.grid(row=1, column=1, sticky='w', padx=5)
+        ttk.Button(frame, text="🔄", width=3,
+                   command=lambda f=frame: self.change_side_composition(
+                       self.side_frames.index(f))).grid(row=1, column=2, padx=2)
+
+        ttk.Label(frame, text="Тактика:").grid(row=2, column=0, sticky='w', pady=2)
+        strat_var = tk.StringVar(value=strategy)
+        ttk.Combobox(frame, textvariable=strat_var, values=self.strategy_types,
+                     width=16, state="readonly").grid(row=2, column=1, padx=5, pady=2)
+
+        ttk.Label(frame, text="Количество врагов:").grid(row=3, column=0, sticky='w', pady=2)
+        count_var = tk.IntVar(value=5)
+        ttk.Spinbox(frame, from_=0, to=500, textvariable=count_var, width=10).grid(
+            row=3, column=1, padx=5, pady=2)
+
+        self.side_frames.append(frame)
+        self.side_name_vars.append(name_var)
+        self.side_army_types.append(army_type)
+        self.side_strategy_vars.append(strat_var)
+        self.side_type_labels.append(type_lbl)
+        self.side_count_vars.append(count_var)
+
+        for w in (frame, title, title.label, title.entry):
+            w.bind("<MouseWheel>", self.setup_scroll_frame._on_mousewheel)
+
+    def change_side_composition(self, i):
+        SideCreatorDialog(self, mode='edit', current_type=self.side_army_types[i],
+                          on_result=lambda d: self._apply_type(i, d['army_type'], d['strategy']))
+
+    def _create_new_side(self, army_type, strategy, name=None, count=None):
+        i = len(self.side_frames)
+        self.create_side_card(i, army_type, strategy)
+        if name is not None: self.side_name_vars[i].set(name)
+        if count is not None: self.side_count_vars[i].set(count)
+        self.num_sides_var.set(i + 1)
+        self.update_sides_layout()
+
+    def _apply_type(self, i, army_type, strategy):
+        self.side_army_types[i] = army_type
+        self.side_type_labels[i].configure(text=army_type)
+        self.side_strategy_vars[i].set(strategy)
+
+    def launch_bestiary_import(self, on_imported, on_cancel=None):
+        """Точка входа для диалога: открывает импортёр и отдаёт ему колбэки успеха/отмены."""
+        try:
+            from bestiary_importer import BestiaryImporter
+        except ImportError:
+            messagebox.showerror("Ошибка", "Файл bestiary_importer.py не найден!")
+            if on_cancel:
+                on_cancel()  # чтобы диалог-родитель не остался спрятанным
+            return
+        BestiaryImporter(self.root, self,
+                         on_imported=on_imported,
+                         on_cancel=on_cancel).open_import_window()
+
+    def update_sides_layout(self):
+        """Только переставляет существующие карточки + плюсик по текущей сетке."""
+        cols = self.side_cols
+        n = len(self.side_frames)
+        for i, frame in enumerate(self.side_frames):
+            frame.grid(row=i // cols, column=i % cols, padx=5, pady=5, sticky='ew')
+        if hasattr(self, 'add_side_btn'):
+            if n < self.MAX_SIDES:
+                self.add_side_btn.grid(row=n // cols, column=n % cols, padx=5, pady=5)
+            else:
+                self.add_side_btn.grid_remove()
+
+    def create_armies(self):
+        """Создание армий на основе текущих настроек"""
+        try:
+            num_sides = self.num_sides_var.get()
+            self.num_sides = num_sides
+
+            self.sides = []
+            self.side_names = []
+
+            for i in range(num_sides):
+                side_name = self.side_name_vars[i].get()
+                enemy_count = self.side_count_vars[i].get()
+                army_type = self.side_army_types[i]
+                strategy_type = self.side_strategy_vars[i].get()
+
+                self.side_names.append(side_name)
+                side_enemies = []
+
+                for j in range(enemy_count):
+                    name = f"{side_name}_{j + 1}"
+                    enemy = EnemyFactory.create_enemy(army_type, name, i)
+
+                    if strategy_type == "агрессивная":
+                        enemy.strategy = AggressiveStrategy()
+                    elif strategy_type == "защитная":
+                        enemy.strategy = DefensiveStrategy()
+                    elif strategy_type == "поддержка":
+                        enemy.strategy = SupportStrategy()
+                    else:
+                        enemy.strategy = RandomStrategy()
+
+                    side_enemies.append(enemy)
+                self.sides.append(side_enemies)
+
+            if hasattr(self, 'battle_results_text'):
+                delattr(self, 'battle_results_text')
+
+            self.setup_battle_ui()
+            self.setup_alliance_ui()
+
+            # Карта боя: новая армия — новая карта (резиновый размер!)
+            max_side = max((len(side) for side in self.sides), default=0)
+            map_w = max(24, 4 * num_sides)
+            zone_cols = max(1, map_w // num_sides)
+            map_h = max(16, (max_side + zone_cols - 1) // zone_cols + 2)
+            self.battle_map = BattleMap(width=map_w, height=map_h)
+            self.setup_map_ui()
+            self.place_formation()
+
+            messagebox.showinfo("Успех", f"Армии созданы!\nКоличество сторон: {num_sides}")
+        except Exception as e:
+            messagebox.showerror("Ошибка", f"Ошибка при создании армий: {str(e)}")
+
+    def add_side(self):
+        SideCreatorDialog(self, mode='create',
+                          on_result=lambda d: self._create_new_side(d['army_type'], d['strategy']))
+
+    def _show_delete_confirm(self, anchor_widget, frame):
+        """Вскакивающая плашка 'Точно удалить?' прямо поверх карточки (без grab, без Toplevel!)."""
+        # Если где-то уже висит открытая плашка - сначала закрываем её
+        if getattr(self, '_confirm_popover', None) is not None:
+            try:
+                self._confirm_popover.destroy()
+            except tk.TclError:
+                pass
+            self._confirm_popover = None
+
+        p = self.theme_manager.palette()
+        parent = self.setup_scroll_frame.scrollable_frame   # большой контейнер - плашку не обрежет
+
+        pop = tk.Frame(parent, bg=p['field_bg'], highlightbackground=p['border'],
+                       highlightthickness=1)
+        tk.Label(pop, text="Удалить отряд?", bg=p['field_bg'], fg=p['fg'],
+                 font=('Segoe UI', 9, 'bold')).pack(padx=10, pady=(8, 2))
+        btns = tk.Frame(pop, bg=p['field_bg']); btns.pack(pady=(0, 8))
+
+        def close():
+            nonlocal pop
+            try:
+                pop.destroy()
+            except tk.TclError:
+                pass
+            if getattr(self, '_confirm_popover', None) is pop:
+                self._confirm_popover = None
+
+        def yes():
+            close()
+            self.remove_side_by_frame(frame)
+
+        tk.Button(btns, text="✓ Да", command=yes, bd=0, cursor='hand2',
+                  bg='#e74c3c', fg='white', activebackground='#c0392b',
+                  activeforeground='white', font=('Segoe UI', 8, 'bold'),
+                  padx=8, pady=1).pack(side='left', padx=(0, 4))
+        tk.Button(btns, text="✕ Нет", command=close, bd=0, cursor='hand2',
+                  bg=p['button_bg'], fg=p['button_fg'], activebackground=p['hover'],
+                  font=('Segoe UI', 8, 'bold'), padx=8, pady=1).pack(side='left')
+
+        px = anchor_widget.winfo_rootx() + anchor_widget.winfo_width() - parent.winfo_rootx()
+        py = anchor_widget.winfo_rooty() + anchor_widget.winfo_height() - parent.winfo_rooty()
+        pop.place(x=px, y=py, anchor='ne')
+        pop.lift()
+        self._confirm_popover = pop
+
+    def remove_side_by_frame(self, frame):
+        """Удаляет сторону по объекту карточки: чистит ВСЕ параллельные списки и переставляет сетку."""
+        try:
+            idx = self.side_frames.index(frame)
+        except ValueError:
+            return
+        frame.destroy()
+        for lst in (self.side_frames, self.side_name_vars, self.side_count_vars,
+                    self.side_army_types, self.side_strategy_vars, self.side_type_labels):
+            del lst[idx]
+        # Синхронизируем внутренний счётчик (create_armies читает именно его)
+        self.num_sides_var.set(len(self.side_frames))
+        self.update_sides_layout()   # плюсик перепрыгнет на освободившееся место
+
+    def relayout_sides(self, event=None):
+        """Умная сетка: количество карточек в ряду подстраивается под ширину окна"""
+        width = self.sides_container.winfo_width()
+        if width < 100:
+            return
+        cols = max(1, min(8, width // 300))  # одной карточке нужно ~300 px
+        if cols == self.side_cols:
+            return
+        self.side_cols = cols
+        for i in range(8):
+            self.sides_container.grid_columnconfigure(i, weight=1 if i < cols else 0)
+        self.update_sides_layout()
+
+
+==================== battle_strategies.py ====================
+
+from abc import ABC, abstractmethod
+import random
+
+
+def distance_ft_between(a, b):
+    """Дистанция между токенами в футах (0, если карты/позиций нет)"""
+    pa, pb = getattr(a, 'pos', None), getattr(b, 'pos', None)
+    if not pa or not pb:
+        return 0
+    return max(abs(pa[0] - pb[0]), abs(pa[1] - pb[1])) * 5
+
+
+def reachable_attacks(attacker, target):
+    """Атаки, достающие цель СЕЙЧАС. Если ни одна не достаёт - все атаки
+    (юнит подойдёт в фазе движения, и атаку выберут заново)"""
+    dist = distance_ft_between(attacker, target)
+    ok = [a for a in attacker.attacks if getattr(a, 'range_ft', 5) >= dist]
+    return ok if ok else list(attacker.attacks)
+
+
+def damage_score(a):
+    """Оценка среднего потенциала урона атаки"""
+    return a.damage_dice_count * int(a.damage_dice_type[1:]) + a.damage_modifier
+
+
+class BattleStrategy(ABC):
+    """Абстрактная стратегия. Общие хелперы сбора целей и учёта дистанции."""
+
+    @abstractmethod
+    def select_target(self, attacker, all_sides, ignore_sides):
+        pass
+
+    @abstractmethod
+    def select_attack(self, attacker, target):
+        pass
+
+    # ---------- общие хелперы ----------
+    def _collect_enemies(self, attacker, all_sides, ignore_sides):
+        """Живые враги attacker'a с учётом игнорируемых сторон."""
+        enemies = []
+        for side_idx, side_enemies in enumerate(all_sides):
+            if side_idx == attacker.side:
+                continue
+            if side_idx in ignore_sides or side_idx in attacker.ignore_sides:
+                continue
+            enemies.extend([e for e in side_enemies if e.alive])
+        return enemies
+
+    def _pick_target(self, attacker, candidates, prefer_key):
+        """Умный выбор цели в THREE приоритетах:
+        1) враг в радиусе оружия -> бей прямо сейчас, не двигаясь;
+        2) враг в радиусе (оружие + скорость) -> подойди и ударь;
+        3) никого вокруг -> беги к ближайшему (а не к 'идеальному' через всю карту).
+        Без карты distance=0 для всех -> приоритет 1 = все -> как раньше."""
+        if not candidates:
+            return None
+        ma = getattr(attacker, 'multiattack', None)
+        if ma:
+            by_name = {a.name: getattr(a, 'range_ft', 5) for a in attacker.attacks}
+            ranges = [by_name[s['attack']] for s in ma if s.get('attack') in by_name]
+            max_range = min(ranges) if ranges else max(
+                (getattr(a, 'range_ft', 5) for a in attacker.attacks), default=5)
+        else:
+            max_range = max((getattr(a, 'range_ft', 5) for a in attacker.attacks), default=5)
+        speed = getattr(attacker, 'speed', 30)
+        d = lambda e: distance_ft_between(attacker, e)
+        tier1 = [e for e in candidates if d(e) <= max_range]  # ударь на месте
+        if tier1:
+            return prefer_key(tier1)
+        tier2 = [e for e in candidates if d(e) <= max_range + speed]  # подойди и ударь
+        if tier2:
+            return prefer_key(tier2)
+        return min(candidates, key=d)  # беги к ближайшему
+
+class AggressiveStrategy(BattleStrategy):
+    """Агрессивная - бьёт самого слабого ИЗ ДОСТУПНЫХ, иначе бежит к ближайшему."""
+    def select_target(self, attacker, all_sides, ignore_sides):
+        enemies = self._collect_enemies(attacker, all_sides, ignore_sides)
+        return self._pick_target(attacker, enemies,
+                                 lambda pool: min(pool, key=lambda e: e.hp))
+
+    def select_attack(self, attacker, target):
+        return max(reachable_attacks(attacker, target), key=damage_score)
+
+
+class DefensiveStrategy(BattleStrategy):
+    """Защитная - нейтрализует самого опасного ИЗ ДОСТУПНЫХ."""
+    def select_target(self, attacker, all_sides, ignore_sides):
+        enemies = self._collect_enemies(attacker, all_sides, ignore_sides)
+        return self._pick_target(attacker, enemies,
+                                 lambda pool: max(pool, key=lambda e:
+                                                  max((a.attack_bonus for a in e.attacks), default=0)))
+
+    def select_attack(self, attacker, target):
+        if not attacker.attacks:
+            return None
+        return max(reachable_attacks(attacker, target), key=lambda a: a.attack_bonus)
+
+
+class RandomStrategy(BattleStrategy):
+    """Случайная - случайная цель из доступных (или ближайшая, если вокруг пусто)."""
+    def select_target(self, attacker, all_sides, ignore_sides):
+        enemies = self._collect_enemies(attacker, all_sides, ignore_sides)
+        return self._pick_target(attacker, enemies, lambda pool: random.choice(pool))
+
+    def select_attack(self, attacker, target):
+        if not attacker.attacks:
+            return None
+        return random.choice(reachable_attacks(attacker, target))
+
+
+class SupportStrategy(BattleStrategy):
+    """Поддержка - лечит самого раненого СОЮЗНИКА из доступных, иначе бьёт врага."""
+    def select_target(self, attacker, all_sides, ignore_sides):
+        # Сначала раненые союзники (тоже с учётом дистанции - лекарь подбегает к ближнему)
+        allies = []
+        for side_idx, side_enemies in enumerate(all_sides):
+            if side_idx == attacker.side and side_idx not in ignore_sides:
+                allies.extend([e for e in side_enemies
+                               if e.alive and e.hp < e.max_hp * 0.7])
+        if allies:
+            return self._pick_target(attacker, allies,
+                                     lambda pool: min(pool, key=lambda e: e.hp / e.max_hp))
+        # Союзников лечить некого - атакуем врага по правилам агрессора
+        enemies = self._collect_enemies(attacker, all_sides, ignore_sides)
+        return self._pick_target(attacker, enemies,
+                                 lambda pool: min(pool, key=lambda e: e.hp))
+
+    def select_attack(self, attacker, target):
+        if not attacker.attacks:
+            return None
+        if target.side == attacker.side:
+            healing = [a for a in attacker.attacks if
+                       "лечение" in a.name.lower() or "heal" in a.name.lower()
+                       or "восстановление" in a.name.lower()]
+            if healing:
+                return healing[0]
+        return max(reachable_attacks(attacker, target), key=damage_score)
+
+
+==================== battle_ui.py ====================
+
+import tkinter as tk
+from tkinter import ttk, messagebox
+
+from battle_logic import ENGINE as _SPR_ENGINE
+from entities import Attack, Enemy
+from ui_components import ScrollableFrame, fit_window_to_screen
+from observer import Observer
+
+
+
+class UIUpdater(Observer):
+    def __init__(self, battle_ui):
+        self.battle_ui = battle_ui
+
+    def update(self, subject):
+        bu = self.battle_ui
+        if not hasattr(bu, '_dirty_enemies'):
+            bu._dirty_enemies = set()
+        bu._dirty_enemies.add(subject)
+        if getattr(bu, 'ui_suspend', False):
+            return
+        if hasattr(bu, 'update_battle_ui'):
+            bu.update_battle_ui()
+
+
+class BattleUI:
+    """Класс для управления интерфейсом битвы"""
+
+    def __init__(self):
+        """Инициализация UI обновителя"""
+        def __init__(self):
+            self._dirty_enemies = set()
+            self.label_by_enemy = {}
+            self.ui_suspend = False
+
+    def setup_battle_ui(self):
+        """Настройка интерфейса битвы"""
+        # Создаем UIUpdater здесь, а не в __init__, чтобы гарантировать его наличие
+        if not hasattr(self, 'ui_updater'):
+            self.ui_updater = UIUpdater(self)
+
+        # Полностью очищаем battle frame
+        for widget in self.battle_frame.winfo_children():
+            widget.destroy()
+
+        self.label_by_enemy = {}
+
+        # Создаем основной контейнер с прокруткой
+        main_scroll_frame = ScrollableFrame(self.battle_frame)
+        main_scroll_frame.pack(fill='both', expand=True)
+
+        # Создание фреймов для каждой стороны с прокруткой
+        self.side_vars = []
+        self.side_frames_battle = []
+        enemy_frames_container = ttk.Frame(main_scroll_frame.scrollable_frame)
+        enemy_frames_container.pack(fill='x', pady=(0, 10))
+
+        # Расчет количества колонок на основе количества сторон
+        num_columns = min(self.num_sides, 3)  # Максимум 3 колонки
+
+        # Привязываем наблюдатель к каждому врагу
+        for side_enemies in self.sides:
+            for enemy in side_enemies:
+                enemy.attach(self.ui_updater)
+
+        for i, (side_enemies, side_name) in enumerate(zip(self.sides, self.side_names)):
+            side_container = ttk.LabelFrame(enemy_frames_container, text=side_name)
+            side_container.grid(row=i // num_columns, column=i % num_columns, padx=5, pady=5, sticky='nsew')
+
+            # Создание прокручиваемого фрейма
+            scroll_frame = ScrollableFrame(side_container)
+            scroll_frame.pack(fill='both', expand=True)
+
+            side_vars = []
+            select_all_var = tk.BooleanVar()
+
+            # Чекбокс "Выделить все"
+            select_frame = ttk.Frame(scroll_frame.scrollable_frame)
+            select_frame.pack(fill='x', pady=5)
+            ttk.Checkbutton(select_frame, text="Выделить все", variable=select_all_var,
+                            command=lambda idx=i: self.toggle_select_all(idx)).pack(side='left')
+
+            for j, enemy in enumerate(side_enemies):
+                var = tk.BooleanVar()
+                frame = ttk.Frame(scroll_frame.scrollable_frame)
+                frame.pack(fill='x', pady=2)
+                ttk.Checkbutton(frame, variable=var).pack(side='left')
+                status = "🟢" if enemy.alive else "🔴"
+                attack_info = ", ".join([f"{a.name}+{a.attack_bonus}" for a in enemy.attacks])
+                lbl = ttk.Label(frame, text=f"{status} {enemy.name}: {enemy.hp}/{enemy.max_hp} HP [{attack_info}]")
+                lbl.pack(side='left')
+                self.label_by_enemy[enemy] = lbl  # прямая ссылка: обновление за O(1)!
+                for w in (frame, lbl):
+                    w.bind('<Double-Button-1>', lambda e, en=enemy: self.edit_enemy(en))
+                side_vars.append(var)
+
+            self.side_vars.append(side_vars)
+            self.side_frames_battle.append((scroll_frame, select_all_var))
+
+        # Настройка сетки контейнера врагов
+        for i in range(num_columns):
+            enemy_frames_container.grid_columnconfigure(i, weight=1)
+
+        # Секция результатов
+        results_label = ttk.Label(main_scroll_frame.scrollable_frame, text="Результаты боя:",
+                                  font=('Arial', 10, 'bold'))
+        results_label.pack(anchor='w', pady=(10, 5))
+
+        # Создание текстового виджета для результатов с прокруткой
+        results_container = ttk.Frame(main_scroll_frame.scrollable_frame)
+        results_container.pack(fill='both', expand=True, pady=(0, 10))
+
+        self.battle_results_text = tk.Text(results_container, height=15, width=100)
+        results_scrollbar = ttk.Scrollbar(results_container, orient="vertical", command=self.battle_results_text.yview)
+        self.battle_results_text.configure(yscrollcommand=results_scrollbar.set)
+
+        self.battle_results_text.pack(side='left', fill='both', expand=True)
+        results_scrollbar.pack(side='right', fill='y')
+        self.battle_results_text.bind('<KeyPress>', self._on_results_keypress, add='+')
+
+        # Управление битвой
+        controls_frame = ttk.Frame(self.battle_frame)
+        controls_frame.pack(fill='x', pady=10)
+
+        # Центрирование кнопок
+        button_container = ttk.Frame(controls_frame)
+        button_container.pack(expand=True)
+
+        ttk.Button(button_container, text="Провести раунд боя", command=self.run_battle_round).pack(side='left', padx=5)
+        ttk.Button(button_container, text="Массовое редактирование", command=self.mass_edit).pack(side='left', padx=5)
+        ttk.Button(button_container, text="Показать статус", command=self.show_status).pack(side='left', padx=5)
+        ttk.Button(button_container, text="Очистить результаты", command=self.clear_results).pack(side='left', padx=5)
+        self.copy_btn = ttk.Button(button_container, text="📋 Копировать лог",
+                                   command=self.copy_results)
+        self.copy_btn.pack(side='left', padx=5)
+        ttk.Button(button_container, text="🔍 Анализ сражения",
+                   command=self.open_decision_analysis).pack(side='left', padx=5)
+
+    def _select_all_results(self, event=None):
+        w = self.battle_results_text
+        w.tag_remove('sel', '1.0', 'end')
+        w.tag_add('sel', '1.0', 'end-1c')
+        return 'break'
+
+    def _on_results_keypress(self, event):
+        # Раскладочно-независимый якорь: keycode = VK-код клавиши на Windows,
+        # НЕ зависит от раскладки/кодировки (в отличие от keysym, который на
+        # кириллице приходит как не-ASCII и в консоли печатается '??').
+        # Ctrl+C -> VK_C=67 всегда; Ctrl+A -> VK_A=65.
+        ctrl = bool(event.state & 0x0004)
+        kc = event.keycode
+        if ctrl:
+            if kc == 67:  # VK_C: Ctrl+C на любой раскладке
+                self.battle_results_text.after(0, self.copy_results)
+                return 'break'  # break ДО update() -> class-binding не спит
+            if kc == 65:  # VK_A: Ctrl+A
+                self.battle_results_text.after(0, self._select_all_results)
+                return 'break'
+            if kc in (37, 39, 38, 40, 36, 35, 33, 34):  # стрелки/Home/End/PgUp/PgDn (VK)
+                return None  # Ctrl+навигация - пропускаем
+            return 'break'  # Ctrl+V/X/Z и пр. - блок (read-only)
+        if kc in (8, 46):  # VK_BACK=8, VK_DELETE=46
+            return 'break'  # удаление - блок
+        ch = event.char
+        if ch and ch.isprintable():
+            return 'break'  # ввод текста - блок
+        return None
+
+    def copy_results(self):
+        w = self.battle_results_text
+        try:
+            sel = w.get('sel.first', 'sel.last')  # TclError, если выделения нет
+        except tk.TclError:
+            sel = ''
+        text = sel if sel else w.get('1.0', 'end-1c')  # fallback: весь лог
+
+        # Единственный рабочий канал: Tk clipboard + форс синхронизации.
+        # (txt-fallback убран: keycode-доказательство подтвердило, что clipboard
+        # доходит до Windows штатно, страховка от msy2-поломки стала лишней.)
+        try:
+            w.clipboard_clear()
+            w.clipboard_append(text)
+            w.update()  # обрабатываем очередь событий -> ownership уходит в Windows
+        except tk.TclError:
+            pass
+
+        # Тихий визуальный отклик кнопки (НЕ окно). Единственный сигнал успеха
+        # после удаления messagebox.showinfo - поэтому оставляем намеренно.
+        if hasattr(self, 'copy_btn'):
+            try:
+                self.copy_btn.configure(text='✓ Скопировано')
+                self.copy_btn.after(1200, lambda: self.copy_btn.configure(text='📋 Копировать лог'))
+            except tk.TclError:
+                pass
+
+    def open_decision_analysis(self):
+        """Окно объяснимости СПР: почему каждый юнит выбрал именно это действие.
+        Читает immutable-снимки ENGINE.get_round_log() (НЕ пересчёт - мир изменился).
+        Свёрнутые карточки-аккордеоны на юнита, на чистом ttk -> цвета подхватывают
+        активную тему (тёмно-фиолетовая схема) без хардкода. Graceful: нет раундов ->
+        заглушка, не краш."""
+        log = _SPR_ENGINE.get_round_log()
+        win = tk.Toplevel(self.root)
+        win.title("Анализ сражения — почему принято каждое решение")
+        fit_window_to_screen(win, 720, 640)
+
+        outer = ttk.Frame(win); outer.pack(fill='both', expand=True, padx=10, pady=10)
+        if not log:
+            ttk.Label(outer, text="Раундов ещё не проводилось — проведите бой и откройте анализ.",
+                      font=('Segoe UI', 11)).pack(pady=20)
+            return
+        ttk.Label(outer, text=f"Решений за последний раунд: {len(log)}",
+                  font=('Segoe UI', 10, 'bold')).pack(anchor='w', pady=(0, 6))
+
+        canvas = tk.Canvas(outer)
+        vsb = ttk.Scrollbar(outer, orient="vertical", command=canvas.yview)
+        body = ttk.Frame(canvas)
+        body.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.create_window((0, 0), window=body, anchor="nw")
+        canvas.configure(yscrollcommand=vsb.set)
+        canvas.bind("<MouseWheel>", lambda e: canvas.yview_scroll(int(-1 * (e.delta / 120)), "units"))
+        body.bind("<MouseWheel>", lambda e: canvas.yview_scroll(int(-1 * (e.delta / 120)), "units"))
+        canvas.pack(side="left", fill="both", expand=True)
+        vsb.pack(side="right", fill="y")
+
+        for snap in log:
+            self._decision_card(body, snap)
+
+    def _decision_card(self, parent, s):
+        """Одна сворачиваемая карточка юнита (паттерн аккордеона, как в editor)."""
+        wrap = ttk.Frame(parent, relief='groove', borderwidth=1)
+        wrap.pack(fill='x', pady=3, padx=2)
+        head = ttk.Frame(wrap); head.pack(fill='x')
+        arrow = ttk.Label(head, text='▸', width=2, cursor='hand2', font=('Segoe UI', 10, 'bold'))
+        arrow.pack(side='left')
+        int_txt = 'не указан' if s['int_score'] is None else str(s['int_score'])
+        title = f"{s['unit']}  ·  INT={int_txt} → Tier {s['tier']} ({s['tier_name']})  ·  {s['archetype']}"
+        ttk.Label(head, text=title, font=('Segoe UI', 10, 'bold'), cursor='hand2').pack(side='left', fill='x', expand=True)
+        detail = ttk.Frame(wrap)
+
+        st = {'open': False, 'body': detail, 'arrow': arrow}
+        def toggle(_e=None):
+            if st['open']:
+                st['body'].pack_forget(); st['arrow'].configure(text='▸'); st['open'] = False
+            else:
+                st['body'].pack(fill='x', padx=8, pady=(0, 4)); st['arrow'].configure(text='▾'); st['open'] = True
+        for w in (head, arrow):
+            w.bind('<Button-1>', toggle)
+        head.bind('<Button-1>', toggle)
+
+        # --- содержимое карточки ---
+        rows = [
+            ('🎯 Цель', f"{s['target_name'] or '—'}  ·  {s['target_reason']}"),
+            ('⚔️ Атака', (f"{s['attack_name'] or 'мультиатака/делегат'}  ·  {s['attack_reason']}")
+                          if not s['multiattack'] else s['attack_reason']),
+            ('👣 Движение', f"{s['move_intent']}  ·  {s['move_reason']}"),
+        ]
+        for label, val in rows:
+            ttk.Label(detail, text=label, font=('Segoe UI', 9, 'bold')).pack(anchor='w', pady=(4, 0))
+            ttk.Label(detail, text=val, font=('Segoe UI', 9), wraplength=640, justify='left').pack(anchor='w')
+        # таблица кандидатов (сердце "почему именно эта атака")
+        if s['candidates']:
+            ttk.Label(detail, text='📋 Разбор оружия (B1 дальность / B2 защиты / B3 EV):',
+                      font=('Segoe UI', 9, 'bold')).pack(anchor='w', pady=(6, 2))
+            grid = ttk.Frame(detail); grid.pack(fill='x')
+            for col, txt in enumerate(('Атака', 'Reach', 'Тип', 'Eff', 'EV', 'Вердикт')):
+                ttk.Label(grid, text=txt, font=('Segoe UI', 8, 'bold')).grid(
+                    row=0, column=col, sticky='w', padx=4)
+            for i, cd in enumerate(s['candidates'], start=1):
+                verdict = '✔ выбрана' if cd.get('chosen') else (cd['reject'] or 'проиграла по EV/reach')
+                for col, val in enumerate((cd['name'], cd['reach'], cd['dmg_type'],
+                                           cd['eff'], cd['ev'], verdict)):
+                    ttk.Label(grid, text=str(val), font=('Segoe UI', 8)).grid(
+                        row=i, column=col, sticky='w', padx=4)
+
+    def clear_results(self):
+        """Очистка текстового поля с результатами"""
+        if hasattr(self, 'battle_results_text'):
+            self.battle_results_text.delete(1.0, tk.END)
+
+    def toggle_select_all(self, side_idx):
+        """Выделение/снятие выделения всех врагов на стороне"""
+        select_all_var = self.side_frames_battle[side_idx][1]
+        for var in self.side_vars[side_idx]:
+            var.set(select_all_var.get())
+
+    def mass_edit(self):
+        """Массовое редактирование выбранных врагов"""
+        selected_enemies = []
+        for i, side_vars in enumerate(self.side_vars):
+            for j, var in enumerate(side_vars):
+                if var.get():
+                    selected_enemies.append(self.sides[i][j])
+
+        if not selected_enemies:
+            messagebox.showwarning("Внимание", "Выберите хотя бы одного врага для редактирования!")
+            return
+
+        # Открытие диалога массового редактирования
+        self.open_mass_edit_dialog(selected_enemies)
+
+    def open_mass_edit_dialog(self, enemies):
+        """Открытие окна массового редактирования"""
+        edit_window = tk.Toplevel(self.root)
+        edit_window.title("Массовое редактирование")
+        fit_window_to_screen(edit_window, 600, 800)
+        edit_window.minsize(400, 300)
+
+        # Создание прокручиваемого фрейма для диалога
+        main_frame = ttk.Frame(edit_window)
+        main_frame.pack(fill='both', expand=True, padx=10, pady=10)
+
+        canvas = tk.Canvas(main_frame)
+        scrollbar = ttk.Scrollbar(main_frame, orient="vertical", command=canvas.yview)
+        scrollable_frame = ttk.Frame(canvas)
+
+        scrollable_frame.bind(
+            "<Configure>",
+            lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
+        )
+
+        canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
+        canvas.configure(yscrollcommand=scrollbar.set)
+
+        # Привязка прокрутки колесом мыши
+        canvas.bind("<MouseWheel>", lambda e: canvas.yview_scroll(int(-1 * (e.delta / 120)), "units"))
+        scrollable_frame.bind("<MouseWheel>", lambda e: canvas.yview_scroll(int(-1 * (e.delta / 120)), "units"))
+
+        canvas.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side='right', fill='y')
+
+        ttk.Label(scrollable_frame, text=f"Редактирование {len(enemies)} врагов",
+                  font=('Arial', 12, 'bold')).pack(pady=10)
+
+        # Основная информация
+        ttk.Label(scrollable_frame, text="Основные параметры:", font=('Arial', 10, 'bold')).pack(anchor='w', pady=5)
+
+        ttk.Label(scrollable_frame, text="Имя:").pack(anchor='w', pady=2)
+        name_var = tk.StringVar(value=enemies[0].name)
+        ttk.Entry(scrollable_frame, textvariable=name_var, width=30).pack(pady=2)
+
+        ttk.Label(scrollable_frame, text="Здоровье:").pack(anchor='w', pady=2)
+        hp_var = tk.IntVar(value=enemies[0].hp)
+        ttk.Spinbox(scrollable_frame, from_=1, to=500, textvariable=hp_var, width=10).pack(pady=2)
+
+        ttk.Label(scrollable_frame, text="Класс доспеха:").pack(anchor='w', pady=2)
+        ac_var = tk.IntVar(value=enemies[0].ac)
+        ttk.Spinbox(scrollable_frame, from_=1, to=30, textvariable=ac_var, width=10).pack(pady=2)
+
+        # Секция атак
+        ttk.Label(scrollable_frame, text="Атаки:", font=('Arial', 10, 'bold')).pack(anchor='w', pady=(10, 5))
+
+        # Фрейм для списка атак
+        attacks_frame = ttk.Frame(scrollable_frame)
+        attacks_frame.pack(fill='x', pady=5)
+
+        # Listbox для атак
+        ttk.Label(attacks_frame, text="Список атак:").pack(anchor='w')
+        attacks_listbox = tk.Listbox(attacks_frame, height=4)
+        attacks_listbox.pack(fill='x', pady=5)
+
+        # Кнопки для управления атаками
+        attack_buttons_frame = ttk.Frame(attacks_frame)
+        attack_buttons_frame.pack(fill='x', pady=5)
+
+        ttk.Button(attack_buttons_frame, text="Добавить атаку",
+                   command=lambda: self.add_attack_to_listbox(attacks_listbox, enemies)).pack(side='left', padx=2)
+        ttk.Button(attack_buttons_frame, text="Удалить атаку",
+                   command=lambda: self.remove_attack_from_listbox(attacks_listbox, enemies)).pack(side='left', padx=2)
+        ttk.Button(attack_buttons_frame, text="Редактировать атаку",
+                   command=lambda: self.edit_attack_in_listbox(attacks_listbox, enemies)).pack(side='left', padx=2)
+
+        # Заполнение listbox атаками
+        self.update_attacks_listbox(attacks_listbox, enemies[0])
+
+        def save_changes():
+            """Сохранение изменений для всех выбранных врагов"""
+            for enemy in enemies:
+                enemy.name = name_var.get()
+                enemy.hp = hp_var.get()
+                enemy.max_hp = hp_var.get()
+                enemy.ac = ac_var.get()
+                enemy.alive = enemy.hp > 0
+
+            edit_window.destroy()
+            self.setup_battle_ui()
+            messagebox.showinfo("Успех", f"Параметры {len(enemies)} врагов обновлены!")
+
+        # Кнопка сохранения внизу
+        ttk.Button(scrollable_frame, text="Сохранить", command=save_changes).pack(pady=20)
+
+        # Сохранение ссылок для доступа в методах
+        self.current_edit_enemies = enemies
+        self.current_attacks_listbox = attacks_listbox
+
+    def update_attacks_listbox(self, listbox, enemy):
+        """Обновление списка атак в listbox"""
+        listbox.delete(0, tk.END)
+        for attack in enemy.attacks:
+            listbox.insert(tk.END,
+                           f"{attack.name} (+{attack.attack_bonus}, {attack.damage_dice_count}{attack.damage_dice_type}+{attack.damage_modifier})")
+
+    def add_attack_to_listbox(self, listbox, enemies):
+        """Добавление новой атаки выбранным врагам"""
+        # Используем данные из первого врага для предзаполнения
+        sample_enemy = enemies[0]
+
+        attack_dialog = tk.Toplevel(self.root)
+        attack_dialog.title("Добавить атаку")
+        fit_window_to_screen(attack_dialog, 400, 500)
+
+        ttk.Label(attack_dialog, text="Новая атака", font=('Arial', 12, 'bold')).pack(pady=10)
+
+        ttk.Label(attack_dialog, text="Название атаки:").pack(pady=2)
+        name_var = tk.StringVar(value="Новая атака")
+        ttk.Entry(attack_dialog, textvariable=name_var, width=30).pack(pady=2)
+
+        ttk.Label(attack_dialog, text="Бонус к атаке:").pack(pady=2)
+        bonus_var = tk.IntVar(value=0)
+        ttk.Spinbox(attack_dialog, from_=-10, to=20, textvariable=bonus_var, width=10).pack(pady=2)
+
+        ttk.Label(attack_dialog, text="Кол-во костей:").pack(pady=2)
+        dice_count_var = tk.IntVar(value=1)
+        ttk.Spinbox(attack_dialog, from_=1, to=20, textvariable=dice_count_var, width=10).pack(pady=2)
+
+        ttk.Label(attack_dialog, text="Тип кости:").pack(pady=2)
+        dice_type_var = tk.StringVar(value="d6")
+        ttk.Combobox(attack_dialog, values=["d4", "d6", "d8", "d10", "d12"],
+                     textvariable=dice_type_var, width=10).pack(pady=2)
+
+        ttk.Label(attack_dialog, text="Модификатор:").pack(pady=2)
+        mod_var = tk.IntVar(value=0)
+        ttk.Spinbox(attack_dialog, from_=-10, to=20, textvariable=mod_var, width=10).pack(pady=2)
+
+        ttk.Label(attack_dialog, text="Тип урона:").pack(pady=2)
+        damage_type_var = tk.StringVar(value="")
+        ttk.Entry(attack_dialog, textvariable=damage_type_var, width=20).pack(pady=2)
+
+        def add_attack():
+            """Создание новой атаки и добавление ее всем выбранным врагам"""
+            new_attack = Attack(
+                name_var.get(),
+                bonus_var.get(),
+                dice_count_var.get(),
+                dice_type_var.get(),
+                mod_var.get(),
+                damage_type_var.get()
+            )
+
+            for enemy in enemies:
+                enemy.attacks.append(new_attack)
+
+            # Обновляем listbox, используя первого врага
+            self.update_attacks_listbox(listbox, enemies[0])
+            attack_dialog.destroy()
+
+        ttk.Button(attack_dialog, text="Добавить", command=add_attack).pack(pady=20)
+
+    def remove_attack_from_listbox(self, listbox, enemies):
+        """Удаление выбранной атаки у всех выбранных врагов"""
+        selection = listbox.curselection()
+        if selection:
+            index = selection[0]
+            for enemy in enemies:
+                if index < len(enemy.attacks):
+                    enemy.attacks.pop(index)
+            self.update_attacks_listbox(listbox, enemies[0])
+        else:
+            messagebox.showwarning("Внимание", "Выберите атаку для удаления!")
+
+    def edit_attack_in_listbox(self, listbox, enemies):
+        """Редактирование выбранной атаки у всех выбранных врагов"""
+        selection = listbox.curselection()
+        if not selection:
+            messagebox.showwarning("Внимание", "Выберите атаку для редактирования!")
+            return
+
+        index = selection[0]
+        attack_sample = enemies[0].attacks[index]  # Используем первый для UI
+
+        # Создаем окно редактирования
+        attack_dialog = tk.Toplevel(self.root)
+        attack_dialog.title("Редактировать атаку")
+        fit_window_to_screen(attack_dialog, 400, 500)
+
+        ttk.Label(attack_dialog, text="Редактирование атаки", font=('Arial', 12, 'bold')).pack(pady=10)
+
+        name_var = tk.StringVar(value=attack_sample.name)
+        ttk.Entry(attack_dialog, textvariable=name_var, width=30).pack(pady=2)
+
+        bonus_var = tk.IntVar(value=attack_sample.attack_bonus)
+        ttk.Spinbox(attack_dialog, from_=-10, to=20, textvariable=bonus_var, width=10).pack(pady=2)
+
+        dice_count_var = tk.IntVar(value=attack_sample.damage_dice_count)
+        ttk.Spinbox(attack_dialog, from_=1, to=20, textvariable=dice_count_var, width=10).pack(pady=2)
+
+        dice_type_var = tk.StringVar(value=attack_sample.damage_dice_type)
+        ttk.Combobox(attack_dialog, values=["d4", "d6", "d8", "d10", "d12"],
+                     textvariable=dice_type_var, width=10).pack(pady=2)
+
+        mod_var = tk.IntVar(value=attack_sample.damage_modifier)
+        ttk.Spinbox(attack_dialog, from_=-10, to=20, textvariable=mod_var, width=10).pack(pady=2)
+
+        damage_type_var = tk.StringVar(value=attack_sample.damage_type)
+        ttk.Entry(attack_dialog, textvariable=damage_type_var, width=20).pack(pady=2)
+
+        def save_attack():
+            """Сохранение изменений атаки для всех выбранных врагов"""
+            for enemy in enemies:
+                attack = enemy.attacks[index]
+                attack.name = name_var.get()
+                attack.attack_bonus = bonus_var.get()
+                attack.damage_dice_count = dice_count_var.get()
+                attack.damage_dice_type = dice_type_var.get()
+                attack.damage_modifier = mod_var.get()
+                attack.damage_type = damage_type_var.get()
+
+            self.update_attacks_listbox(listbox, enemies[0])
+            attack_dialog.destroy()
+
+        ttk.Button(attack_dialog, text="Сохранить", command=save_attack).pack(pady=20)
+
+    def edit_enemy(self, enemy):
+        """Редактирование одного врага"""
+        self.open_mass_edit_dialog([enemy])
+
+    def show_status(self):
+        """Показать текущий статус всех врагов"""
+        status_text = "=== ТЕКУЩИЙ СТАТУС ===\n"
+        for i, (side_enemies, side_name) in enumerate(zip(self.sides, self.side_names)):
+            status_text += f"{side_name}:\n"
+            for enemy in side_enemies:
+                status = "🟢 ЖИВ" if enemy.alive else "🔴 МЕРТВ"
+                ignore_text = f" (Игнорирует: {', '.join([self.side_names[s] for s in enemy.ignore_sides])})" if enemy.ignore_sides else ""
+                attacks_text = ", ".join([f"{attack.name}+{attack.attack_bonus}" for attack in enemy.attacks])
+                status_text += f"  {enemy.name}: {enemy.hp}/{enemy.max_hp} HP [{attacks_text}] ({status}){ignore_text}\n"
+            status_text += "\n"
+
+        if hasattr(self, 'battle_results_text'):
+            self.battle_results_text.insert(tk.END, status_text + "\n")
+            self.battle_results_text.see(tk.END)
+
+    def update_battle_ui(self):
+        """Обновление интерфейса: только изменившиеся враги, O(число изменений)"""
+        dirty = getattr(self, '_dirty_enemies', set())
+        for enemy in dirty:
+            label = self.label_by_enemy.get(enemy)
+            if label is None:
+                continue
+            status = "🟢" if enemy.alive else "🔴"
+            attack_info = ", ".join([f"{a.name}+{a.attack_bonus}" for a in enemy.attacks])
+            label.configure(text=f"{status} {enemy.name}: {enemy.hp}/{enemy.max_hp} HP [{attack_info}]")
+        dirty.clear()
+
+
+==================== bestiary_importer.py ====================
+
+import tkinter as tk
+from tkinter import ttk, messagebox
+import requests
+from bs4 import BeautifulSoup
+import re
+import threading
+from entities import Enemy, Attack
+from ui_components import ScrollableFrame, fit_window_to_screen
+from statblock_parser import parse_characteristics, extract_statblock_text, extract_battle_text
+
+
+class BestiaryImporter:
+    """Класс для импорта монстров с dnd.su"""
+
+    # --- Шаблоны для парсинга (атрибуты КЛАССА) ---
+    MONSTER_URL_RE = re.compile(r'/(?:multiverse/)?bestiary/\d+[-_][\w\-]+/?$')
+    ATTACK_RE = re.compile(
+        r'(?P<name>[А-ЯЁA-Z][^.\n]{2,80}?)\.\s*'
+        r'(?P<kind>Рукопашная|Дальнобойная)\s+атака\s+оружием:?\s*'
+        r'(?P<bonus>[+-]?\d+)\s+к\s+попаданию',
+        re.IGNORECASE)
+    DICE_RE = re.compile(r'(\d+)\s*[кkd]\s*(\d+)(?:\s*([+-]\s*\d+))?')
+    DAMAGE_TYPE_MAP = [
+        ('рубящ', 'рубящий'), ('колющ', 'колющий'), ('пронзающ', 'пронзающий'),
+        ('дробящ', 'дробящий'), ('огнен', 'огненный'), ('кислот', 'кислотный'),
+        ('холод', 'холод'), ('электрич', 'электрический'), ('молни', 'молнии'),
+        ('яд', 'яд'), ('психич', 'психический'), ('силов', 'силовое поле'),
+        ('излуч', 'излучение'), ('некротич', 'некротический'), ('гром', 'гром'),
+    ]
+    HEADERS = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+                             'AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36'}
+
+    NUM_WORDS = {'одна':1,'одну':1,'одной':1,'одним':1,'одним':1,
+                 'две':2,'двух':2,'двум':2,'двумя':2,'две':2,
+                 'три':3,'трёх':3,'трём':3,'четыре':4,'четырёх':4,'четырём':4,
+                 'пять':5,'пяти':5,'шесть':6,'шести':6,'семь':7,'семи':7,
+                 'восемь':8,'восьми':8,'девять':9,'девяти':9,'десять':10,'десяти':10}
+    STRIKE_RE = re.compile(
+        r'(?:(?P<num>одн[ауюе]|дв[ауюеи]|тр[еиё]|четыр[еиё]?|пяти?|шести?|семи?|восьми?|девяти?|десяти?|\d+)\s+)?'
+        r'атак[ауеийок]*\s+(?:оружием\s+|частью\s+|по\s+)?'
+        r'(?P<part>[А-ЯЁа-яёA-Za-z][\w\-]*)', re.IGNORECASE)
+    SUFFIXES = sorted(['иями','иям','ами','ями','ам','ям','ом','ем','ов','ев',
+                       'ах','ях','у','ю','а','я','и','ы','е','о'], key=len, reverse=True)
+
+    @classmethod
+    def _norm_word(cls, w):
+        w = w.lower().strip()
+        for suf in cls.SUFFIXES:
+            if w.endswith(suf) and len(w) - len(suf) >= 3:
+                return w[:-len(suf)]
+        return w
+
+    def _match_attack(self, part, attacks):
+        np = self._norm_word(part)
+        if not np:
+            return None
+        for a in attacks:
+            words = {self._norm_word(x) for x in a['name'].split()}
+            if np in words or any(np == wd or (len(np) >= 3 and (np in wd or wd in np)) for wd in words):
+                return a['name']
+        return None
+
+    def parse_multiattack(self, text, attacks):
+        """Вытаскивает мультиатаку из окна текста; возвращает list-of-dict или None."""
+        m = re.search(r'(?:Мультиатака|Multiattack)', text, re.IGNORECASE)
+        if not m:
+            return None
+        window = text[m.end(): m.end() + 320]          # окно на всю фразу мультиатаки
+        strikes, seen_pairs = [], set()
+        for sm in self.STRIKE_RE.finditer(window):
+            raw = sm.group('num')
+            if raw is None:
+                cnt = 1
+            elif raw.isdigit():
+                cnt = int(raw)
+            else:
+                cnt = self.NUM_WORDS.get(self._norm_word(raw) + '' if False else raw.lower(), None)
+                if cnt is None:
+                    # пробуем по основе слова
+                    cnt = next((v for k, v in self.NUM_WORDS.items() if k.startswith(raw.lower()[:3])), 1)
+            name = self._match_attack(sm.group('part'), attacks)
+            if not name:
+                continue                                # преамбула/мусор - отбрасываем
+            key = (name, cnt)
+            if key in seen_pairs:
+                continue
+            seen_pairs.add(key)
+            strikes.append({'attack': name, 'count': cnt})
+        return strikes or None                          # None => воин бьёт одной атакой (деградация)
+
+    def __init__(self, parent_root, simulator, on_imported=None, on_cancel=None):
+        self.parent_root = parent_root
+        self.simulator = simulator
+        self.search_results = []
+        self.selected_monster = None
+        self.on_imported = on_imported
+        self.on_cancel = on_cancel
+
+        # ================= АСИНХРОННЫЙ СЕТЕВОЙ СЛОЙ =================
+    def _async(self, work, on_success):
+        """work() выполняется в ФОНОВОМ потоке (не блокирует UI!),
+        а on_success(результат) вызывается обратно в UI-потоке через after."""
+        def runner():
+            try:
+                result = work()
+            except Exception as e:
+                self.parent_root.after(0, lambda exc=e: self._safe(self._on_error, exc))
+                return
+            self.parent_root.after(0, lambda r=result: self._safe(on_success, r))
+        threading.Thread(target=runner, daemon=True).start()
+
+    def _safe(self, func, arg):
+        """Вызываем колбэк ТОЛЬКО если окно импорта ещё живо (иначе игнорим)."""
+        try:
+            if self.import_window.winfo_exists():
+                func(arg)
+        except tk.TclError:
+            pass  # окно закрыли в момент возврата из сети - тихо выходим
+
+    def _on_error(self, exc):
+        messagebox.showerror("Ошибка сети", f"Не удалось получить данные:\n{exc}",
+                             parent=self.import_window)
+
+    def _set_busy(self, busy):
+        """Блокируем ввод на время запроса + показываем, что идёт загрузка."""
+        state = 'disabled' if busy else 'normal'
+        self.search_entry.config(state=state)
+
+    # ================= ОКНО =================
+    def open_import_window(self):
+        self.import_window = tk.Toplevel(self.parent_root)
+        self.import_window.title("📖 Импорт монстров из бестиария")
+        fit_window_to_screen(self.import_window, 900, 700)
+        self.import_window.transient(self.parent_root)
+        self.import_window.protocol('WM_DELETE_WINDOW', self._on_close)
+
+        main_frame = ttk.Frame(self.import_window)
+        main_frame.pack(fill='both', expand=True, padx=10, pady=10)
+
+        search_frame = ttk.LabelFrame(main_frame, text="Поиск монстра")
+        search_frame.pack(fill='x', pady=5)
+        ttk.Label(search_frame, text="Название:").pack(side='left', padx=5)
+        self.search_var = tk.StringVar()
+        self.search_entry = ttk.Entry(search_frame, textvariable=self.search_var, width=30)
+        self.search_entry.pack(side='left', padx=5)
+        self.search_entry.bind('<Return>', lambda e: self.search_monster())
+        ttk.Button(search_frame, text="🔍 Искать", command=self.search_monster).pack(side='left', padx=5)
+
+        results_frame = ttk.LabelFrame(main_frame, text="Результаты поиска")
+        results_frame.pack(fill='both', expand=True, pady=5)
+        self.results_listbox = tk.Listbox(results_frame, height=10)
+        self.results_listbox.pack(fill='both', expand=True, padx=5, pady=5)
+        self.results_listbox.bind('<<ListboxSelect>>', self.on_monster_select)
+
+        preview_frame = ttk.LabelFrame(main_frame, text="Предпросмотр монстра")
+        preview_frame.pack(fill='both', expand=True, pady=5)
+        self.preview_scroll = ScrollableFrame(preview_frame)
+        self.preview_scroll.pack(fill='both', expand=True)
+
+        self.import_btn = ttk.Button(main_frame, text="✨ Импортировать в симулятор",
+                                     command=self.import_selected_monster, state='disabled')
+        self.import_btn.pack(pady=10)
+
+    def _on_close(self):
+        try:
+            self.import_window.destroy()
+        except tk.TclError:
+            pass
+        if self.on_cancel:
+            self.on_cancel()
+
+    # ПОИСК
+    def search_monster(self):
+        query = self.search_var.get().strip()
+        if not query:
+            messagebox.showwarning("Внимание", "Введите название монстра!", parent=self.import_window)
+            return
+        self._set_busy(True)
+        self.selected_monster = None
+        self.import_btn.config(state='disabled')
+        self.results_listbox.delete(0, tk.END)
+        self.results_listbox.insert(tk.END, "⏳ Ищем на dnd.su... (окно живёт, идёт загрузка)")
+
+        def work():
+            response = requests.get(f"https://dnd.su/bestiary/?search={query}",
+                                    headers=self.HEADERS, timeout=10)
+            response.encoding = 'utf-8'
+            if response.status_code != 200:
+                raise RuntimeError(f"Сайт ответил кодом {response.status_code}")
+            return response.text
+
+        def ok(html):
+            self._set_busy(False)
+            self.parse_search_results(html, query)
+
+        self._async(work, ok)
+
+    def parse_search_results(self, html, query):
+        soup = BeautifulSoup(html, 'html.parser')
+        self.results_listbox.delete(0, tk.END)
+        self.search_results = []
+        seen = set()
+        query_lower = query.lower()
+        for link in soup.find_all('a', href=True):
+            href = link['href']
+            if not self.MONSTER_URL_RE.search(href):
+                continue
+            name = link.get_text(strip=True)
+            if query_lower not in name.lower():
+                continue
+            if not name or href in seen:
+                continue
+            seen.add(href)
+            url = href if href.startswith('http') else f'https://dnd.su{href}'
+            self.search_results.append({'name': name, 'url': url})
+        self.search_results.sort(key=lambda e: (not e['name'].lower().startswith(query_lower),
+                                                e['name'].lower()))
+        for entry in self.search_results:
+            self.results_listbox.insert(tk.END, entry['name'])
+        if not self.search_results:
+            messagebox.showinfo("Результаты",
+                                "Монстры с таким именем не найдены. Попробуй другое название!",
+                                parent=self.import_window)
+
+    # ================= ВЫБОР / ЗАГРУЗКА СТАТБЛОКА (тоже не виснет!) =================
+    def on_monster_select(self, event):
+        selection = self.results_listbox.curselection()
+        if not selection:
+            return
+        monster_data = self.search_results[selection[0]]
+        self.import_btn.config(state='disabled')
+        # пометка в превью, что грузимся
+        for w in self.preview_scroll.scrollable_frame.winfo_children():
+            w.destroy()
+        ttk.Label(self.preview_scroll.scrollable_frame,
+                  text="⏳ Загружаем статблок монстра...", font=('Arial', 11)).pack(pady=20)
+
+        def work():
+            response = requests.get(monster_data['url'], headers=self.HEADERS, timeout=10)
+            response.encoding = 'utf-8'
+            if response.status_code != 200:
+                raise RuntimeError(f"Сайт ответил кодом {response.status_code}")
+            return response.text
+
+        def ok(html):
+            monster_stats = self.parse_statblock(html)
+            self.display_monster_preview(monster_stats)
+            self.selected_monster = monster_stats
+            self.import_btn.config(state='normal')
+
+        self._async(work, ok)
+
+    # ================= ПАРСИНГ (чистый, без сети) =================
+    def parse_statblock(self, html):
+        soup = BeautifulSoup(html, 'html.parser')
+        monster = {'name': '', 'hp': 10, 'ac': 10, 'attacks': [], 'regen': 0, 'speed': 30}
+        name = ''
+        h1 = soup.find('h1')
+        if h1:
+            name = h1.get_text(strip=True)
+        if not name and soup.title and soup.title.string:
+            name = soup.title.string.split('/')[0].strip()
+        name = re.sub(r'\s*\[.*?\]', '', name)
+        name = re.split(r'[—–-]\s*Бестиарий', name)[0]
+        name = re.sub(r'\s*\([A-Za-z]{2,6}\)\s*[—–-].*$', '', name)
+        monster['name'] = name.strip() or 'Без имени'
+
+        # ДВА окна активной редакции: ref (справочный+особенности+хиты/КД/скорость)
+        # и battle (Действия -> атаки/мультиатака). Парсим по окнам, НЕ по полному
+        # get_text(), иначе ловим обе редакции (5e24/5e14) -> дубль атак/хвостов.
+        ref = extract_statblock_text(soup)
+        battle = extract_battle_text(soup)
+
+        spd = re.search(r'Скорость\s*(\d+)\s*футов', ref, re.I)
+        if spd:
+            monster['speed'] = int(spd.group(1))
+        hp = re.search(r'(?:Хиты|Hit\s+Points)[^\d]{0,20}(\d+)', ref, re.I)
+        if hp:
+            monster['hp'] = int(hp.group(1))
+        ac = re.search(r'(?:Класс\s+Доспеха|Armor\s+Class)[^\d]{0,20}(\d+)', ref, re.I)
+        if ac:
+            monster['ac'] = int(ac.group(1))
+        regen = re.search(r'(?:восстанавливает|регенерация)[^\d]{0,40}(\d+)\s+хитов', ref, re.I)
+        if regen:
+            monster['regen'] = int(regen.group(1))
+
+        monster['attacks'] = self.parse_attacks(battle)
+        monster['multiattack'] = self.parse_multiattack(battle, monster['attacks'])
+        monster.update(parse_characteristics(soup, ref))
+        return monster
+
+    def parse_attacks(self, text):
+        attacks = []
+        seen = set()
+        for m in self.ATTACK_RE.finditer(text):
+            name = m.group('name').strip(' _*')
+            bonus = int(m.group('bonus'))
+            window = text[m.end(): m.end() + 250]
+            rm = re.search(r'дистанция\s*(\d+)', window)
+            reach = re.search(r'досягаемость\s*(\d+)', window)
+            if m.group('kind').lower().startswith('дально') and rm:
+                range_ft = int(rm.group(1))
+            elif reach:
+                range_ft = int(reach.group(1))
+            else:
+                range_ft = 5
+            dm = self.DICE_RE.search(window)
+            if not dm:
+                continue
+            count, die = int(dm.group(1)), int(dm.group(2))
+            mod = int(dm.group(3).replace(' ', '')) if dm.group(3) else 0
+            type_window = window[:dm.end() + 60].lower()
+            dtype = next((full for stem, full in self.DAMAGE_TYPE_MAP if stem in type_window), '')
+            key = (name, bonus, count, die)
+            if key in seen:
+                continue
+            seen.add(key)
+            attacks.append({'name': name, 'attack_bonus': bonus,
+                            'damage_dice_count': count, 'damage_dice_type': f'd{die}',
+                            'damage_modifier': mod, 'damage_type': dtype, 'range_ft': range_ft})
+        if not attacks:
+            attacks.append({'name': 'Атака', 'attack_bonus': 0, 'damage_dice_count': 1,
+                            'damage_dice_type': 'd6', 'damage_modifier': 0,
+                            'damage_type': '', 'range_ft': 5})
+        return attacks
+
+    def display_monster_preview(self, monster):
+        for widget in self.preview_scroll.scrollable_frame.winfo_children():
+            widget.destroy()
+        preview = self.preview_scroll.scrollable_frame
+        ttk.Label(preview, text=f"👾 {monster['name']}", font=('Arial', 14, 'bold')).pack(pady=5)
+
+        head = []
+        if monster.get('size'): head.append(monster['size'])
+        if monster.get('type'): head.append(monster['type'])
+        if monster.get('cr'):   head.append(f"CR {monster['cr']}")
+        if monster.get('prof_bonus'): head.append(f"Бонус мастерства {monster['prof_bonus']}")
+        if head:
+            ttk.Label(preview, text=' · '.join(head), font=('Arial', 10, 'italic')).pack(anchor='w', padx=10)
+
+        ttk.Label(preview, text=f"❤️ Хиты: {monster['hp']}   🛡️ КД: {monster['ac']}   "
+                                f"👟 Скорость: {monster.get('speed', 30)} фт",
+                  font=('Arial', 11)).pack(anchor='w', padx=10)
+        if monster.get('regen'):
+            ttk.Label(preview, text=f"💚 Регенерация: {monster['regen']}", font=('Arial', 11)).pack(anchor='w', padx=10)
+
+        from statblock_parser import ABILITY_ORDER, ABILITY_LABEL
+        sc, md = monster.get('ability_scores') or {}, monster.get('ability_mods') or {}
+        if sc:
+            cells = []
+            for k in ABILITY_ORDER:
+                if k in sc:
+                    sign = '+' if md.get(k, 0) >= 0 else ''
+                    cells.append(f"{ABILITY_LABEL[k]} {sc[k]} ({sign}{md.get(k, 0)})")
+            ttk.Label(preview, text=' · '.join(cells), font=('Arial', 10, 'bold')).pack(anchor='w', padx=10,
+                                                                                        pady=(4, 0))
+        for label, key in [('Спасброски', 'saves'), ('Навыки', 'skills'), ('Чувства', 'senses')]:
+            d = monster.get(key) or {}
+            if d:
+                txt = ', '.join(f"{kk} {vv}".strip() for kk, vv in d.items())
+                ttk.Label(preview, text=f"{label}: {txt}", font=('Arial', 10)).pack(anchor='w', padx=10)
+        for label, key in [('Уязвимости', 'vulnerabilities'), ('Сопротивления', 'resistances'),
+                           ('Иммунитеты', 'immunities'), ('Иммун. к условиям', 'condition_immunities'),
+                           ('Языки', 'languages')]:
+            lst = monster.get(key) or []
+            if lst:
+                ttk.Label(preview, text=f"{label}: {', '.join(lst)}", font=('Arial', 10)).pack(anchor='w', padx=10)
+
+        traits = monster.get('traits') or []
+        if traits:
+            ttk.Label(preview, text="✨ Особенности:", font=('Arial', 12, 'bold')).pack(anchor='w', pady=(8, 2))
+            for tr in traits:
+                ttk.Label(preview, text=f"• {tr['name']}. {tr['desc']}",
+                          font=('Arial', 9), wraplength=560, justify='left').pack(anchor='w', padx=20)
+
+        ttk.Label(preview, text="⚔️ Атаки:", font=('Arial', 12, 'bold')).pack(anchor='w', pady=(10, 5))
+        for attack in monster['attacks']:
+            attack_text = (f"• {attack['name']} ({attack['attack_bonus']:+d}, "
+                           f"{attack['damage_dice_count']}{attack['damage_dice_type']}"
+                           f"{attack['damage_modifier']:+d})")
+            ttk.Label(preview, text=attack_text, font=('Arial', 10)).pack(anchor='w', padx=20)
+
+        if not sc and not traits and not (monster.get('saves') or monster.get('skills')):
+            ttk.Label(preview, text="⚠ В источнике не указаны характеристики/особенности "
+                                    "(описание дополняется на dnd.su)",
+                      font=('Arial', 9, 'italic'), foreground='#888888').pack(anchor='w', padx=10, pady=(8, 0))
+
+    # ИМПОРТ
+    def import_selected_monster(self):
+        if not self.selected_monster:
+            return
+        monster_type = self.selected_monster['name']
+        attacks_data = [{
+            'name': a['name'], 'attack_bonus': a['attack_bonus'],
+            'damage_dice_count': a['damage_dice_count'],
+            'damage_dice_type': a['damage_dice_type'],
+            'damage_modifier': a['damage_modifier'],
+            'damage_type': a.get('damage_type', ''),
+            'range_ft': a.get('range_ft', 5),
+        } for a in self.selected_monster['attacks']]
+
+        from factory import EnemyFactory
+        chars = {k: v for k, v in self.selected_monster.items()
+                 if k in ('ability_scores', 'ability_mods', 'saves', 'skills', 'senses',
+                          'vulnerabilities', 'resistances', 'immunities',
+                          'condition_immunities', 'languages', 'cr', 'prof_bonus',
+                          'size', 'type', 'traits')}
+        EnemyFactory.register_type(monster_type,
+                                   hp=self.selected_monster['hp'],
+                                   ac=self.selected_monster['ac'],
+                                   attacks=attacks_data,
+                                   speed=self.selected_monster.get('speed', 30),
+                                   regen=self.selected_monster.get('regen', 0),
+                                   multiattack=self.selected_monster.get('multiattack'),
+                                   **chars)
+        if monster_type not in self.simulator.enemy_types:
+            self.simulator.enemy_types.append(monster_type)
+            messagebox.showinfo("Успех",
+                                f"✨ Монстр {monster_type} импортирован!",
+                                parent=self.import_window)
+        else:
+            messagebox.showinfo("Информация",
+                                f"Монстр {monster_type} уже в списке!",
+                                parent=self.import_window)
+
+        self.import_window.destroy()
+        if self.on_imported:
+            self.on_imported(monster_type)
+
+
+==================== characteristics_editor.py ====================
+
+import tkinter as tk
+from tkinter import ttk
+
+ABILITY_ROWS = [('str', 'СИЛ'), ('dex', 'ЛОВ'), ('con', 'ТЕЛ'),
+                ('int', 'ИНТ'), ('wis', 'МДР'), ('cha', 'ХАР')]
+DICT_FIELDS = [('saves', 'Спасброски'), ('skills', 'Навыки'), ('senses', 'Чувства')]
+LIST_FIELDS = [('vulnerabilities', 'Уязвимости к урону'),
+               ('resistances', 'Сопротивления урону'),
+               ('immunities', 'Иммунитеты к урону'),
+               ('condition_immunities', 'Иммунитеты к условиям'),
+               ('languages', 'Языки')]
+# однострочные справочные
+SCALAR_FIELDS = [('cr', 'Опасность (CR)'), ('prof_bonus', 'Бонус мастерства'),
+                 ('size', 'Размер'), ('type', 'Тип')]
+
+
+class CharacteristicsEditor:
+    def __init__(self, parent, initial=None, on_change=None, palette=None):
+        self.parent = parent
+        self.on_change = on_change
+        self.palette = palette or {}
+        self._entries = {}      # имя поля -> tk.Entry/StringVar (скаляры, ability)
+        self._texts = {}        # имя поля -> tk.Text (dict/list/traits)
+        self._sections = {}     # ключ секции -> Frame (для сворачивания)
+        self._build()
+        self.set_data(initial or {})
+
+    # ---------- каркас: две сворачиваемые секции ----------
+    def _build(self):
+        self._section('stats', '📊 Характеристики', self._build_stats)
+        self._section('defense', '🛡 Особенности и защита', self._build_defense)
+
+    def _section(self, key, title, builder):
+        wrap = ttk.Frame(self.parent)  # обёртка фиксирует позицию секции в parent
+        wrap.pack(fill='x', pady=(4, 0))
+        head = ttk.Frame(wrap)
+        head.pack(fill='x')
+        arrow = ttk.Label(head, text='▸', width=2, cursor='hand2',
+                          font=('Segoe UI', 10, 'bold'))
+        arrow.pack(side='left')
+        lbl = ttk.Label(head, text=title, font=('Segoe UI', 11, 'bold'), cursor='hand2')
+        lbl.pack(side='left')
+        body = ttk.Frame(wrap)  # НЕ pack-аем здесь: тело живёт внутри wrap
+        self._sections[key] = {'body': body, 'arrow': arrow, 'open': False}
+
+        def toggle(_e=None):
+            st = self._sections[key]
+            if st['open']:
+                st['body'].pack_forget()
+                st['arrow'].configure(text='▸')
+                st['open'] = False
+            else:
+                st['body'].pack(fill='x', padx=8)  # pack ВНУТРИ wrap -> сразу под head
+                st['arrow'].configure(text='▾')
+                st['open'] = True
+
+        # bind только на заголовок (не на wrap): клик в пустое место тела не свернёт секцию
+        for w in (head, arrow, lbl):
+            w.bind('<Button-1>', toggle)
+        builder(body)
+
+    # ---------- секция 📊 ----------
+    def _build_stats(self, body):
+        # ability-сетка 6 строк: СИЛ [score] ( [mod] )
+        grid = ttk.Frame(body); grid.pack(fill='x', pady=2)
+        for r, (key, label) in enumerate(ABILITY_ROWS):
+            ttk.Label(grid, text=label, width=4,
+                      font=('Segoe UI', 9, 'bold')).grid(row=r, column=0, sticky='w', padx=(0, 4))
+            sv_s = tk.StringVar(); sv_m = tk.StringVar()
+            ttk.Entry(grid, textvariable=sv_s, width=5).grid(row=r, column=1, padx=1)
+            ttk.Label(grid, text='(').grid(row=r, column=2)
+            ttk.Entry(grid, textvariable=sv_m, width=5).grid(row=r, column=3, padx=1)
+            ttk.Label(grid, text=')').grid(row=r, column=4)
+            self._entries[f'score_{key}'] = sv_s
+            self._entries[f'mod_{key}'] = sv_m
+            for sv in (sv_s, sv_m):
+                sv.trace_add('write', lambda *_: self._emit())
+        # dict-поля (saves/skills/senses) - Text 'Ключ Значение' по строке
+        for key, label in DICT_FIELDS:
+            ttk.Label(body, text=label + ':', font=('Segoe UI', 9, 'bold')).pack(anchor='w', pady=(4, 0))
+            self._texts[key] = self._mk_text(body, height=2,
+                                             hint='Сил +3, Лов +2  (каждая пара с новой строки или через запятую)')
+
+    # ---------- секция 🛡 ----------
+    def _build_defense(self, body):
+        # скаляры
+        sf = ttk.Frame(body); sf.pack(fill='x', pady=2)
+        for c, (key, label) in enumerate(SCALAR_FIELDS):
+            col = c % 2
+            ttk.Label(sf, text=label + ':', font=('Segoe UI', 9)).grid(
+                row=c // 2, column=col * 2, sticky='e', padx=(0, 3))
+            sv = tk.StringVar()
+            ttk.Entry(sf, textvariable=sv, width=14).grid(row=c // 2, column=col * 2 + 1, sticky='w', padx=(0, 10))
+            self._entries[key] = sv
+            sv.trace_add('write', lambda *_: self._emit())
+        # list-поля - Text через запятую
+        for key, label in LIST_FIELDS:
+            ttk.Label(body, text=label + ':', font=('Segoe UI', 9, 'bold')).pack(anchor='w', pady=(4, 0))
+            self._texts[key] = self._mk_text(body, height=1,
+                                             hint='огонь, холод  (через запятую)')
+        # traits - Text 'Имя. Описание' по строке (симметрия с парсером)
+        ttk.Label(body, text='Особенности (Имя. Описание, каждая с новой строки):',
+                  font=('Segoe UI', 9, 'bold')).pack(anchor='w', pady=(6, 0))
+        self._texts['traits'] = self._mk_text(body, height=4,
+                                              hint='Регенерация. Восстанавливает 10 HP в начале хода.')
+
+    # ---------- хелперы Text ----------
+    def _mk_text(self, parent, height, hint):
+        bg = self.palette.get('field_bg'); fg = self.palette.get('fg')
+        kw = {}
+        if bg: kw['bg'] = bg
+        if fg: kw['fg'] = fg
+        t = tk.Text(parent, height=height, wrap='word', font=('Segoe UI', 9), **kw)
+        t.pack(fill='x', padx=2)
+        t._hint = hint
+        t.bind('<FocusIn>', lambda e, w=t: self._hint_clear(w))
+        t.bind('<FocusOut>', lambda e, w=t: self._hint_restore(w))
+        t.bind('<KeyRelease>', lambda *_: self._emit())
+        return t
+
+    def _hint_clear(self, t):
+        if t.get('1.0', 'end-1c').strip() == t._hint:
+            t.delete('1.0', 'end')
+            if self.palette.get('fg'):
+                t.configure(fg=self.palette['fg'])
+
+    def _hint_restore(self, t):
+        if not t.get('1.0', 'end-1c').strip():
+            t.insert('1.0', t._hint)
+            if self.palette.get('fg_muted'):
+                t.configure(fg=self.palette['fg_muted'])
+
+    # ---------- сериализация dict <-> виджеты ----------
+    def set_data(self, data):
+        """Заполняет виджеты из dict (вызывается из _load_preset после сборки)."""
+        sc = data.get('ability_scores') or {}
+        md = data.get('ability_mods') or {}
+        for key, _ in ABILITY_ROWS:
+            self._entries[f'score_{key}'].set('' if key not in sc else str(sc[key]))
+            self._entries[f'mod_{key}'].set('' if key not in md else ('+%d' % md[key] if md[key] >= 0 else str(md[key])))
+        for key, _ in SCALAR_FIELDS:
+            v = data.get(key)
+            self._entries[key].set('' if v is None else str(v))
+        for key, _ in DICT_FIELDS:
+            d = data.get(key) or {}
+            self._set_text(key, ', '.join(f'{k} {v}'.strip() for k, v in d.items()))
+        for key, _ in LIST_FIELDS:
+            lst = data.get(key) or []
+            self._set_text(key, ', '.join(str(x) for x in lst))
+        traits = data.get('traits') or []
+        self._set_text('traits', '\n'.join(f"{t.get('name','')}. {t.get('desc','')}".strip('. ')
+                                           for t in traits))
+
+    def _set_text(self, key, value):
+        t = self._texts[key]
+        t.delete('1.0', 'end')
+        if value:
+            t.insert('1.0', value)
+            if self.palette.get('fg'):
+                t.configure(fg=self.palette['fg'])
+        else:
+            t.insert('1.0', t._hint)
+            if self.palette.get('fg_muted'):
+                t.configure(fg=self.palette['fg_muted'])
+
+    def get_data(self):
+        """Собирает dict справочных полей из виджетов (для _confirm_custom)."""
+        out = {'ability_scores': {}, 'ability_mods': {}, 'saves': {}, 'skills': {},
+               'senses': {}, 'vulnerabilities': [], 'resistances': [], 'immunities': [],
+               'condition_immunities': [], 'languages': [], 'cr': None,
+               'prof_bonus': None, 'size': None, 'type': None, 'traits': []}
+        for key, _ in ABILITY_ROWS:
+            s = self._parseInt(self._entries[f'score_{key}'].get())
+            m = self._parseInt(self._entries[f'mod_{key}'].get())
+            if s is not None: out['ability_scores'][key] = s
+            if m is not None: out['ability_mods'][key] = m
+        for key, _ in SCALAR_FIELDS:
+            v = self._entries[key].get().strip()
+            out[key] = v if v else None
+        for key, _ in DICT_FIELDS:
+            out[key] = self._parsePairs(self._getText(key))
+        for key, _ in LIST_FIELDS:
+            out[key] = self._parseList(self._getText(key))
+        out['traits'] = self._parseTraits(self._getText('traits'))
+        return out
+
+    # ---------- парсинг ручного ввода (простой, т.к. ввод чистый построчно) ----------
+    def _parseInt(self, s):
+        s = (s or '').strip()
+        if not s: return None
+        try: return int(s)
+        except ValueError: return None
+
+    def _getText(self, key):
+        t = self._texts[key]
+        txt = t.get('1.0', 'end-1c').strip()
+        return '' if txt == t._hint else txt
+
+    def _parsePairs(self, seg):
+        res = {}
+        for part in [p.strip() for p in seg.replace('\n', ',').split(',') if p.strip()]:
+            # 'Сил +3' или 'Сил: +3'
+            import re as _re
+            m = _re.match(r'^(.+?)\s*[:\s]\s*([+-]?\d+)$', part)
+            if m: res[m.group(1).strip()] = m.group(2)
+            elif ' ' in part:
+                k, v = part.rsplit(' ', 1)
+                res[k.strip()] = v.strip()
+        return res
+
+    def _parseList(self, seg):
+        return [p.strip() for p in seg.replace('\n', ',').split(',') if p.strip()]
+
+    def _parseTraits(self, seg):
+        import re as _re
+        out = []
+        for line in seg.split('\n'):
+            line = line.strip()
+            if not line: continue
+            m = _re.match(r'^([^.!?:]{1,60}?)\.\s+(.*)$', line)
+            if m:
+                out.append({'name': m.group(1).strip(' *'), 'desc': m.group(2).strip()})
+            else:
+                out.append({'name': line, 'desc': ''})
+        return out
+
+    def _emit(self):
+        if self.on_change:
+            try: self.on_change(self.get_data())
+            except Exception: pass
+
+    def retint(self, palette):
+        """Перекраска tk.Text при смене темы (ttk подхватит стиль сам)."""
+        self.palette = palette or {}
+        bg, fg, muted = palette.get('field_bg'), palette.get('fg'), palette.get('fg_muted')
+        for t in self._texts.values():
+            if bg: t.configure(bg=bg)
+            cur = t.get('1.0', 'end-1c').strip()
+            if cur == t._hint and muted:
+                t.configure(fg=muted)
+            elif fg:
+                t.configure(fg=fg)
+
+
+==================== decision_engine.py ====================
+
+"""Слой принятия решений существа (v1 + объяснимость).
+
+Две ортогональные оси: temperament (ручной, делегируем) x intellect (INT, авто из
+парсера). v1-объём: A (цель + A5-фильтр иммунных), B1/B2/B3 (дальность/защиты/EV),
+C1 + hold-половина C2/D1. БЕЗ прогноза F и памяти D4/B5 (v2).
+
+ОБЪЯСНИМОСТЬ (этап СПР-анализ): каждый выход decide фиксирует immutable-снимок
+Explanation в self._round_log (НЕ пересчёт - мир к моменту открытия окна изменился).
+Снимок хранит имена и числовые мотивы, не ссылки на target/attack (протухнут).
+Журнал живёт в ENGINE, а не в BattleLogic: объяснение рождается только в decide,
+и тащить его сбор в боевое ядро = смешать слои (battle_logic получает лишь
+begin_round()). Единый источник истины о типе урона - dmg_canon здесь.
+Graceful под живой источник (дайджест: Arcana Unleashed доливается волнами,
+"в некоторых монстрах пока не добавлены полные описания"; легенда: "- приватная
+карточка"): отсутствие INT = 10 = Tier 2, а не овощ Tier 0.
+"""
+import re
+from typing import List, Optional
+
+DMG_CANON_TRIGGERS = [
+    ('bludgeoning', ['дроб', 'bludgeon']),
+    ('piercing',    ['колю', 'пронз', 'pierc']),
+    ('slashing',    ['руб', 'slash']),
+    ('acid',        ['кисл', 'acid']),
+    ('fire',        ['огон', 'огн', 'fire']),
+    ('cold',        ['хол', 'cold']),
+    ('lightning',   ['электр', 'молн', 'lightn']),
+    ('thunder',     ['гром', 'thund']),
+    ('poison',      ['яд', 'poison']),
+    ('necrotic',    ['некрот', 'necrot']),
+    ('radiant',     ['излуч', 'сия', 'radiant']),
+    ('psychic',     ['псих', 'psychic']),
+    ('force',       ['силов', 'force']),
+]
+
+TIER_NAMES = {0: 'Рефлекторный', 1: 'Инстинктивный', 2: 'Тактический',
+              3: 'Оптимизирующий', 4: 'Стратегический'}
+
+
+def dmg_canon(s) -> str:
+    if not s:
+        return ''
+    low = str(s).lower()
+    for canon, triggs in DMG_CANON_TRIGGERS:
+        if any(t in low for t in triggs):
+            return canon
+    return low.strip()
+
+
+_DIE_AVG = {'d4': 2.5, 'd6': 3.5, 'd8': 4.5, 'd10': 5.5, 'd12': 6.5, 'd20': 10.5}
+
+
+def _avg_dice(dtype: str) -> float:
+    m = re.search(r'd(\d+)', str(dtype or ''))
+    if not m:
+        return 0.0
+    return _DIE_AVG.get('d' + m.group(1), (int(m.group(1)) + 1) / 2.0)
+
+
+def tier_from_int(int_score) -> int:
+    if int_score is None:
+        return 2
+    try:
+        v = int(int_score)
+    except (TypeError, ValueError):
+        return 2
+    if v <= 3:
+        return 0
+    if v <= 7:
+        return 1
+    if v <= 11:
+        return 2
+    if v <= 15:
+        return 3
+    return 4
+
+
+class Decision:
+    __slots__ = ('target', 'attack', 'move_intent', 'target_dist_ft', 'tier', 'rationale')
+
+    def __init__(self, target, attack, move_intent, target_dist_ft, tier, rationale=''):
+        self.target = target
+        self.attack = attack
+        self.move_intent = move_intent
+        self.target_dist_ft = target_dist_ft
+        self.tier = tier
+        self.rationale = rationale
+
+
+class DecisionEngine:
+    """Stateless-мозг + журнал объяснимости (self._round_log)."""
+
+    def __init__(self):
+        self._round_log: List[dict] = []
+
+    # ---------- жизненный цикл журнала ----------
+    def begin_round(self):
+        """Сброс буфера на новый раунд. Вызывается из BattleLogic._run_round_inner
+        (единственная строка-крючок в боевом ядре)."""
+        self._round_log = []
+
+    def get_round_log(self):
+        """Копия снимков текущего раунда для окна анализа."""
+        return list(self._round_log)
+
+    def _log(self, **kw):
+        self._round_log.append(kw)
+
+    # ---------- главный вход ----------
+    def decide(self, attacker, sides, ignore):
+        from battle_strategies import distance_ft_between
+        int_score = (attacker.ability_scores or {}).get('int')
+        tier = tier_from_int(int_score)
+        arch = attacker.strategy.__class__.__name__
+
+        target = attacker.strategy.select_target(attacker, sides, ignore)
+        if target is None:
+            self._log(unit=attacker.name, side=attacker.side, int_score=int_score,
+                      tier=tier, tier_name=TIER_NAMES[tier], archetype=arch,
+                      target_name=None, target_reason='нет живых целей',
+                      attack_name=None, attack_reason='', candidates=[],
+                      move_intent='approach', move_reason='', multiattack=False,
+                      rationale='')
+            return Decision(None, None, 'approach', 5, tier, '')
+
+        target_reason = f'архетип {arch} выбрал цель'
+        if tier >= 2 and self._all_immune(attacker, target):
+            alt = self._first_not_fully_immune(attacker, sides, ignore, skip=target)
+            if alt is not None:
+                target_reason = (f'архетип {arch} выбрал {target.name}, но весь арсенал '
+                                 f'иммунен -> A5 переключил на {alt.name}')
+                target = alt
+            else:
+                target_reason = (f'архетип {arch} выбрал {target.name}; A5: альтернатив '
+                                 f'не найдено, бьём иммунного (выбора нет)')
+
+        # Мультиатака: B4-распределение off в v1
+        if getattr(attacker, 'multiattack', None):
+            strikes_desc = ' + '.join(f"{s['attack']}×{s.get('count', 1)}"
+                                      for s in attacker.multiattack)
+            self._log(unit=attacker.name, side=attacker.side, int_score=int_score,
+                      tier=tier, tier_name=TIER_NAMES[tier], archetype=arch,
+                      target_name=target.name, target_reason=target_reason,
+                      attack_name=None, attack_reason=f'мультиатака: {strikes_desc}',
+                      candidates=[], move_intent='approach', move_reason='',
+                      multiattack=True, rationale='')
+            return Decision(target, None, 'approach', 5, tier, '')
+
+        # Tier 0: полный делегат
+        if tier == 0:
+            self._log(unit=attacker.name, side=attacker.side, int_score=int_score,
+                      tier=tier, tier_name=TIER_NAMES[tier], archetype=arch,
+                      target_name=target.name, target_reason=target_reason,
+                      attack_name=None,
+                      attack_reason=f'Tier 0: решение полностью у архетипа {arch}, '
+                                    f'мозг не вмешивается',
+                      candidates=[], move_intent='approach', move_reason='',
+                      multiattack=False, rationale='')
+            return Decision(target, None, 'approach', 5, tier, '')
+
+        # Tier >= 1: B1 (+B2 tier>=2, +B3 tier>=3) + C1/hold
+        dist_now = distance_ft_between(attacker, target)
+        attack, reason, candidates = self._pick_attack(attacker, target, tier, dist_now)
+        if attack is None:
+            self._log(unit=attacker.name, side=attacker.side, int_score=int_score,
+                      tier=tier, tier_name=TIER_NAMES[tier], archetype=arch,
+                      target_name=target.name, target_reason=target_reason,
+                      attack_name=None, attack_reason=reason or 'нет доступных атак',
+                      candidates=candidates, move_intent='approach', move_reason='',
+                      multiattack=False, rationale=reason)
+            return Decision(target, None, 'approach', 5, tier, reason)
+
+        reach = getattr(attack, 'range_ft', 5)
+        move_intent = 'approach'
+        move_reason = f'подойти на {reach} фт (дистанция {dist_now:.0f})'
+        if reach > 5 and dist_now <= reach and self._should_hold(attacker, target, dist_now):
+            move_intent = 'hold'
+            why = []
+            if attacker.max_hp and attacker.hp / attacker.max_hp < 0.5:
+                why.append(f'ранен ({attacker.hp}/{attacker.max_hp})')
+            if any(getattr(a, 'range_ft', 5) <= 5 for a in getattr(target, 'attacks', [])):
+                why.append('враг опасен в melee')
+            move_reason = (f'держит дистанцию: {attack.name} достаёт с {dist_now:.0f} фт '
+                           f'(reach {reach}), и ' + ' + '.join(why))
+            reason = (reason + '; ' if reason else '') + 'держит дистанцию (стреляет издалека)'
+
+        self._log(unit=attacker.name, side=attacker.side, int_score=int_score,
+                  tier=tier, tier_name=TIER_NAMES[tier], archetype=arch,
+                  target_name=target.name, target_reason=target_reason,
+                  attack_name=attack.name, attack_reason=reason,
+                  candidates=candidates, move_intent=move_intent,
+                  move_reason=move_reason, multiattack=False, rationale=reason)
+        return Decision(target, attack, move_intent, reach, tier, reason)
+
+    # ---------- A5 ----------
+    def _all_immune(self, attacker, target) -> bool:
+        imm = {dmg_canon(x) for x in (getattr(target, 'immunities', []) or [])}
+        if not imm:
+            return False
+        for a in attacker.attacks:
+            if dmg_canon(getattr(a, 'damage_type', '')) not in imm:
+                return False
+        return True
+
+    def _first_not_fully_immune(self, attacker, sides, ignore, skip):
+        for side_idx, side_enemies in enumerate(sides):
+            if side_idx == attacker.side or side_idx in ignore \
+                    or side_idx in getattr(attacker, 'ignore_sides', set()):
+                continue
+            for e in side_enemies:
+                if e.alive and e is not skip and not self._all_immune(attacker, e):
+                    return e
+        return None
+
+    # ---------- B1/B2/B3 + сбор кандидатов ----------
+    def _pick_attack(self, attacker, target, tier, dist_now):
+        """Возвращает (best, reason, candidates). candidates - объяснительный список
+        для окна анализа: каждая атака с reach/типом/eff/EV и причиной отсечения."""
+        use_defense = tier >= 2
+        use_hit = tier >= 3
+        imm = {dmg_canon(x) for x in (getattr(target, 'immunities', []) or [])} if use_defense else set()
+        res = {dmg_canon(x) for x in (getattr(target, 'resistances', []) or [])} if use_defense else set()
+        ac = getattr(target, 'ac', 10)
+
+        def metrics(a):
+            c = dmg_canon(getattr(a, 'damage_type', ''))
+            eff = 1.0
+            if use_defense:
+                eff = 0.0 if c in imm else (0.5 if c in res else 1.0)
+            avg = a.damage_dice_count * _avg_dice(a.damage_dice_type) + a.damage_modifier
+            if use_hit:
+                p_hit = max(0.05, min(0.95, (21 - max(1, ac - a.attack_bonus)) / 20.0))
+                return avg * p_hit * eff, eff
+            return avg * eff, eff
+
+        reachable = [a for a in attacker.attacks if getattr(a, 'range_ft', 5) >= dist_now]
+        pool, prefer_far = (reachable, False) if reachable else (list(attacker.attacks), True)
+
+        best, best_ev, best_eff, best_reach = None, -1.0, -1.0, None
+        candidates = []
+        for a in attacker.attacks:
+            r = getattr(a, 'range_ft', 5)
+            ev, eff = metrics(a)
+            in_pool = a in pool
+            if not in_pool:
+                rej = f'не достаёт с {dist_now:.0f} фт (reach {r}) [B1]'
+            elif eff == 0.0 and use_defense:
+                rej = 'цель иммунна к этому типу [B2]'
+            else:
+                rej = ''
+            chosen = False
+            if in_pool:
+                if best is None:
+                    better = True
+                else:
+                    pri_new, pri_old = (1 if eff > 0 else 0), (1 if best_eff > 0 else 0)
+                    if pri_new != pri_old:
+                        better = pri_new > pri_old
+                    elif abs(ev - best_ev) > 1e-9:
+                        better = ev > best_ev
+                    else:
+                        better = (r < best_reach) if not prefer_far else (r > best_reach)
+                if better:
+                    if best is not None:
+                        # прежний best теперь не chosen - помечаем в candidates ниже
+                        pass
+                    best, best_ev, best_eff, best_reach = a, ev, eff, r
+            candidates.append({'name': a.name, 'reach': r,
+                               'dmg_type': getattr(a, 'damage_type', '') or '—',
+                               'eff': round(eff, 2), 'ev': round(ev, 1),
+                               'reject': rej})
+        # финальная пометка chosen (после цикла, т.к. best мог смениться)
+        if best is not None:
+            for cd in candidates:
+                if cd['name'] == best.name:
+                    cd['chosen'] = True
+                    if cd['reject']:
+                        cd['reject'] = ''
+        reason = ''
+        if best is not None:
+            c = dmg_canon(getattr(best, 'damage_type', ''))
+            if use_defense and best_eff == 0.0:
+                reason = f'весь арсенал иммунен цели ({getattr(best, "damage_type", "")})'
+            elif use_defense and 0 < best_eff < 1.0:
+                reason = f'цель сопротивляется {getattr(best, "damage_type", "")} (урон пополам) [B2]'
+            elif use_hit:
+                reason = f'макс. EV с учётом шанса попадания [B3]'
+        return best, reason, candidates
+
+    # ---------- hold ----------
+    def _should_hold(self, attacker, target, dist_now) -> bool:
+        if attacker.max_hp and attacker.hp / attacker.max_hp < 0.5:
+            return True
+        for a in getattr(target, 'attacks', []):
+            if getattr(a, 'range_ft', 5) <= 5:
+                return True
+        return False
+
+
+==================== entities.py ====================
+
+import random
+from typing import List, Tuple
+from observer import Subject
+from battle_strategies import BattleStrategy, RandomStrategy
+
+
+class Attack:
+    """Класс для представления атаки существа"""
+
+    def __init__(self, name: str, attack_bonus: int, damage_dice_count: int,
+                 damage_dice_type: str, damage_modifier: int, damage_type: str = "",
+                 range_ft: int = 5):
+        self.name = name
+        self.attack_bonus = attack_bonus
+        self.damage_dice_count = damage_dice_count
+        self.damage_dice_type = damage_dice_type
+        self.damage_modifier = damage_modifier
+        self.damage_type = damage_type
+        self.range_ft = range_ft
+
+    def to_dict(self):
+        """Преобразует объект атаки в словарь для сохранения"""
+        return {
+            'name': self.name,
+            'attack_bonus': self.attack_bonus,
+            'damage_dice_count': self.damage_dice_count,
+            'damage_dice_type': self.damage_dice_type,
+            'damage_modifier': self.damage_modifier,
+            'damage_type': self.damage_type,
+            'range_ft': self.range_ft,
+        }
+
+    @classmethod
+    def from_dict(cls, data):
+        """Создает объект атаки из словаря"""
+        return cls(
+            data['name'],
+            data['attack_bonus'],
+            data['damage_dice_count'],
+            data['damage_dice_type'],
+            data['damage_modifier'],
+            data.get('damage_type', ''),
+            data.get('range_ft', 5)
+        )
+
+
+class Enemy(Subject):
+    """Класс для представления врага/существа в битве"""
+
+    def __init__(self, name: str, hp: int, ac: int, attacks: List[Attack], side: int,
+                 regen=0, speed=30):
+        super().__init__()
+        self.name = name
+        self.max_hp = hp
+        self.hp = hp
+        self.ac = ac
+        self.attacks = attacks
+        self.side = side
+        self.alive = True
+        self.ignore_sides = set()
+        self.strategy: BattleStrategy = RandomStrategy()
+        self.regen = regen
+        self.speed = speed          # скорость в футах (5 фт = 1 клетка)
+        self.pos = None             # позиция на карте (x, y) или None
+        self.moved_ft = 0           # потрачено футов перемещения за раунд
+        self.multiattack = None     # список ударов [{'attack': имя, 'count': n}] или None
+        self.ability_scores = {}      # {'str':8,'dex':14,...}
+        self.ability_mods = {}        # {'str':-1,'dex':2,...}
+        self.saves = {}               # {'Лов':'+3', ...}
+        self.skills = {}              # {'Скрытность':'+4', ...}
+        self.senses = {}              # {'Тёмное зрение':'60', ...}
+        self.vulnerabilities = []     # ['огонь', ...]
+        self.resistances = []
+        self.immunities = []
+        self.condition_immunities = []
+        self.languages = []
+        self.cr = None                # строкой: '1/4', '5', '—'
+        self.prof_bonus = None
+        self.size = None
+        self.type = None
+        self.traits = []              # [{'name':..,'desc':..}]
+
+    def take_damage(self, damage: int):
+        """Нанесение урона врага"""
+        actual_damage = max(0, damage)  # Урон не может быть отрицательным
+        previous_hp = self.hp
+        self.hp -= actual_damage
+        if self.hp <= 0:
+            self.alive = False
+            self.hp = 0
+            self.notify()           # Оповещаем наблюдателей об изменении состояния
+            return False
+        elif self.hp != previous_hp:
+            self.notify()           # Оповещаем наблюдателей об изменении состояния
+
+        return self.alive
+
+    def perform_attack(self, attack: Attack, target_ac: int) -> Tuple[bool, int, int, bool, str]:
+        attack_roll = random.randint(1, 20)
+        total_attack = attack_roll + attack.attack_bonus
+        critical = (attack_roll == 20)  # Критическое попадание при 20
+        hit = total_attack >= target_ac or critical
+        damage_info = ""
+        if hit:
+            # Расчет урона
+            dice_type = int(attack.damage_dice_type.split('d')[1])
+            damage = sum(random.randint(1, dice_type) for _ in range(attack.damage_dice_count)) + attack.damage_modifier
+            # Удвоение урона при критическом попадании
+            if critical:
+                damage *= 2
+            damage = max(0, damage)  # Урон не может быть отрицательным
+            damage_info = f"{damage} урона"
+            if attack.damage_type:
+                damage_info += f" ({attack.damage_type})"
+            return True, damage, total_attack, critical, damage_info
+        return False, 0, total_attack, critical, damage_info
+
+    def regenerate(self):
+        """Регенерация здоровья в конце раунда"""
+        if self.alive and self.regen > 0:
+            prev_hp = self.hp
+            self.hp = min(self.max_hp, self.hp + self.regen)
+            if self.hp != prev_hp:
+                self.notify()       # Оповещаем об изменении здоровья
+
+    def to_dict(self):
+        """Преобразует объект врага в словарь для сохранения"""
+        return {
+            'name': self.name,
+            'max_hp': self.max_hp,
+            'hp': self.hp,
+            'ac': self.ac,
+            'attacks': [attack.to_dict() for attack in self.attacks],
+            'side': self.side,
+            'alive': self.alive,
+            'ignore_sides': list(self.ignore_sides),
+            'strategy_type': self.strategy.__class__.__name__,
+            'regen': self.regen,
+            'speed': self.speed,
+            'pos': self.pos,
+            'multiattack': self.multiattack,
+            'ability_scores': self.ability_scores,
+            'ability_mods': self.ability_mods,
+            'saves': self.saves,
+            'skills': self.skills,
+            'senses': self.senses,
+            'vulnerabilities': self.vulnerabilities,
+            'resistances': self.resistances,
+            'immunities': self.immunities,
+            'condition_immunities': self.condition_immunities,
+            'languages': self.languages,
+            'cr': self.cr,
+            'prof_bonus': self.prof_bonus,
+            'size': self.size,
+            'type': self.type,
+            'traits': self.traits,
+        }
+
+    @classmethod
+    def from_dict(cls, data):
+        """Создает объект врага из словаря"""
+        enemy = cls(
+            data['name'],
+            data['max_hp'],
+            data['ac'],
+            [Attack.from_dict(attack_data) for attack_data in data['attacks']],
+            data['side'],
+            data.get('regen', 0)
+        )
+        enemy.hp = data['hp']
+        enemy.alive = data['alive']
+        enemy.ignore_sides = set(data['ignore_sides'])
+        enemy.speed = data.get('speed', 30)
+        enemy.pos = data.get('pos')             # восстанавливаем позицию на карте
+        enemy.multiattack = data.get('multiattack')
+        enemy.multiattack = data.get('multiattack')
+        enemy.ability_scores = dict(data.get('ability_scores') or {})
+        enemy.ability_mods = dict(data.get('ability_mods') or {})
+        enemy.saves = dict(data.get('saves') or {})
+        enemy.skills = dict(data.get('skills') or {})
+        enemy.senses = dict(data.get('senses') or {})
+        enemy.vulnerabilities = list(data.get('vulnerabilities') or [])
+        enemy.resistances = list(data.get('resistances') or [])
+        enemy.immunities = list(data.get('immunities') or [])
+        enemy.condition_immunities = list(data.get('condition_immunities') or [])
+        enemy.languages = list(data.get('languages') or [])
+        enemy.cr = data.get('cr')
+        enemy.prof_bonus = data.get('prof_bonus')
+        enemy.size = data.get('size')
+        enemy.type = data.get('type')
+        enemy.traits = [dict(tr) for tr in (data.get('traits') or [])]
+
+        # Восстановление стратегии из сохранения
+        strategy_type = data.get('strategy_type', 'RandomStrategy')
+        from battle_strategies import AggressiveStrategy, DefensiveStrategy, RandomStrategy, SupportStrategy
+        if strategy_type == 'AggressiveStrategy':
+            enemy.strategy = AggressiveStrategy()
+        elif strategy_type == 'DefensiveStrategy':
+            enemy.strategy = DefensiveStrategy()
+        elif strategy_type == 'SupportStrategy':
+            enemy.strategy = SupportStrategy()
+        else:
+            enemy.strategy = RandomStrategy()
+
+        return enemy
+
+
+==================== factory.py ====================
+
+from entities import Enemy, Attack
+
+
+def _creature_def(hp, ac, attacks, speed=30, regen=0, multiattack=None, *,
+                  ability_scores=None, ability_mods=None, saves=None, skills=None,
+                  senses=None, vulnerabilities=None, resistances=None, immunities=None,
+                  condition_immunities=None, languages=None, cr=None, prof_bonus=None,
+                  size=None, ctype=None, traits=None):
+    """Конструктор записи реестра с дефолтами по схеме (чтобы не писать {} / [] везде).
+    Боевые поля обязательны; справочные опциональны — отсутствие = пустой контейнер/None."""
+    return {
+        'hp': hp, 'ac': ac, 'attacks': attacks, 'speed': speed, 'regen': regen,
+        'multiattack': multiattack,
+        'ability_scores': ability_scores or {}, 'ability_mods': ability_mods or {},
+        'saves': saves or {}, 'skills': skills or {}, 'senses': senses or {},
+        'vulnerabilities': vulnerabilities or [], 'resistances': resistances or [],
+        'immunities': immunities or [], 'condition_immunities': condition_immunities or [],
+        'languages': languages or [], 'cr': cr, 'prof_bonus': prof_bonus,
+        'size': size, 'type': ctype, 'traits': traits or [],
+    }
+
+
+class EnemyFactory:
+    """Фабрика для создания врагов разных типов"""
+    CUSTOM_TYPES = {}    # импортированные/кастомные
+    CREATURE_DEFS = {}   # канонические встроенные типы
+
+    CREATURE_DEFS = {
+        'обычный': _creature_def(hp=10, ac=10, speed=30,
+            attacks=[{'name': 'Атака', 'attack_bonus': 0, 'damage_dice_count': 1,
+                      'damage_dice_type': 'd6', 'damage_modifier': 0, 'damage_type': ''}]),
+
+        'гоблин': _creature_def(hp=7, ac=14, speed=30,
+            attacks=[{'name': 'Короткий меч', 'attack_bonus': 4, 'damage_dice_count': 1,
+                      'damage_dice_type': 'd6', 'damage_modifier': 2, 'damage_type': 'рубящий'},
+                     {'name': 'Короткий лук', 'attack_bonus': 4, 'damage_dice_count': 1,
+                      'damage_dice_type': 'd6', 'damage_modifier': 2, 'damage_type': 'колющий',
+                      'range_ft': 80}],
+            ability_scores={'str': 8, 'dex': 14, 'con': 10, 'int': 10, 'wis': 8, 'cha': 8},
+            ability_mods={'str': -1, 'dex': 2, 'con': 0, 'int': 0, 'wis': -1, 'cha': -1},
+            skills={'Скрытность': '+4', 'Восприятие': '+1'},
+            senses={'Тёмное зрение': '60', 'Пассивное восприятие': '11'},
+            languages=['общий', 'гоблинский'], cr='1/4', prof_bonus='+2',
+            size='Малый', ctype='гуманоид (гоблиноид)',
+            traits=[{'name': 'Ловкое ускользание',
+                     'desc': 'Бонусным действием может отступить (Disengage) или спрятаться (Hide).'}]),
+
+        'орк': _creature_def(hp=15, ac=13, speed=30,
+            attacks=[{'name': 'Большой топор', 'attack_bonus': 5, 'damage_dice_count': 1,
+                      'damage_dice_type': 'd12', 'damage_modifier': 3, 'damage_type': 'рубящий'}],
+            ability_scores={'str': 16, 'dex': 12, 'con': 16, 'int': 7, 'wis': 11, 'cha': 10},
+            ability_mods={'str': 3, 'dex': 1, 'con': 3, 'int': -2, 'wis': 0, 'cha': 0},
+            skills={'Устрашение': '+2'},
+            senses={'Тёмное зрение': '60', 'Пассивное восприятие': '10'},
+            languages=['общий', 'безымянный'], cr='1/2', prof_bonus='+2',
+            size='Средний', ctype='гуманоид (орк)',
+            traits=[{'name': 'Ярость орка',
+                     'desc': 'Когда HP падает до 0, но существо не умирает, может потратить реакцию, чтобы остаться с 1 HP.'}]),
+
+        'скелет': _creature_def(hp=13, ac=16, speed=30,
+            attacks=[{'name': 'Длинный меч', 'attack_bonus': 4, 'damage_dice_count': 1,
+                      'damage_dice_type': 'd8', 'damage_modifier': 2, 'damage_type': 'рубящий'},
+                     {'name': 'Короткий лук', 'attack_bonus': 4, 'damage_dice_count': 1,
+                      'damage_dice_type': 'd6', 'damage_modifier': 2, 'damage_type': 'колющий',
+                      'range_ft': 80}],
+            ability_scores={'str': 10, 'dex': 14, 'con': 0, 'int': 6, 'wis': 8, 'cha': 7},
+            ability_mods={'str': 0, 'dex': 2, 'con': 0, 'int': -2, 'wis': -1, 'cha': -2},
+            senses={'Тёмное зрение': '60', 'Пассивное восприятие': '9'},
+            vulnerabilities=['дробящий'], immunities=['некротический', 'яд'],
+            condition_immunities=['истощение', 'отравление'],
+            cr='1/4', prof_bonus='+2', size='Средний', ctype='нежить'),
+
+        'тролль': _creature_def(hp=84, ac=15, speed=30, regen=10,
+            attacks=[{'name': 'Когти', 'attack_bonus': 7, 'damage_dice_count': 2,
+                      'damage_dice_type': 'd6', 'damage_modifier': 3, 'damage_type': 'дробящий'},
+                     {'name': 'Укус', 'attack_bonus': 7, 'damage_dice_count': 2,
+                      'damage_dice_type': 'd6', 'damage_modifier': 3, 'damage_type': 'пронзающий'}],
+            multiattack=[{'attack': 'Когти', 'count': 2}, {'attack': 'Укус', 'count': 1}],
+            ability_scores={'str': 18, 'dex': 13, 'con': 20, 'int': 7, 'wis': 9, 'cha': 7},
+            ability_mods={'str': 4, 'dex': 1, 'con': 5, 'int': -2, 'wis': -1, 'cha': -2},
+            senses={'Тёмное зрение': '60', 'Пассивное восприятие': '9'},
+            languages=['великанский'], vulnerabilities=['огонь', 'холод'],
+            cr='5', prof_bonus='+3', size='Огромный', ctype='гигант',
+            traits=[{'name': 'Острый нюх',
+                     'desc': 'Преимущество на проверки Восприятия, основанные на обонянии.'},
+                    {'name': 'Регенерация',
+                     'desc': 'В начале хода восстанавливает 10 HP, если с прошлого хода не получил урон огнём или кислотой.'}]),
+
+        'гном': _creature_def(hp=10, ac=16, speed=25,
+            attacks=[{'name': 'Молоток', 'attack_bonus': 3, 'damage_dice_count': 1,
+                      'damage_dice_type': 'd6', 'damage_modifier': 1, 'damage_type': 'дробящий'},
+                     {'name': 'Праща', 'attack_bonus': 3, 'damage_dice_count': 1,
+                      'damage_dice_type': 'd4', 'damage_modifier': 1, 'damage_type': 'дробящий',
+                      'range_ft': 30}],
+            # справочные значения-заглушка: в ММ «гном» — раса, не отдельный монстр; допишем этапом 2
+            ability_scores={'str': 9, 'dex': 13, 'con': 14, 'int': 12, 'wis': 10, 'cha': 9},
+            ability_mods={'str': -1, 'dex': 1, 'con': 2, 'int': 1, 'wis': 0, 'cha': -1},
+            senses={'Тёмное зрение': '60', 'Пассивное восприятие': '10'},
+            languages=['общий', 'гномий'], cr='1/4', prof_bonus='+2',
+            size='Малый', ctype='гуманоид (гном)'),
+
+        'эльф': _creature_def(hp=12, ac=15, speed=30,
+            attacks=[{'name': 'Длинный меч', 'attack_bonus': 4, 'damage_dice_count': 1,
+                      'damage_dice_type': 'd8', 'damage_modifier': 2, 'damage_type': 'рубящий'},
+                     {'name': 'Длинный лук', 'attack_bonus': 6, 'damage_dice_count': 1,
+                      'damage_dice_type': 'd8', 'damage_modifier': 2, 'damage_type': 'колющий',
+                      'range_ft': 150}],
+            ability_scores={'str': 10, 'dex': 14, 'con': 10, 'int': 12, 'wis': 11, 'cha': 10},
+            ability_mods={'str': 0, 'dex': 2, 'con': 0, 'int': 1, 'wis': 0, 'cha': 0},
+            senses={'Тёмное зрение': '60', 'Пассивное восприятие': '10'},
+            languages=['общий', 'эльфийский'], cr='1/4', prof_bonus='+2',
+            size='Средний', ctype='гуманоид (эльф)'),
+
+        'дротик': _creature_def(hp=22, ac=13, speed=30,
+            attacks=[{'name': 'Укус', 'attack_bonus': 4, 'damage_dice_count': 1,
+                      'damage_dice_type': 'd6', 'damage_modifier': 2, 'damage_type': 'пронзающий'},
+                     {'name': 'Огненное дыхание', 'attack_bonus': 0, 'damage_dice_count': 3,
+                      'damage_dice_type': 'd6', 'damage_modifier': 0, 'damage_type': 'огневой',
+                      'range_ft': 15}],
+            ability_scores={'str': 14, 'dex': 12, 'con': 14, 'int': 6, 'wis': 10, 'cha': 10},
+            ability_mods={'str': 2, 'dex': 1, 'con': 2, 'int': -2, 'wis': 0, 'cha': 0},
+            senses={'Тёмное зрение': '60', 'Пассивное восприятие': '10'},
+            languages=[], cr='1', prof_bonus='+2', size='Средний', ctype='дракон'),
+    }
+
+    @staticmethod
+    def register_type(type_name, hp, ac, attacks, speed=30, regen=0, multiattack=None, **extra):
+        EnemyFactory.CUSTOM_TYPES[type_name] = {
+            'hp': hp, 'ac': ac, 'attacks': attacks,
+            'speed': speed, 'regen': regen,
+            'multiattack': multiattack,
+            **extra,
+        }
+
+    @staticmethod
+    def _make_attack(data):
+        """Создаёт Attack из словаря, аккуратно вынимая range_ft"""
+        data = dict(data)
+        range_ft = data.pop('range_ft', 5)
+        attack = Attack(**data)
+        attack.range_ft = range_ft
+        return attack
+
+    @staticmethod
+    def _finish(enemy, speed=30, ranges=()):
+        """Гарантирует speed; range_ft уже проставлен _make_attack из dict реестра,
+        поэтому ranges здесь больше не нужен (оставлен для совместимости сигнатуры)."""
+        enemy.speed = speed
+        for idx, attack in enumerate(enemy.attacks):
+            attack.range_ft = ranges[idx] if idx < len(ranges) else getattr(attack, 'range_ft', 5)
+        return enemy
+
+    @staticmethod
+    def _apply_def(enemy, t):
+        """МОСТ между схемой реестра и объектом Enemy: проставляет ВСЕ справочные поля
+        с дефолтами. Единая точка для CREATURE_DEFS и CUSTOM_TYPES — поэтому парсер
+        (этап 1) и форма (этап 3), наполняющие dict, подхватятся без правок фабрики."""
+        enemy.ability_scores = dict(t.get('ability_scores') or {})
+        enemy.ability_mods = dict(t.get('ability_mods') or {})
+        enemy.saves = dict(t.get('saves') or {})
+        enemy.skills = dict(t.get('skills') or {})
+        enemy.senses = dict(t.get('senses') or {})
+        enemy.vulnerabilities = list(t.get('vulnerabilities') or [])
+        enemy.resistances = list(t.get('resistances') or [])
+        enemy.immunities = list(t.get('immunities') or [])
+        enemy.condition_immunities = list(t.get('condition_immunities') or [])
+        enemy.languages = list(t.get('languages') or [])
+        enemy.cr = t.get('cr')
+        enemy.prof_bonus = t.get('prof_bonus')
+        enemy.size = t.get('size')
+        enemy.type = t.get('type')
+        enemy.traits = [dict(tr) for tr in (t.get('traits') or [])]
+        return enemy
+
+    @staticmethod
+    def create_enemy(enemy_type, name, side):
+        """Создаёт врага: сначала кастом/импорт, затем канон, иначе болванка 'обычный'."""
+        if enemy_type in EnemyFactory.CUSTOM_TYPES:
+            t = EnemyFactory.CUSTOM_TYPES[enemy_type]
+        elif enemy_type in EnemyFactory.CREATURE_DEFS:
+            t = EnemyFactory.CREATURE_DEFS[enemy_type]
+        else:
+            t = EnemyFactory.CREATURE_DEFS['обычный']
+        enemy = Enemy(name=name, hp=t['hp'], ac=t['ac'],
+                      attacks=[EnemyFactory._make_attack(a) for a in t['attacks']],
+                      side=side, regen=t.get('regen', 0))
+        enemy = EnemyFactory._finish(enemy, speed=t.get('speed', 30))
+        enemy.multiattack = t.get('multiattack')
+        EnemyFactory._apply_def(enemy, t)   # 👈 характеристики доезжают до объекта
+        return enemy
+
+
+==================== main.py ====================
+
+import tkinter as tk
+from battle_simulator import BattleSimulator
+
+def main():
+    """Основная функция запуска приложения"""
+    root = tk.Tk()
+    app = BattleSimulator(root)
+    root.mainloop()
+
+if __name__ == "__main__":
+    main()
+
+
+==================== observer.py ====================
+
+from abc import ABC, abstractmethod
+
+
+class Observer(ABC):
+    """Абстрактный класс наблюдателя"""
+
+    @abstractmethod
+    def update(self, subject):
+        """Метод для обновления состояния наблюдателя"""
+        pass
+
+
+class Subject:
+    """Субъект, за которым наблюдают"""
+
+    def __init__(self):
+        self._observers = []
+
+    def attach(self, observer):
+        """Добавляет наблюдателя"""
+        if observer not in self._observers:
+            self._observers.append(observer)
+
+    def detach(self, observer):
+        """Удаляет наблюдателя"""
+        try:
+            self._observers.remove(observer)
+        except ValueError:
+            pass
+
+    def notify(self):
+        """Оповещает всех наблюдателей об изменении"""
+        for observer in self._observers:
+            observer.update(self)
+
+
+==================== settings_ui.py ====================
+
+import tkinter as tk
+from tkinter import ttk, messagebox, filedialog
+import json
+import os
+from datetime import datetime
+from entities import Attack, Enemy
+from battle_strategies import AggressiveStrategy, DefensiveStrategy, RandomStrategy, SupportStrategy
+
+
+class SettingsUI:
+    """Класс для управления настройками и сохранением/загрузкой"""
+
+    def __init__(self):
+        """Инициализация UI настроек"""
+        pass
+
+    def save_settings(self):
+        """Сохранение текущих настроек в файл"""
+        try:
+            # Создание директории для настроек если она не существует
+            if not os.path.exists('battle_settings'):
+                os.makedirs('battle_settings')
+
+            # Генерация имени файла с временной меткой
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            filename = f"battle_settings/battle_{timestamp}.json"
+
+            # Сохраняем текущие настройки альянсов
+            current_alliance_settings = []
+            if hasattr(self, 'alliance_vars'):
+                for i in range(len(self.alliance_vars)):
+                    row_settings = []
+                    for j in range(len(self.alliance_vars[i])):
+                        if self.alliance_vars[i][j] is not None:
+                            row_settings.append(self.alliance_vars[i][j].get())
+                        else:
+                            row_settings.append(False)
+                    current_alliance_settings.append(row_settings)
+
+            # Сохраняем типы армий и стратегии
+            army_types = list(self.side_army_types[:self.num_sides_var.get()])
+            strategy_types = [v.get() for v in self.side_strategy_vars[:self.num_sides_var.get()]]
+
+            from factory import EnemyFactory
+            custom_types_snapshot = dict(getattr(EnemyFactory, 'CUSTOM_TYPES', {}))
+
+            settings = {
+                'num_sides': self.num_sides_var.get(),
+                'side_names': [var.get() for var in self.side_name_vars],
+                'side_counts': [var.get() for var in self.side_count_vars],
+                'army_types': army_types,
+                'strategy_types': strategy_types,
+                'custom_types': custom_types_snapshot,
+                'alliance_settings': current_alliance_settings if current_alliance_settings else self.alliance_settings,
+                'ignore_sides': {str(k): list(v) for k, v in self.ignore_sides.items()} if hasattr(self,
+                                                                                                   'ignore_sides') else {}
+            }
+
+            with open(filename, 'w', encoding='utf-8') as f:
+                json.dump(settings, f, ensure_ascii=False, indent=2)
+
+            messagebox.showinfo("Успех", f"Настройки сохранены в файл:\n{filename}")
+        except Exception as e:
+            messagebox.showerror("Ошибка", f"Ошибка при сохранении: {str(e)}")
+
+    def load_settings(self):
+        """Загрузка настроек из файла (под новую архитектуру карточек сторон)"""
+        try:
+            filename = filedialog.askopenfilename(
+                title="Выберите файл настроек",
+                filetypes=[("JSON files", "*.json"), ("All files", "*.*")],
+                initialdir="battle_settings"
+            )
+            if not filename:
+                return
+
+            with open(filename, 'r', encoding='utf-8') as f:
+                settings = json.load(f)
+
+            from factory import EnemyFactory
+            if not hasattr(EnemyFactory, 'CUSTOM_TYPES'):
+                EnemyFactory.CUSTOM_TYPES = {}
+            for type_name, type_data in settings.get('custom_types', {}).items():
+                EnemyFactory.CUSTOM_TYPES[type_name] = type_data
+                if type_name not in self.enemy_types:
+                    self.enemy_types.append(type_name)
+
+            for frame in self.side_frames:
+                frame.destroy()
+            for lst in (self.side_frames, self.side_name_vars, self.side_count_vars,
+                        self.side_army_types, self.side_strategy_vars, self.side_type_labels):
+                lst.clear()
+
+
+            saved_names   = settings.get('side_names', [])
+            saved_counts  = settings.get('side_counts', [])
+            saved_types   = settings.get('army_types', [])
+            saved_strats  = settings.get('strategy_types', [])
+            num_sides     = int(settings.get('num_sides', 0))
+
+            for i in range(num_sides):
+                army_type = saved_types[i] if i < len(saved_types) else self.enemy_types[0]
+                strategy  = saved_strats[i] if i < len(saved_strats) else self.strategy_types[0]
+                name      = saved_names[i] if i < len(saved_names) else None
+                count     = saved_counts[i] if i < len(saved_counts) else None
+                self._create_new_side(army_type, strategy, name=name, count=count)
+
+            # Синхронизируем внутренний счётчик сторон (нужен вкладке альянсов позже).
+            self.num_sides = num_sides
+
+            if 'alliance_settings' in settings:
+                self.alliance_settings = settings['alliance_settings']
+            if 'ignore_sides' in settings:
+                self.ignore_sides = {int(k): set(v) for k, v in settings['ignore_sides'].items()}
+
+            messagebox.showinfo("Успех", f"Настройки загружены!\nСторон восстановлено: {num_sides}")
+        except Exception as e:
+            messagebox.showerror("Ошибка", f"Ошибка при загрузке: {str(e)}")
+
+
+==================== side_creator.py ====================
+
+import tkinter as tk
+from tkinter import ttk, messagebox
+from ui_components import RoundedButton, ScrollableFrame, fit_window_to_screen
+from factory import EnemyFactory
+from characteristics_editor import CharacteristicsEditor
+
+
+class SideCreatorDialog:
+    """Модальное окно 'кого создать': импорт из бестиария или свой существ."""
+
+    def __init__(self, simulator, mode='create', current_type=None, on_result=None):
+        self.sim = simulator
+        self.mode = mode                      # 'create' | 'edit'
+        self.current_type = current_type
+        self.on_result = on_result or (lambda d: None)
+        self.pal = simulator.theme_manager.palette()
+        self.attacks = []
+        self.multiattack_data = None
+        self.chars_data = {}
+        self.win = tk.Toplevel(simulator.root)
+        self.win.title("Кого ведём в бой?" if mode == 'create' else "Изменить состав")
+        self.win.transient(simulator.root)
+        fit_window_to_screen(self.win, 560, 480)
+        self._build_choice_screen()
+
+    # экран выбора пути
+    def _build_choice_screen(self):
+        for w in self.win.winfo_children():
+            w.destroy()
+        p = self.pal
+        pad = ttk.Frame(self.win); pad.pack(fill='both', expand=True, padx=14, pady=12)
+
+        ttk.Label(pad, text="Тактика отряда:", font=('Segoe UI', 10, 'bold')).pack(anchor='w')
+        self.strat_var = tk.StringVar(value=self.sim.strategy_types[0])
+        ttk.Combobox(pad, textvariable=self.strat_var, values=self.sim.strategy_types,
+                     width=16, state='readonly').pack(anchor='w', pady=(0, 10))
+
+        ttk.Label(pad, text="Выберите, откуда взять существ:",
+                  font=('Segoe UI', 10)).pack(anchor='w', pady=(4, 8))
+
+        row = ttk.Frame(pad); row.pack(fill='x')
+        RoundedButton(row, "📖  Импорт из бестиария\n(тянем статблок с dnd.su)",
+                      palette=p, command=self._start_import,
+                      width=250, height=70, radius=14, font=('Segoe UI', 10, 'bold'))\
+            .pack(side='left', padx=4)
+        RoundedButton(row, "🛠  Свой существ\n(характеристики вручную)",
+                      palette=p, command=self._build_custom_form,
+                      width=250, height=70, radius=14, font=('Segoe UI', 10, 'bold'))\
+            .pack(side='left', padx=4)
+
+        if self.mode == 'edit':
+            ttk.Label(pad, text=f"Текущий состав: {self.current_type}",
+                      font=('Segoe UI', 9, 'italic')).pack(anchor='w', pady=(10, 0))
+
+    # путь: импорт
+    def _start_import(self):
+        self.win.withdraw()
+
+        def done(type_name):
+            self.win.destroy()
+            self.on_result({'army_type': type_name, 'strategy': self.strat_var.get()})
+
+        def cancel():
+            self.win.deiconify()
+
+        self.sim.launch_bestiary_import(on_imported=done, on_cancel=cancel)
+
+    # путь: кастом
+    def _build_custom_form(self):
+        for w in self.win.winfo_children():
+            w.destroy()
+        sf = ScrollableFrame(self.win)
+        sf.pack(fill='both', expand=True, padx=10, pady=10)
+        f = sf.scrollable_frame
+
+        ttk.Label(f, text="Пресет (встроенный тип):", font=('Segoe UI', 10, 'bold')).pack(anchor='w')
+        pr = ttk.Frame(f); pr.pack(fill='x', pady=(0, 8))
+        self.preset_var = tk.StringVar(value=self.sim.enemy_types[0])
+        ttk.Combobox(pr, textvariable=self.preset_var, values=self.sim.enemy_types,
+                     width=16, state='readonly').pack(side='left')
+        ttk.Button(pr, text="Загрузить пресет в поля", command=self._load_preset).pack(side='left', padx=6)
+
+        self.name_var = tk.StringVar(value="")
+        self.hp_var = tk.IntVar(value=10)
+        self.ac_var = tk.IntVar(value=10)
+        self.spd_var = tk.IntVar(value=30)
+        self.regen_var = tk.IntVar(value=0)
+        for label, var, rng in (("Имя существа:", self.name_var, None),
+                                ("Хиты:", self.hp_var, (1, 1000)),
+                                ("Класс доспеха:", self.ac_var, (1, 30)),
+                                ("Скорость (фт):", self.spd_var, (0, 200)),
+                                ("Регенерация:", self.regen_var, (0, 100))):
+            ttk.Label(f, text=label).pack(anchor='w', pady=(4, 0))
+            if rng:
+                ttk.Spinbox(f, from_=rng[0], to=rng[1], textvariable=var, width=12).pack(anchor='w')
+            else:
+                ttk.Entry(f, textvariable=var, width=24).pack(anchor='w')
+
+        ttk.Label(f, text="Атаки:", font=('Segoe UI', 10, 'bold')).pack(anchor='w', pady=(10, 2))
+        self.atk_box = tk.Listbox(f, height=4); self.atk_box.pack(fill='x')
+        btns = ttk.Frame(f); btns.pack(fill='x', pady=4)
+        ttk.Button(btns, text="＋ атака", command=self._add_attack).pack(side='left', padx=2)
+        ttk.Button(btns, text="✎ изменить", command=self._edit_attack).pack(side='left', padx=2)
+        ttk.Button(btns, text="✕ удалить", command=self._del_attack).pack(side='left', padx=2)
+        self._refresh_atk_box()
+        self._refresh_atk_box()
+
+        self.editor = CharacteristicsEditor(f, initial=self.chars_data, palette=self.pal)
+
+        bottom = ttk.Frame(f); bottom.pack(fill='x', pady=12)
+
+        bottom = ttk.Frame(f); bottom.pack(fill='x', pady=12)
+        RoundedButton(bottom, "Отмена", palette=self.pal, command=self.win.destroy,
+                      width=120, height=32, radius=10, outline=True).pack(side='left', padx=4)
+        RoundedButton(bottom, "✅ Создать сторону", palette=self.pal, command=self._confirm_custom,
+                      width=170, height=32, radius=10).pack(side='left', padx=4)
+
+    def _load_preset(self):
+        tmp = EnemyFactory.create_enemy(self.preset_var.get(), "_preset_", 0)
+        self.multiattack_data = getattr(tmp, 'multiattack', None)
+        self.chars_data = {
+            'ability_scores': dict(getattr(tmp, 'ability_scores', {}) or {}),
+            'ability_mods':   dict(getattr(tmp, 'ability_mods', {}) or {}),
+            'saves':          dict(getattr(tmp, 'saves', {}) or {}),
+            'skills':         dict(getattr(tmp, 'skills', {}) or {}),
+            'senses':         dict(getattr(tmp, 'senses', {}) or {}),
+            'vulnerabilities':list(getattr(tmp, 'vulnerabilities', []) or []),
+            'resistances':    list(getattr(tmp, 'resistances', []) or []),
+            'immunities':     list(getattr(tmp, 'immunities', []) or []),
+            'condition_immunities': list(getattr(tmp, 'condition_immunities', []) or []),
+            'languages':      list(getattr(tmp, 'languages', []) or []),
+            'cr':             getattr(tmp, 'cr', None),
+            'prof_bonus':     getattr(tmp, 'prof_bonus', None),
+            'size':           getattr(tmp, 'size', None),
+            'type':           getattr(tmp, 'type', None),
+            'traits':         [dict(tr) for tr in (getattr(tmp, 'traits', []) or [])],
+        }
+        self.name_var.set(self.preset_var.get())
+        self.hp_var.set(tmp.max_hp);
+        self.ac_var.set(tmp.ac)
+        self.spd_var.set(getattr(tmp, 'speed', 30));
+        self.regen_var.set(getattr(tmp, 'regen', 0))
+        self.attacks = [{'name': a.name, 'attack_bonus': a.attack_bonus,
+                         'damage_dice_count': a.damage_dice_count,
+                         'damage_dice_type': a.damage_dice_type,
+                         'damage_modifier': a.damage_modifier,
+                         'damage_type': getattr(a, 'damage_type', ''),
+                         'range_ft': getattr(a, 'range_ft', 5)} for a in tmp.attacks]
+        self._refresh_atk_box()
+        self._refresh_atk_box()
+        self.editor.set_data(self.chars_data)   # этап 3: пресет доезжает до редактора
+
+    def _refresh_atk_box(self):
+        self.atk_box.delete(0, tk.END)
+        for a in self.attacks:
+            self.atk_box.insert(tk.END,
+                f"{a['name']} (+{a['attack_bonus']}, {a['damage_dice_count']}{a['damage_dice_type']}"
+                f"{a['damage_modifier']:+d})")
+
+    def _attack_form(self, title, init=None):
+        init = dict(init or {'name': 'Атака', 'attack_bonus': 0, 'damage_dice_count': 1,
+                             'damage_dice_type': 'd6', 'damage_modifier': 0,
+                             'damage_type': '', 'range_ft': 5})
+        d = tk.Toplevel(self.win);
+        d.title(title);
+        d.transient(self.win);
+        d.grab_set()
+        fit_window_to_screen(d, 360, 430)
+        fr = ttk.Frame(d);
+        fr.pack(fill='both', expand=True, padx=12, pady=10)
+        vars_ = {}
+        for key, lab, wid in (('name', 'Название', 24), ('damage_type', 'Тип урона', 18)):
+            ttk.Label(fr, text=lab).pack(anchor='w');
+            vars_[key] = tk.StringVar(value=init[key])
+            ttk.Entry(fr, textvariable=vars_[key], width=wid).pack(anchor='w', pady=(0, 4))
+        for key, lab, rng in (('attack_bonus', 'Бонус к попаданию', (-10, 20)),
+                              ('damage_dice_count', 'Кол-во костей', (1, 20)),
+                              ('damage_modifier', 'Модификатор урона', (-20, 50)),
+                              ('range_ft', 'Дальность (фт)', (5, 300))):
+            ttk.Label(fr, text=lab).pack(anchor='w');
+            vars_[key] = tk.IntVar(value=init[key])
+            ttk.Spinbox(fr, from_=rng[0], to=rng[1], textvariable=vars_[key], width=10).pack(anchor='w', pady=(0, 4))
+        ttk.Label(fr, text='Тип кости').pack(anchor='w')
+        vars_['damage_dice_type'] = tk.StringVar(value=init['damage_dice_type'])
+        ttk.Combobox(fr, textvariable=vars_['damage_dice_type'],
+                     values=['d4', 'd6', 'd8', 'd10', 'd12', 'd20'], width=8, state='readonly').pack(anchor='w')
+        result = {}
+
+        def ok():
+            result.update({k: v.get() for k, v in vars_.items()});
+            d.destroy()
+
+        def cancel():
+            d.destroy()
+
+        ttk.Button(fr, text='Сохранить', command=ok).pack(side='left', padx=6, pady=8)
+        ttk.Button(fr, text='Отмена', command=cancel).pack(side='left', pady=8)
+        d.wait_window()
+        return result or None
+
+    def _add_attack(self):
+        a = self._attack_form('Новая атака')
+        if a: self.attacks.append(a); self._refresh_atk_box()
+
+    def _edit_attack(self):
+        sel = self.atk_box.curselection()
+        if not sel: messagebox.showwarning('Внимание', 'Выберите атаку!', parent=self.win); return
+        a = self._attack_form('Изменить атаку', self.attacks[sel[0]])
+        if a: self.attacks[sel[0]] = a; self._refresh_atk_box()
+
+    def _del_attack(self):
+        sel = self.atk_box.curselection()
+        if sel: del self.attacks[sel[0]]; self._refresh_atk_box()
+
+    def _confirm_custom(self):
+        name = self.name_var.get().strip()
+        if not name:
+            messagebox.showwarning('Внимание', 'Дайте существу имя!', parent=self.win);
+            return
+        if not self.attacks:
+            messagebox.showwarning('Внимание', 'Добавьте хотя бы одну атаку!', parent=self.win);
+            return
+        self.chars_data = self.editor.get_data()
+        EnemyFactory.register_type(name,
+                                   hp=self.hp_var.get(), ac=self.ac_var.get(),
+                                   attacks=self.attacks, speed=self.spd_var.get(),
+                                   regen=self.regen_var.get(),
+                                   multiattack=self.multiattack_data,
+                                   **self.chars_data)
+        if name not in self.sim.enemy_types:
+            self.sim.enemy_types.append(name)
+        self.on_result({'army_type': name, 'strategy': self.strat_var.get()})
+        self.win.destroy()
+
+
+
+==================== statblock_parser.py ====================
+
+"""Разбор СПРАВОЧНЫХ характеристик статблока (этап 1, финальная ревизия).
+
+Спроектирован по LIVE-дампу dnd.su (стр. демогоргона, обе редакции в DOM).
+Ключевые решения, выведенные из дампа (не из фантазии о PHB):
+(1) поля защиты матчим СТРОГИМ regex с обязательным 'урон*'/'состоян*' после
+    слова защиты -> 'Сопротивление магии.' (без 'урон') НЕ поле, а особенность;
+    хвосты 'урону'/'к урону' отрезаются целиком;
+(2) заголовки разделов ловятся startswith (склеенный get_text() 'ДействияМультиатака');
+(3) continuation особенности НЕ теряется (ветка current=='TRAIT');
+(4) однословные подписи чистятся сдвигом до границы слова.
+Graceful degradation: неизвестная строка -> игнор, неполный источник -> пустые
+поля, никогда исключение (дайджест dnd.su: Arcana Unleashed доливается волнами,
+'в некоторых монстрах пока не добавлены полные описания').
+"""
+import re
+
+ABILITY_VARIANTS = {
+    'str': ['сил', 'стра', 'strength'],
+    'dex': ['лов', 'ловк', 'dexterity'],
+    'con': ['тел', 'телос', 'constitution'],
+    'int': ['инт', 'интелл', 'intelligence'],
+    'wis': ['мдр', 'мудр', 'wisdom'],
+    'cha': ['хар', 'харизм', 'charisma'],
+}
+ABILITY_ORDER = ['str', 'dex', 'con', 'int', 'wis', 'cha']
+ABILITY_LABEL = {'str': 'СИЛ', 'dex': 'ЛОВ', 'con': 'ТЕЛ',
+                 'int': 'ИНТ', 'wis': 'МДР', 'cha': 'ХАР'}
+
+SIZE_WORDS = (r'(?:Крошечный|Малый|Средний|Крупный|Огромный|Огромное|Гигантский|'
+              r'Tiny|Small|Medium|Large|Huge|Gargantuan)')
+
+# Однословные подписи (префикс короче слова -> _cut_prefix сдвигает до границы слова).
+LINE_KEYS = [
+    ('спасброск',        'saves'),
+    ('навык',            'skills'),
+    ('чувств',           'senses'),
+    ('язык',             'languages'),
+    ('опасност',         '__ignore__'),
+    ('бонус мастерства', '__ignore__'),
+    ('proficiency bonus','__ignore__'),
+    ('challenge rating', '__ignore__'),
+]
+
+# ПОЛЯ ЗАЩИТЫ: строгий regex, ТРЕБУЕТ 'урон*'/'состоян*' после слова защиты.
+# Это отличает 'Сопротивления урону огонь' (поле) от 'Сопротивление магии.' (особенность).
+DEFENSE_RE = re.compile(
+    r'^(сопротивления?|уязвимости?|иммунитеты?|иммунитет)\s+(?:к\s+)?(урон\w*|состоян\w*)',
+    re.IGNORECASE)
+
+SECTION_HEADS = ('действия', 'легендарные действия', 'легендарное действие',
+                 'логово', 'местные эффекты', 'культ', 'описание',
+                 'действия логова', 'региональные эффекты', 'boss actions',
+                 'actions', 'lair actions', 'regional effects', 'description')
+
+TRAIT_STOP = ['существо с точно', 'другой книге', 'другой редакц', '(oota)',
+              'господин финик', 'ссылка на аналог', 'вы могли по ошибке',
+              'что вам было нужно', 'и блок статистики', 'работа в этой',
+              'полные описания', 'присутствует и в']
+
+TRAIT_RE = re.compile(r'^([А-ЯЁA-Z][^.]{2,60}?)\.\s+(.*)$')
+BUCKET_FIELDS = ('saves', 'skills', 'senses', 'languages', 'vulnerabilities',
+                 'resistances', 'immunities', 'condition_immunities')
+
+
+def _is_section_heading(line):
+    s = line.lower().lstrip('—–-\u00a0 ').strip()
+    return any(s.startswith(h) for h in SECTION_HEADS)
+
+def _strip_known_prefix(line):
+    """Срезает ведущий заголовок раздела, склеенный get_text() с телом
+    ('ДействияСкимитар' -> 'Скимитар...', 'ДействияМультиатака' -> 'Мультиатака...').
+    Режет по ТОЧНОМУ префиксу из SECTION_HEADS (без isalpha-сдвига, иначе съест
+    имя атаки). Отдельная строка-заголовок -> '' (безвредно для regex-поиска)."""
+    s = line.lstrip('—–-\u00a0 \t')
+    low = s.lower()
+    for h in sorted(SECTION_HEADS, key=len, reverse=True):   # длинные раньше
+        if low.startswith(h):
+            return s[len(h):].lstrip(' :：\t—–-')
+    return line
+
+
+def _cut_prefix(line, pref_len):
+    i, n = pref_len, len(line)
+    while i < n and line[i].isalpha():
+        i += 1
+    return line[i:].strip(' :：\t')
+
+
+def _match_defense_field(low, line):
+    """Поле защиты ИЛИ None. Возвращает (field, rest) только если после слова
+    защиты стоит 'урон*'/'состоян*' -> 'Сопротивление магии.' вернёт None."""
+    m = DEFENSE_RE.match(low)
+    if not m:
+        return None
+    word, unit = m.group(1).lower(), m.group(2).lower()
+    if unit.startswith('состоян'):
+        field = 'condition_immunities'
+    elif word.startswith('сопротивл'):
+        field = 'resistances'
+    elif word.startswith('уязвим'):
+        field = 'vulnerabilities'
+    else:
+        field = 'immunities'
+    return field, line[m.end():].lstrip(' :：\t')
+
+
+def extract_statblock_text(soup):
+    """Справочный блок + особенности АКТИВНОЙ редакции: от первой size-строки
+    до первого заголовка раздела (state-machine сам остановится, но и здесь режем
+    для чистоты ref). Graceful: нет size -> 0."""
+    lines = soup.get_text().split('\n')
+    start = 0
+    for i, ln in enumerate(lines):
+        if re.search(SIZE_WORDS, ln, re.IGNORECASE):
+            start = i
+            break
+    end = len(lines)
+    for i in range(start + 1, len(lines)):
+        if _is_section_heading(lines[i]):
+            end = i
+            break
+    return '\n'.join(lines[start:end])
+
+
+def extract_battle_text(soup):
+    """БОЕВОЙ блок активной редакции: от первого заголовка раздела после size-строки
+    до границы второй редакции (']CODE' или вторая size-строка). Чинит дубль атак
+    (parse_attacks по полному get_text() ловит обе редакции).
+    + режет склейку заголовка с первой атакой на ВСЁМ срезе (фикс 'ДействияСкимитар')."""
+    lines = soup.get_text().split('\n')
+    start1 = 0
+    for i, ln in enumerate(lines):
+        if re.search(SIZE_WORDS, ln, re.IGNORECASE):
+            start1 = i
+            break
+    h1 = -1
+    for i in range(start1 + 1, len(lines)):
+        if _is_section_heading(lines[i]):
+            h1 = i
+            break
+    if h1 == -1:
+        h1 = start1
+    end = len(lines)
+    for i in range(h1 + 1, len(lines)):
+        ln = lines[i]
+        if re.search(r'\]\s*[A-Za-z]{2,6}\s*$', ln) or \
+           (i > h1 and re.search(SIZE_WORDS, ln, re.IGNORECASE) and
+            any(k in ln.lower() for k in ['исчадие','демон','гигант','нежить','дракон',
+                                            'элементаль','зверь','растение','аббераци',
+                                            'конструкц','небесн','монстр','fiend','giant',
+                                            'undead','dragon','elemental','beast','plant',
+                                            'aberration','construct','celestial','monstrosity'])):
+            end = i
+            break
+    # режем склейку заголовка на каждой строке среза (ловит ДействияСкимитар,
+    # Легендарные действияВзор, Действия логова… и т.д. на любом монстре)
+    sliced = [_strip_known_prefix(ln) for ln in lines[h1:end]]
+    return '\n'.join(sliced)
+
+
+def _parse_size_type(lines):
+    if not lines:
+        return None, None
+    m = re.match(r'\s*(' + SIZE_WORDS + r')\s*[^\w\s]{0,3}\s*(.*)$',
+                 lines[0], re.IGNORECASE)
+    if not m:
+        return None, None
+    size = m.group(1).strip()
+    parts = [m.group(2).strip()]
+    for ln in lines[1:]:
+        low = ln.lower()
+        if any(k in low for k in ['класс доспеха','хиты','armor class','hit points',
+                                  'ac ','спасброск','сил','скорост']):
+            break
+        if _is_section_heading(ln):
+            break
+        parts.append(ln.strip())
+    typ = re.sub(r'\s+', ' ', ' '.join(p for p in parts if p)).strip(' ,;.')
+    return size, (typ or None)
+
+
+def parse_ability_line(line):
+    scores, mods = {}, {}
+    for key, variants in ABILITY_VARIANTS.items():
+        vs = sorted((re.escape(v) for v in variants), key=len, reverse=True)
+        pat = re.compile('(?:' + '|'.join(vs) + r')\s*(-?\d+)\s*\(\s*([+-]?\d+)\s*\)',
+                         re.IGNORECASE)
+        m = pat.search(line)
+        if m:
+            scores[key] = int(m.group(1))
+            mods[key] = int(m.group(2))
+    return scores, mods
+
+
+def _parse_kv_list(seg):
+    seg = (seg or '').strip()
+    if not seg:
+        return {}, []
+    parts = [p.strip() for p in re.split(r'[,;]', seg) if p.strip()]
+    pairs, bare = {}, []
+    pair_re = re.compile(r'^(.+?)\s+([+-]\d+)$')
+    for p in parts:
+        m = pair_re.match(p)
+        if m:
+            pairs[m.group(1).strip()] = m.group(2)
+        else:
+            bare.append(p)
+    return pairs, bare
+
+
+def _flush_trait(tb):
+    return {'name': tb['name'],
+            'desc': re.sub(r'\s+', ' ', ' '.join(tb['parts'])).strip()}
+
+
+def parse_characteristics(soup, text):
+    """Точка входа. text = extract_statblock_text(soup). НИКОГДА не бросает."""
+    out = {'ability_scores': {}, 'ability_mods': {}, 'saves': {}, 'skills': {},
+           'senses': {}, 'vulnerabilities': [], 'resistances': [], 'immunities': [],
+           'condition_immunities': [], 'languages': [], 'cr': None,
+           'prof_bonus': None, 'size': None, 'type': None, 'traits': []}
+    try:
+        lines = [ln.strip() for ln in text.split('\n') if ln.strip()]
+        if not lines:
+            return out
+
+        out['size'], out['type'] = _parse_size_type(lines)
+        for ln in lines:
+            if re.search(r'СИЛ\s*-?\d+\s*\(', ln, re.IGNORECASE):
+                out['ability_scores'], out['ability_mods'] = parse_ability_line(ln)
+                break
+
+        joined = '\n'.join(lines)
+        cr_m = re.search(r'(?:CR|Опасност[ьи]|Challenge)\D{0,8}?(\d+(?:/\d+)?)', joined, re.I)
+        if cr_m:
+            out['cr'] = cr_m.group(1)
+        pb_m = re.search(r'(?:бонус мастерства|Proficiency Bonus)\D{0,4}?([+-]\d+)', joined, re.I)
+        if pb_m:
+            out['prof_bonus'] = pb_m.group(1)
+
+        buckets = {f: [] for f in BUCKET_FIELDS}
+        current, trait_buf = None, None
+
+        def close_trait():
+            nonlocal trait_buf
+            if trait_buf:
+                out['traits'].append(_flush_trait(trait_buf))
+                trait_buf = None
+
+        for ln in lines:
+            low = ln.lower()
+            if _is_section_heading(ln):                       # 1) конец блока
+                close_trait(); break
+            df = _match_defense_field(low, ln)                # 2) поле защиты (строго)
+            if df:
+                close_trait(); current = df[0]
+                if df[1]:
+                    buckets[current].append(df[1])
+                continue
+            lk = None                                         # 3) однословный ключ
+            for pref, field in LINE_KEYS:
+                if low.startswith(pref):
+                    lk = (field, _cut_prefix(ln, len(pref))); break
+            if lk:
+                close_trait(); current = lk[0]
+                if current in buckets and lk[1]:
+                    buckets[current].append(lk[1])
+                continue
+            if any(s in low for s in TRAIT_STOP):             # 4) сноска
+                close_trait(); current = None; continue
+            tm = TRAIT_RE.match(ln)                           # 5) новая особенность
+            if tm:
+                close_trait(); current = 'TRAIT'
+                trait_buf = {'name': tm.group(1).strip(' *'), 'parts': [tm.group(2).strip()]}
+                continue
+            if current in buckets:                            # 6) continuation поля
+                buckets[current].append(ln); continue
+            if current == 'TRAIT' and trait_buf:              # 7) continuation особенности
+                trait_buf['parts'].append(ln); continue
+            current = None                                    # 8) служебное
+
+        close_trait()
+
+        for field in ('saves', 'skills'):
+            p, _ = _parse_kv_list(', '.join(buckets[field])); out[field] = p
+        p, b = _parse_kv_list(', '.join(buckets['senses']))
+        out['senses'] = p if p else {x: '' for x in b}
+        for field in ('languages', 'vulnerabilities', 'resistances',
+                      'immunities', 'condition_immunities'):
+            _, bare = _parse_kv_list(', '.join(buckets[field])); out[field] = bare
+    except Exception:
+        pass
+    return out
+
+
+==================== theme_manager.py ====================
+
+import json
+import os
+import tkinter as tk
+from tkinter import ttk
+from ui_components import RoundedButton, EditableLabel
+
+THEME_FILE = os.path.join('battle_settings', 'theme.json')
+
+THEMES = {
+    'dark': {   # Тёмная тема
+        'bg': '#36393f',
+        'bg_secondary': '#2f3136',
+        'field_bg': '#40444b',
+        'fg': '#dcddde',
+        'fg_muted': '#96989d',
+        'accent': '#5865f2',
+        'button_bg': '#40444b',
+        'button_fg': '#dcddde',
+        'border': '#202225',
+        'canvas_map': '#2b2d31',
+        'canvas_grid': '#383b40',
+        'canvas_reach': '#3a463a',
+        'icon': '🌙',
+        'hover': '#40444b',
+    },
+    'light': {  # Светлая тема: тёплый пергамент
+        'bg': '#f2ede3',
+        'bg_secondary': '#e8e1d3',
+        'field_bg': '#faf7f0',
+        'fg': '#33302a',
+        'fg_muted': '#8a8177',
+        'accent': '#a8763e',
+        'button_bg': '#e3dbc9',
+        'button_fg': '#33302a',
+        'border': '#d5cbb8',
+        'canvas_map': '#e6dfcd',
+        'canvas_grid': '#cfc4aa',
+        'canvas_reach': '#cddcae',
+        'icon': '☀️',
+        'hover': '#ddd2bc',
+    },
+}
+
+
+def current_palette(obj):
+    """Палитра текущей темы для любого объекта, у которого есть theme_manager"""
+    tm = getattr(obj, 'theme_manager', None)
+    return THEMES.get(getattr(tm, 'current', 'dark'))
+
+
+class ThemeManager:
+    """Применяет палитру ко всем ttk-виджетам через Style"""
+
+    def __init__(self, root):
+        self.root = root
+        self.style = ttk.Style(root)
+        try:
+            self.style.theme_use('clam')  # clam умеет перекрашиваться целиком
+        except tk.TclError:
+            pass
+        self.current = self._load_saved() or 'dark'
+
+    def _load_saved(self):
+        try:
+            with open(THEME_FILE, 'r', encoding='utf-8') as f:
+                return json.load(f).get('theme')
+        except Exception:
+            return None
+
+    def save(self):
+        try:
+            os.makedirs('battle_settings', exist_ok=True)
+            with open(THEME_FILE, 'w', encoding='utf-8') as f:
+                json.dump({'theme': self.current}, f)
+        except Exception:
+            pass
+
+    def palette(self):
+        return THEMES[self.current]
+
+    def apply(self, theme_name=None):
+        if theme_name in THEMES:
+            self.current = theme_name
+        p = self.palette()
+        s = self.style
+        self.root.configure(bg=p['bg'])
+
+        s.configure('.', background=p['bg'], foreground=p['fg'],
+                    fieldbackground=p['field_bg'], bordercolor=p['border'],
+                    lightcolor=p['border'], darkcolor=p['border'],
+                    troughcolor=p['bg_secondary'],
+                    selectbackground=p['accent'], selectforeground='#ffffff')
+        s.configure('TFrame', background=p['bg'])
+        s.configure('TLabel', background=p['bg'], foreground=p['fg'])
+        s.configure('TLabelframe', background=p['bg'], bordercolor=p['border'])
+        s.configure('TLabelframe.Label', background=p['bg'], foreground=p['fg'])
+        s.configure('TButton', background=p['button_bg'], foreground=p['button_fg'],
+                    bordercolor=p['border'], padding=(8, 4))
+        s.map('TButton',
+              background=[('active', p['accent']), ('pressed', p['accent'])],
+              foreground=[('active', '#ffffff')])
+        s.configure('TEntry', fieldbackground=p['field_bg'], foreground=p['fg'],
+                    insertcolor=p['fg'], bordercolor=p['border'])
+        s.configure('TCombobox', fieldbackground=p['field_bg'], foreground=p['fg'],
+                    bordercolor=p['border'], arrowcolor=p['fg_muted'])
+        s.map('TCombobox',
+              fieldbackground=[('readonly', p['button_bg'])],
+              foreground=[('readonly', p['button_fg'])])
+        s.configure('TSpinbox', fieldbackground=p['field_bg'], foreground=p['fg'],
+                    bordercolor=p['border'], arrowcolor=p['fg'])
+        s.configure('TCheckbutton', background=p['bg'], foreground=p['fg'])
+        s.map('TCheckbutton', background=[('active', p['bg'])])
+        s.configure('TRadiobutton', background=p['bg'], foreground=p['fg'])
+        s.map('TNotebook.Tab',
+              background=[('selected', p['bg'])],
+              foreground=[('selected', p['accent'])])
+        for orient in ('Vertical', 'Horizontal'):
+            s.configure(f'{orient}.Scrollbar', background=p['button_bg'],
+                        troughcolor=p['bg_secondary'], bordercolor=p['border'],
+                        arrowcolor=p['fg'])
+            s.map(f'{orient}.Scrollbar', background=[('active', p['accent'])])
+
+        # Дефолты для "голых" Tk-виджетов, которые создадутся ПОСЛЕ применения
+        self.root.option_add('*Canvas.background', p['bg'])
+        self.root.option_add('*Canvas.highlightThickness', 0)
+        self.root.option_add('*Listbox.background', p['field_bg'])
+        self.root.option_add('*Listbox.foreground', p['fg'])
+        self.root.option_add('*Listbox.selectBackground', p['accent'])
+        self.root.option_add('*Listbox.selectForeground', '#ffffff')
+        self.root.option_add('*Text.background', p['field_bg'])
+        self.root.option_add('*Text.foreground', p['fg'])
+        self.root.option_add('*Text.insertBackground', p['fg'])
+        self.root.option_add('*TCombobox*Listbox.background', p['field_bg'])
+        self.root.option_add('*TCombobox*Listbox.foreground', p['fg'])
+        self.root.option_add('*TCombobox*Listbox.selectBackground', p['accent'])
+        self.root.option_add('*TCombobox*Listbox.selectForeground', '#ffffff')
+
+
+class ThemeUI:
+    """Кнопка-переключатель темы"""
+
+    def __init__(self):
+        self.theme_btn = None
+
+    def setup_theme_button(self, master):
+        p = self.theme_manager.palette()
+        self.theme_btn = RoundedButton(
+            master, command=self.toggle_theme, palette=p,
+            width=42, height=34, radius=10,
+            icon='moon' if self.theme_manager.current == 'dark' else 'sun')
+        self.theme_btn.pack(side='right', padx=10)
+
+    def toggle_theme(self):
+        new = 'light' if self.theme_manager.current == 'dark' else 'dark'
+        self.theme_manager.apply(new)
+        self.theme_manager.save()
+        self.theme_btn.set_icon('moon' if new == 'dark' else 'sun')
+        self._retint_all(self.root)
+        if getattr(self, 'battle_map', None) and getattr(self, 'map_canvas', None):
+            self.draw_map()
+
+    def _retint_all(self, widget):
+        """Рекурсивно перекрашивает голые Tk-виджеты и закруглённые кнопки"""
+        p = self.theme_manager.palette()
+        for w in widget.winfo_children():
+            cls = w.winfo_class()
+            try:
+                if w is getattr(self, 'sub_bar', None):
+                    w.configure(bg=p['bg_secondary'])
+                elif w is getattr(self, 'sub_sep', None):
+                    w.configure(bg=p['border'])
+                elif w is getattr(self, 'sub_caption', None):
+                    w.configure(bg=p['bg_secondary'], fg=p['fg_muted'])
+                if isinstance(w, EditableLabel):
+                    w.apply_palette(p)
+                elif isinstance(w, RoundedButton):
+                    w.apply_palette(p)
+                elif cls == 'Canvas':
+                    if w is getattr(self, 'map_canvas', None):
+                        w.configure(bg=p['canvas_map'], highlightbackground=p['border'])
+                    else:
+                        w.configure(bg=p['bg'])
+                elif cls == 'Text':
+                    w.configure(bg=p['field_bg'], fg=p['fg'],
+                                insertbackground=p['fg'], selectbackground=p['accent'])
+                elif cls == 'Listbox':
+                    w.configure(bg=p['field_bg'], fg=p['fg'],
+                                selectbackground=p['accent'],
+                                highlightbackground=p['border'])
+                elif cls == 'Button' and not isinstance(w, ttk.Button):
+                    w.configure(bg=p['button_bg'], fg=p['button_fg'],
+                                activebackground=p['accent'], activeforeground='#ffffff')
+                elif cls == 'Frame' and not isinstance(w, ttk.Frame):
+                    w.configure(bg=p['bg'])
+                elif cls == 'Label' and not isinstance(w, ttk.Label):
+                    w.configure(bg=p['bg'], fg=p['fg'])
+            except tk.TclError:
+                pass
+            self._retint_all(w)
+
+
+==================== ui_components.py ====================
+
+import tkinter as tk
+from tkinter import ttk
+import math
+
+class ScrollableFrame(ttk.Frame):
+    """Прокручиваемый фрейм: контент растянут на всю ширину canvas"""
+
+    def __init__(self, container, *args, **kwargs):
+        super().__init__(container, *args, **kwargs)
+        self.canvas = tk.Canvas(self)
+        scrollbar = ttk.Scrollbar(self, orient="vertical", command=self.canvas.yview)
+        self.scrollable_frame = ttk.Frame(self.canvas)
+
+        self.scrollable_frame.bind(
+            "<Configure>",
+            lambda e: self.canvas.configure(scrollregion=self.canvas.bbox("all"))
+        )
+
+        # Запоминаем id окна, чтобы управлять его шириной!
+        self.window_id = self.canvas.create_window((0, 0), window=self.scrollable_frame, anchor="nw")
+        self.canvas.configure(yscrollcommand=scrollbar.set)
+
+        # ГЛАВНАЯ МАГИЯ: при изменении размера canvas растягиваем контент на всю ширину
+        self.canvas.bind('<Configure>', self._on_canvas_configure)
+
+        # Привязка прокрутки колесом мыши
+        self.canvas.bind("<MouseWheel>", self._on_mousewheel)
+        self.scrollable_frame.bind("<MouseWheel>", self._on_mousewheel)
+
+        self.canvas.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+
+    def _on_canvas_configure(self, event):
+        """Контент всегда шириной с видимую область canvas"""
+        self.canvas.itemconfigure(self.window_id, width=event.width)
+
+    def _on_mousewheel(self, event):
+        """Обработчик прокрутки колесом мыши"""
+        self.canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+
+class EditableLabel(ttk.Frame):
+    """Заголовок, который становится полем ввода по клику.
+    Label и Entry привязаны к одному StringVar"""
+
+    def __init__(self, master, textvariable, palette=None,
+                 font=('Segoe UI', 10, 'bold')):
+        super().__init__(master)
+        self.var = textvariable
+        self.palette = palette or {}
+        self.font = font
+        self._hover = False
+
+        # Label = обычный вид заголовка
+        self.label = ttk.Label(self, textvariable=self.var, font=font, cursor='hand2')
+        self.label.pack(anchor='w')
+        self.label.bind('<Button-1>', self._start_edit)
+        self.label.bind('<Enter>', self._on_enter)
+        self.label.bind('<Leave>', self._on_leave)
+
+        # Entry = режим редактирования (скрыт до клика)
+        self.entry = ttk.Entry(self, textvariable=self.var, font=font, width=18)
+        self.entry.bind('<Return>', self._stop_edit)        # Enter = сохранить
+        self.entry.bind('<KP_Enter>', self._stop_edit)
+        self.entry.bind('<FocusOut>', self._stop_edit)      # клик мимо = сохранить
+        self.entry.bind('<Escape>', lambda e: self._stop_edit())
+
+        self._apply_colors()
+
+    # переключение режимов
+    def _start_edit(self, event=None):
+        self.label.pack_forget()
+        self.entry.pack(anchor='w', fill='x')
+        self.entry.focus_set()
+        self.entry.select_range(0, 'end')   #
+
+    def _stop_edit(self, event=None):
+        self.entry.pack_forget()
+        self.label.pack(anchor='w')
+        self._apply_colors()                # вернуть заголовку обычный цвет
+
+    def _on_enter(self, event=None):
+        self._hover = True
+        self.label.configure(foreground=self.palette.get('accent', '#5865f2'))
+
+    def _on_leave(self, event=None):
+        self._hover = False
+        self.label.configure(foreground=self.palette.get('fg', '#000000'))
+
+    def _apply_colors(self):
+        fg = self.palette.get('accent' if self._hover else 'fg', '#000000')
+        self.label.configure(foreground=fg, background=self.palette.get('bg', '#ffffff'))
+        self.entry.configure(background=self.palette.get('field_bg', '#ffffff'))
+
+    def apply_palette(self, palette):
+        """Перекраска под новую тему (вызывается из _retint_all)"""
+        self.palette = palette
+        self._apply_colors()
+
+def fit_window_to_screen(window, desired_width, desired_height):
+    """Устанавливает размер окна, не превышающий экран, и центрирует его"""
+    window.update_idletasks()
+    screen_w = window.winfo_screenwidth()
+    screen_h = window.winfo_screenheight()
+
+    # Оставляем поля для панели задач и рамок окна
+    max_w = max(400, screen_w - 60)
+    max_h = max(300, screen_h - 100)
+
+    w = min(desired_width, max_w)
+    h = min(desired_height, max_h)
+
+    x = max(0, (screen_w - w) // 2)
+    y = max(0, (screen_h - h) // 2)
+
+    window.geometry(f"{w}x{h}+{x}+{y}")
+
+class RoundedButton(tk.Canvas):
+    """Закруглённая кнопка: hover-подсветка, тема, иконки, контурный режим"""
+
+    def __init__(self, master, text='', command=None, palette=None,
+                 width=150, height=34, radius=12, font=('Segoe UI', 10, 'bold'),
+                 icon=None, outline=False, surface_key=None):
+        super().__init__(master, width=width, height=height,
+                         highlightthickness=0, bd=0, cursor='hand2')
+        self.text = text
+        self.icon = icon
+        self.command = command
+        self.width = width
+        self.height = height
+        self.radius = radius
+        self.font = font
+        self.palette = palette or {}
+        self.outline = outline          # контурный стиль для второстепенных кнопок
+        self.surface_key = surface_key  # ключ палитры поверхности, на которой лежит кнопка
+        self.hover = False
+        self.active = False
+        self.bind('<Enter>', self._on_enter)
+        self.bind('<Leave>', self._on_leave)
+        self.bind('<Button-1>', self._on_click)
+        self.redraw()
+
+    def apply_palette(self, palette):
+        self.palette = palette
+        self.redraw()
+
+    def set_active(self, state):
+        self.active = state
+        self.redraw()
+
+    def set_text(self, text):
+        self.text = text
+        self.redraw()
+
+    def set_icon(self, icon):
+        self.icon = icon
+        self.redraw()
+
+    def _on_enter(self, e):
+        self.hover = True
+        self.redraw()
+
+    def _on_leave(self, e):
+        self.hover = False
+        self.redraw()
+
+    def _on_click(self, e):
+        if self.command:
+            self.command()
+
+    def _base(self):
+        """Цвет поверхности под кнопкой (фон панели)"""
+        if self.surface_key:
+            return self.palette.get(self.surface_key, self.palette.get('bg', '#ffffff'))
+        return self.palette.get('bg', '#ffffff')
+
+    def _colors(self):
+        p = self.palette
+        if self.active:
+            return p.get('accent', '#5865f2'), '#ffffff'
+        if self.hover:
+            return p.get('hover', p.get('button_bg', '#cccccc')), p.get('fg', '#000000')
+        if self.outline:
+            return self._base(), p.get('fg_muted', p.get('fg', '#000000'))
+        return p.get('bg_secondary', '#eeeeee'), p.get('fg', '#000000')
+
+    def _round_shape(self, x0, y0, x1, y1, r, fill):
+        self.create_rectangle(x0 + r, y0, x1 - r, y1, fill=fill, outline='')
+        self.create_rectangle(x0, y0 + r, x1, y1 - r, fill=fill, outline='')
+        self.create_oval(x0, y0, x0 + 2 * r, y0 + 2 * r, fill=fill, outline='')
+        self.create_oval(x1 - 2 * r, y0, x1, y0 + 2 * r, fill=fill, outline='')
+        self.create_oval(x0, y1 - 2 * r, x0 + 2 * r, y1, fill=fill, outline='')
+        self.create_oval(x1 - 2 * r, y1 - 2 * r, x1, y1, fill=fill, outline='')
+
+    def redraw(self):
+        self.delete('all')
+        self.configure(bg=self._base())
+        fill, fg = self._colors()
+        x0, y0, x1, y1 = 1, 1, self.width - 1, self.height - 1
+        r = min(self.radius, (min(self.width, self.height) - 2) / 2)
+        if self.outline:
+            # Контурная кнопка: рамочка + прозрачное тело, сливающееся с панелью
+            ring = (self.palette.get('accent', '#5865f2') if (self.hover or self.active)
+                    else self.palette.get('border', '#999999'))
+            self._round_shape(x0, y0, x1, y1, r, ring)
+            self._round_shape(x0 + 1.5, y0 + 1.5, x1 - 1.5, y1 - 1.5, max(1, r - 2), fill)
+        else:
+            self._round_shape(x0, y0, x1, y1, r, fill)
+        if self.icon:
+            self._draw_icon(fill)
+        elif self.text:
+            self.create_text(self.width / 2, self.height / 2, text=self.text,
+                             fill=fg, font=self.font)
+
+    def _draw_icon(self, fill):
+        """Рисует солнце, луну или плюс строго по центру"""
+        import math
+        p = self.palette
+        cx, cy = self.width / 2, self.height / 2
+        r = min(self.width, self.height) / 2 - 8
+        if self.icon == 'moon':
+            color = p.get('icon_moon', '#f5d76e')
+            self.create_oval(cx - r, cy - r, cx + r, cy + r, fill=color, outline='')
+            self.create_oval(cx - r + r * 0.7, cy - r - r * 0.35,
+                             cx + r + r * 0.7, cy + r - r * 0.35, fill=fill, outline='')
+        elif self.icon == 'sun':
+            color = p.get('icon_sun', '#e8a33d')
+            core = r * 0.55
+            self.create_oval(cx - core, cy - core, cx + core, cy + core, fill=color, outline='')
+            for i in range(8):
+                ang = i * math.pi / 4
+                self.create_line(cx + math.cos(ang) * r * 0.75, cy + math.sin(ang) * r * 0.75,
+                                 cx + math.cos(ang) * r, cy + math.sin(ang) * r,
+                                 fill=color, width=2)
+        elif self.icon == 'plus':
+            # Плюс в кружочке: при наведении всё вспыхивает акцентом!
+            color = (p.get('accent', '#5865f2') if (self.hover or self.active)
+                     else p.get('fg_muted', '#888888'))
+            rr = min(self.width, self.height) / 2 - 7
+            self.create_oval(cx - rr, cy - rr, cx + rr, cy + rr,
+                             outline=color, width=2, fill='')
+            arm = rr * 0.55
+            self.create_line(cx - arm, cy, cx + arm, cy, fill=color, width=2)
+            self.create_line(cx, cy - arm, cx, cy + arm, fill=color, width=2)
+

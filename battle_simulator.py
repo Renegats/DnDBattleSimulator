@@ -4,11 +4,13 @@ from entities import Attack, Enemy
 from ui_components import ScrollableFrame, fit_window_to_screen, EditableLabel
 from battle_ui import BattleUI
 from battle_logic import BattleLogic
+from decision_engine import DecisionEngine
 from alliance_ui import AllianceUI
 from settings_ui import SettingsUI
 from factory import EnemyFactory
 from battle_strategies import AggressiveStrategy, DefensiveStrategy, RandomStrategy, SupportStrategy
-from battle_map import BattleMapUI, BattleMap
+from battle_map import BattleMapUI
+from battle_map_model import BattleMap
 from theme_manager import ThemeManager, ThemeUI
 from side_creator import SideCreatorDialog
 
@@ -16,9 +18,11 @@ from side_creator import SideCreatorDialog
 class BattleSimulator(BattleUI, BattleLogic, AllianceUI, SettingsUI, BattleMapUI, ThemeUI):
     MAX_SIDES = 26
     """Основной класс симулятора битв"""
+
     def __init__(self, root):
-        BattleUI.__init__(self)
-        BattleLogic.__init__(self)
+        engine = DecisionEngine()
+        BattleUI.__init__(self, engine)
+        BattleLogic.__init__(self, engine)
         AllianceUI.__init__(self)
         SettingsUI.__init__(self)
         BattleMapUI.__init__(self)

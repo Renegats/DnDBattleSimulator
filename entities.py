@@ -1,15 +1,17 @@
 import random
 from typing import List, Tuple
+
 from observer import Subject
 from battle_strategies import BattleStrategy, RandomStrategy
 
 
 class Attack:
-    """Класс для представления атаки существа"""
+    """Атака существа. magical=True — оружие считается магическим и пробивает
+    иммунитеты вида «дробящий от немагического оружия» (RAW: Magic Weapons)."""
 
     def __init__(self, name: str, attack_bonus: int, damage_dice_count: int,
                  damage_dice_type: str, damage_modifier: int, damage_type: str = "",
-                 range_ft: int = 5):
+                 range_ft: int = 5, magical: bool = False):
         self.name = name
         self.attack_bonus = attack_bonus
         self.damage_dice_count = damage_dice_count
@@ -17,9 +19,9 @@ class Attack:
         self.damage_modifier = damage_modifier
         self.damage_type = damage_type
         self.range_ft = range_ft
+        self.magical = bool(magical)
 
     def to_dict(self):
-        """Преобразует объект атаки в словарь для сохранения"""
         return {
             'name': self.name,
             'attack_bonus': self.attack_bonus,
@@ -28,11 +30,11 @@ class Attack:
             'damage_modifier': self.damage_modifier,
             'damage_type': self.damage_type,
             'range_ft': self.range_ft,
+            'magical': self.magical,
         }
 
     @classmethod
     def from_dict(cls, data):
-        """Создает объект атаки из словаря"""
         return cls(
             data['name'],
             data['attack_bonus'],
@@ -40,15 +42,16 @@ class Attack:
             data['damage_dice_type'],
             data['damage_modifier'],
             data.get('damage_type', ''),
-            data.get('range_ft', 5)
+            data.get('range_ft', 5),
+            data.get('magical', False),
         )
 
 
 class Enemy(Subject):
-    """Класс для представления врага/существа в битве"""
+    """Существо в битве. rng — внедряемая зависимость (DI): None => модульный random."""
 
     def __init__(self, name: str, hp: int, ac: int, attacks: List[Attack], side: int,
-                 regen=0, speed=30):
+                 regen=0, speed=30, rng=None):
         super().__init__()
         self.name = name
         self.max_hp = hp
@@ -60,119 +63,95 @@ class Enemy(Subject):
         self.ignore_sides = set()
         self.strategy: BattleStrategy = RandomStrategy()
         self.regen = regen
-        self.speed = speed          # скорость в футах (5 фт = 1 клетка)
-        self.pos = None             # позиция на карте (x, y) или None
-        self.moved_ft = 0           # потрачено футов перемещения за раунд
-        self.multiattack = None     # список ударов [{'attack': имя, 'count': n}] или None
-        self.ability_scores = {}      # {'str':8,'dex':14,...}
-        self.ability_mods = {}        # {'str':-1,'dex':2,...}
-        self.saves = {}               # {'Лов':'+3', ...}
-        self.skills = {}              # {'Скрытность':'+4', ...}
-        self.senses = {}              # {'Тёмное зрение':'60', ...}
-        self.vulnerabilities = []     # ['огонь', ...]
+        self.speed = speed
+        self.pos = None
+        self.moved_ft = 0
+        self.multiattack = None
+        self.ability_scores = {}
+        self.ability_mods = {}
+        self.saves = {}
+        self.skills = {}
+        self.senses = {}
+        self.vulnerabilities = []
         self.resistances = []
         self.immunities = []
         self.condition_immunities = []
         self.languages = []
-        self.cr = None                # строкой: '1/4', '5', '—'
+        self.cr = None
         self.prof_bonus = None
         self.size = None
         self.type = None
-        self.traits = []              # [{'name':..,'desc':..}]
+        self.traits = []
+        self._rng = rng if rng is not None else random
 
     def take_damage(self, damage: int):
-        """Нанесение урона врага"""
-        actual_damage = max(0, damage)  # Урон не может быть отрицательным
+        actual_damage = max(0, damage)
         previous_hp = self.hp
         self.hp -= actual_damage
         if self.hp <= 0:
             self.alive = False
             self.hp = 0
-            self.notify()           # Оповещаем наблюдателей об изменении состояния
+            self.notify()
             return False
         elif self.hp != previous_hp:
-            self.notify()           # Оповещаем наблюдателей об изменении состояния
-
+            self.notify()
         return self.alive
 
     def perform_attack(self, attack: Attack, target_ac: int) -> Tuple[bool, int, int, bool, str]:
-        attack_roll = random.randint(1, 20)
+        attack_roll = self._rng.randint(1, 20)
         total_attack = attack_roll + attack.attack_bonus
-        critical = (attack_roll == 20)  # Критическое попадание при 20
+        critical = (attack_roll == 20)
         hit = total_attack >= target_ac or critical
         damage_info = ""
         if hit:
-            # Расчет урона
             dice_type = int(attack.damage_dice_type.split('d')[1])
-            damage = sum(random.randint(1, dice_type) for _ in range(attack.damage_dice_count)) + attack.damage_modifier
-            # Удвоение урона при критическом попадании
+            damage = sum(self._rng.randint(1, dice_type)
+                         for _ in range(attack.damage_dice_count)) + attack.damage_modifier
             if critical:
                 damage *= 2
-            damage = max(0, damage)  # Урон не может быть отрицательным
+            damage = max(0, damage)
             damage_info = f"{damage} урона"
             if attack.damage_type:
                 damage_info += f" ({attack.damage_type})"
+            if getattr(attack, 'magical', False):
+                damage_info += " ✦маг."
             return True, damage, total_attack, critical, damage_info
         return False, 0, total_attack, critical, damage_info
 
     def regenerate(self):
-        """Регенерация здоровья в конце раунда"""
         if self.alive and self.regen > 0:
             prev_hp = self.hp
             self.hp = min(self.max_hp, self.hp + self.regen)
             if self.hp != prev_hp:
-                self.notify()       # Оповещаем об изменении здоровья
+                self.notify()
 
     def to_dict(self):
-        """Преобразует объект врага в словарь для сохранения"""
         return {
-            'name': self.name,
-            'max_hp': self.max_hp,
-            'hp': self.hp,
-            'ac': self.ac,
-            'attacks': [attack.to_dict() for attack in self.attacks],
-            'side': self.side,
-            'alive': self.alive,
+            'name': self.name, 'max_hp': self.max_hp, 'hp': self.hp, 'ac': self.ac,
+            'attacks': [a.to_dict() for a in self.attacks],
+            'side': self.side, 'alive': self.alive,
             'ignore_sides': list(self.ignore_sides),
             'strategy_type': self.strategy.__class__.__name__,
-            'regen': self.regen,
-            'speed': self.speed,
-            'pos': self.pos,
+            'regen': self.regen, 'speed': self.speed, 'pos': self.pos,
             'multiattack': self.multiattack,
-            'ability_scores': self.ability_scores,
-            'ability_mods': self.ability_mods,
-            'saves': self.saves,
-            'skills': self.skills,
-            'senses': self.senses,
-            'vulnerabilities': self.vulnerabilities,
-            'resistances': self.resistances,
-            'immunities': self.immunities,
-            'condition_immunities': self.condition_immunities,
-            'languages': self.languages,
-            'cr': self.cr,
-            'prof_bonus': self.prof_bonus,
-            'size': self.size,
-            'type': self.type,
-            'traits': self.traits,
+            'ability_scores': self.ability_scores, 'ability_mods': self.ability_mods,
+            'saves': self.saves, 'skills': self.skills, 'senses': self.senses,
+            'vulnerabilities': self.vulnerabilities, 'resistances': self.resistances,
+            'immunities': self.immunities, 'condition_immunities': self.condition_immunities,
+            'languages': self.languages, 'cr': self.cr, 'prof_bonus': self.prof_bonus,
+            'size': self.size, 'type': self.type, 'traits': self.traits,
         }
 
     @classmethod
     def from_dict(cls, data):
-        """Создает объект врага из словаря"""
-        enemy = cls(
-            data['name'],
-            data['max_hp'],
-            data['ac'],
-            [Attack.from_dict(attack_data) for attack_data in data['attacks']],
-            data['side'],
-            data.get('regen', 0)
-        )
+        enemy = cls(data['name'], data['max_hp'], data['ac'],
+                    [Attack.from_dict(a) for a in data['attacks']],
+                    data['side'], data.get('regen', 0))
         enemy.hp = data['hp']
         enemy.alive = data['alive']
         enemy.ignore_sides = set(data['ignore_sides'])
         enemy.speed = data.get('speed', 30)
-        enemy.pos = data.get('pos')             # восстанавливаем позицию на карте
-        enemy.multiattack = data.get('multiattack')
+        enemy.pos = data.get('pos')
         enemy.multiattack = data.get('multiattack')
         enemy.ability_scores = dict(data.get('ability_scores') or {})
         enemy.ability_mods = dict(data.get('ability_mods') or {})
@@ -190,16 +169,12 @@ class Enemy(Subject):
         enemy.type = data.get('type')
         enemy.traits = [dict(tr) for tr in (data.get('traits') or [])]
 
-        # Восстановление стратегии из сохранения
         strategy_type = data.get('strategy_type', 'RandomStrategy')
-        from battle_strategies import AggressiveStrategy, DefensiveStrategy, RandomStrategy, SupportStrategy
-        if strategy_type == 'AggressiveStrategy':
-            enemy.strategy = AggressiveStrategy()
-        elif strategy_type == 'DefensiveStrategy':
-            enemy.strategy = DefensiveStrategy()
-        elif strategy_type == 'SupportStrategy':
-            enemy.strategy = SupportStrategy()
-        else:
-            enemy.strategy = RandomStrategy()
-
+        from battle_strategies import (AggressiveStrategy, DefensiveStrategy,
+                                       RandomStrategy, SupportStrategy)
+        enemy.strategy = {
+            'AggressiveStrategy': AggressiveStrategy,
+            'DefensiveStrategy': DefensiveStrategy,
+            'SupportStrategy': SupportStrategy,
+        }.get(strategy_type, RandomStrategy)()
         return enemy

@@ -3,17 +3,15 @@ import tkinter as tk
 from tkinter import ttk, messagebox
 from entities import Enemy
 from battle_strategies import BattleStrategy, RandomStrategy, AggressiveStrategy, DefensiveStrategy, SupportStrategy
-from decision_engine import DecisionEngine, dmg_canon
-
-ENGINE = DecisionEngine()
+from combat_core import resolve_strikes, strike_reach, execute_strikes
 
 
 class BattleLogic:
     """Класс для управления логикой битвы"""
 
-    def __init__(self):
-        """Инициализация логики битвы"""
-        pass
+    def __init__(self, engine):
+        """Инициализация логики битвы."""
+        self.engine = engine
 
     def _run_round_inner(self):
         """Проведение одного раунда битвы"""
@@ -22,7 +20,7 @@ class BattleLogic:
             return
 
         battle_log = "=== НОВЫЙ РАУНД БОЯ ===\n"
-        ENGINE.begin_round()   # сброс журнала объяснений на новый раунд (СПР-анализ)
+        self.engine.begin_round()  # сброс журнала объяснений на новый раунд (СПР-анализ)
 
         # Новый раунд - все очки движения восстанавливаются
         for side_enemies in self.sides:
@@ -41,8 +39,8 @@ class BattleLogic:
             alive_attackers = [e for e in side_enemies if e.alive]
             for attacker in alive_attackers:
                 # ===== v1 ИИ: мозг решает цель/атаку/намерение движения =====
-                decision = ENGINE.decide(attacker, self.sides,
-                                         self.ignore_sides.get(attacker_side_idx, set()))
+                decision = self.engine.decide(attacker, self.sides,
+                                              self.ignore_sides.get(attacker_side_idx, set()))
                 target = decision.target
                 if not target:
                     battle_log += f"{attacker.name} - нет подходящих целей для атаки\n"
@@ -52,11 +50,11 @@ class BattleLogic:
 
                 if decision.attack is None:
                     # делегат (tier0/1) или мультиатака - старый путь развёртки
-                    strikes = self._resolve_strikes(attacker, target)
+                    strikes = resolve_strikes(attacker, target)
                     if not strikes:
                         battle_log += f"{attacker.name} - нет доступных атак\n"
                         continue
-                    reach = self._strike_reach(attacker, strikes)
+                    reach = strike_reach(strikes)
                 else:
                     # smart-одиночная (tier>=2): атака уже выбрана с учётом защиты/дальности
                     strikes = [decision.attack]
@@ -80,12 +78,14 @@ class BattleLogic:
                     # переспрашивал стратегию по новой дистанции - сохраняем ноль регрессии.
                     if decision.attack is None and decision.tier <= 1 \
                             and not getattr(attacker, 'multiattack', None):
-                        strikes = self._resolve_strikes(attacker, target)
+                        strikes = resolve_strikes(attacker, target)
                         if not strikes:
                             continue
 
                 # ===== Выполнение ударов =====
-                lines, _killed = self.execute_strikes(attacker, target, strikes)
+                lines, _killed = execute_strikes(attacker, target, strikes,
+                                                 self.sides, self.ignore_sides,
+                                                 getattr(self, 'battle_map', None))
                 for ln in lines:
                     battle_log += ln + "\n"
 
@@ -131,108 +131,3 @@ class BattleLogic:
             self.update_battle_ui()
             if getattr(self, 'battle_map', None):
                 self.draw_map()
-
-    def _resolve_strikes(self, attacker, target):
-        if getattr(attacker, 'multiattack', None):
-            by_name = {a.name: a for a in attacker.attacks}
-            strikes = []
-            for s in attacker.multiattack:
-                atk = by_name.get(s['attack'])
-                if atk is None:
-                    continue                      # имя не распознано парсером - тихо пропускаем
-                strikes.extend([atk] * max(1, int(s.get('count', 1))))
-            if strikes:
-                return strikes
-        # нет мультиатаки (или она пустая) - одна атака по стратегии
-        a = attacker.strategy.select_attack(attacker, target)
-        return [a] if a else []
-
-    def _strike_reach(self, attacker, strikes):
-        """Дистанция, на которую надо подойти, чтобы нанести ВСЕ удары = минимум range среди них."""
-        if not strikes:
-            return 5
-        return min(getattr(a, 'range_ft', 5) for a in strikes)
-
-    def _in_range_of(self, attacker, target, atk):
-        """Достаёт ли КОНКРЕТНЫЙ удар цель прямо сейчас (страховка внутри мультиатаки)."""
-        need = getattr(atk, 'range_ft', 5)
-        if getattr(self, 'battle_map', None) and self.battle_map.get_pos(attacker) \
-                and self.battle_map.get_pos(target):
-            return self.battle_map.distance_ft(attacker, target) <= need
-        from battle_strategies import distance_ft_between
-        return distance_ft_between(attacker, target) <= need
-
-    def execute_strikes(self, attacker, target, strikes):
-        # входной guard (defensible-in-depth: защищает от любой будущей регрессии
-        # в _run_round_inner, где target может стать None по третьей причине)
-        if target is None:
-            return [], False
-        lines, any_killed = [], False
-        ignore = self.ignore_sides.get(attacker.side, set())
-        for atk in strikes:
-            if target is None or not target.alive:
-                # цель погибла (или изначально не достаётся) - ищем нового соседа
-                target = self._nearest_in_range(attacker, atk, ignore)
-                if target is None:
-                    break  # мёртвую цель не добить, живой в радиусе нет -
-                    # все оставшиеся удары пропадают (без движения посреди замаха)
-            if not self._in_range_of(attacker, target, atk):
-                # цель ЖИВАЯ, но далеко для ЭТОГО удара - ищем достижимого
-                alt = self._nearest_in_range(attacker, atk, ignore)
-                if alt is None:
-                    continue  # БЕЗОПАСНО: target живой, следующая атака (напр. лук) достанет
-                target = alt
-            hit, damage, attack_roll, critical, damage_info = attacker.perform_attack(atk, target.ac)
-            if hit:
-                damage, dmg_note = self._modify_damage(target, damage, atk.damage_type)
-                target.take_damage(damage)
-                crit_text = " КРИТИЧЕСКИЙ УДАР!" if critical else ""
-                lines.append(f"{attacker.name} → {target.name} ({atk.name}: "
-                             f"{attack_roll} vs AC {target.ac}) - ПОПАДАНИЕ!{crit_text} {damage_info}{dmg_note}")
-                if not target.alive:
-                    lines.append(f"☠️ {target.name} УНИЧТОЖЕН!")
-                    any_killed = True
-            else:
-                lines.append(f"{attacker.name} → {target.name} ({atk.name}: "
-                             f"{attack_roll} vs AC {target.ac}) - ПРОМАХ!")
-        return lines, any_killed
-
-    def _nearest_in_range(self, attacker, atk, ignore):
-        need = getattr(atk, 'range_ft', 5)
-        has_map = getattr(self, 'battle_map', None) is not None \
-            and self.battle_map.get_pos(attacker) is not None
-        best, best_d = None, None
-        for side_idx, side_enemies in enumerate(self.sides):
-            if side_idx == attacker.side:
-                continue
-            if side_idx in ignore or side_idx in attacker.ignore_sides:
-                continue
-            for e in side_enemies:
-                if not e.alive:
-                    continue
-                if not has_map:
-                    return e                      # без карты - любой живой «в радиусе»
-                if self.battle_map.get_pos(e) is None:
-                    continue
-                d = self.battle_map.distance_ft(attacker, e)
-                if d <= need and (best_d is None or d < best_d):
-                    best, best_d = e, d
-        return best
-
-
-    def _modify_damage(self, target, raw, damage_type):
-        canon = dmg_canon(damage_type)
-        if not canon or raw <= 0:
-            return raw, ''
-        imm = {dmg_canon(x) for x in (getattr(target, 'immunities', []) or [])}
-        vul = {dmg_canon(x) for x in (getattr(target, 'vulnerabilities', []) or [])}
-        res = {dmg_canon(x) for x in (getattr(target, 'resistances', []) or [])}
-        if canon in imm:
-            return 0, f" → 0 (иммунитет: {damage_type})"
-        if canon in vul:
-            final = raw * 2
-            return final, f" → {final} (уязвимость: {damage_type})"
-        if canon in res:
-            final = raw // 2
-            return final, f" → {final} (сопротивление: {damage_type})"
-        return raw, ''

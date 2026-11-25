@@ -1,7 +1,6 @@
 import tkinter as tk
 from tkinter import ttk, messagebox
 
-from battle_logic import ENGINE as _SPR_ENGINE
 from entities import Attack, Enemy
 from ui_components import ScrollableFrame, fit_window_to_screen
 from observer import Observer
@@ -26,12 +25,12 @@ class UIUpdater(Observer):
 class BattleUI:
     """Класс для управления интерфейсом битвы"""
 
-    def __init__(self):
-        """Инициализация UI обновителя"""
-        def __init__(self):
-            self._dirty_enemies = set()
-            self.label_by_enemy = {}
-            self.ui_suspend = False
+    def __init__(self, engine):
+        """Инициализация UI обновителя."""
+        self.engine = engine
+        self._dirty_enemies = set()
+        self.label_by_enemy = {}
+        self.ui_suspend = False
 
     def setup_battle_ui(self):
         """Настройка интерфейса битвы"""
@@ -199,7 +198,7 @@ class BattleUI:
         Свёрнутые карточки-аккордеоны на юнита, на чистом ttk -> цвета подхватывают
         активную тему (тёмно-фиолетовая схема) без хардкода. Graceful: нет раундов ->
         заглушка, не краш."""
-        log = _SPR_ENGINE.get_round_log()
+        log = self.engine.get_round_log()
         win = tk.Toplevel(self.root)
         win.title("Анализ сражения — почему принято каждое решение")
         fit_window_to_screen(win, 720, 640)

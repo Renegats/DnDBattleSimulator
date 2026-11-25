@@ -173,18 +173,34 @@ class EnemyFactory:
         return enemy
 
     @staticmethod
-    def create_enemy(enemy_type, name, side):
-        """Создаёт врага: сначала кастом/импорт, затем канон, иначе болванка 'обычный'."""
-        if enemy_type in EnemyFactory.CUSTOM_TYPES:
-            t = EnemyFactory.CUSTOM_TYPES[enemy_type]
-        elif enemy_type in EnemyFactory.CREATURE_DEFS:
-            t = EnemyFactory.CREATURE_DEFS[enemy_type]
-        else:
-            t = EnemyFactory.CREATURE_DEFS['обычный']
+    def create_enemy(enemy_type, name, side, registry=None):
+        reg = registry if registry is not None else PRODUCTION_REGISTRY
+        t = reg.lookup(enemy_type)
         enemy = Enemy(name=name, hp=t['hp'], ac=t['ac'],
                       attacks=[EnemyFactory._make_attack(a) for a in t['attacks']],
                       side=side, regen=t.get('regen', 0))
         enemy = EnemyFactory._finish(enemy, speed=t.get('speed', 30))
         enemy.multiattack = t.get('multiattack')
-        EnemyFactory._apply_def(enemy, t)   # 👈 характеристики доезжают до объекта
+        EnemyFactory._apply_def(enemy, t)
         return enemy
+
+
+class CreatureRegistry:
+    def __init__(self, defs=None, custom=None):
+        self.defs = defs if defs is not None else {}
+        self.custom = custom if custom is not None else {}
+
+    def lookup(self, type_name):
+        if type_name in self.custom:
+            return self.custom[type_name]
+        if type_name in self.defs:
+            return self.defs[type_name]
+        return self.defs.get('обычный')
+
+    def register(self, type_name, **data):
+        self.custom[type_name] = data
+
+PRODUCTION_REGISTRY = CreatureRegistry(
+    defs=EnemyFactory.CREATURE_DEFS,
+    custom=EnemyFactory.CUSTOM_TYPES,
+)

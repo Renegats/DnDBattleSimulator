@@ -1,0 +1,70 @@
+{
+  "Демогоргон": {
+    "urls": [
+      "https://dnd.su/gallery/bestiary/1041_1_1549647751_s.png",
+      "https://dnd.su/gallery/bestiary/1041_1_1602710551_s.jpg",
+      "https://dnd.su/gallery/bestiary/1041_1_1602710557_s.png",
+      "https://dnd.su/gallery/bestiary/1041_1_1602710562_s.jpg",
+      "https://dnd.su/gallery/bestiary/1041_1_1602710567_s.jpg",
+      "https://dnd.su/gallery/bestiary/1041_1_1602710572_s.jpg",
+      "https://dnd.su/gallery/bestiary/1041_1_1602710577_s.jpg",
+      "https://dnd.su/gallery/bestiary/1041_1_1602710583_s.png",
+      "https://dnd.su/gallery/bestiary/1041_1_1602710589_s.jpg",
+      "https://dnd.su/gallery/bestiary/1041_1_1602710595_s.png"
+    ],
+    "index": 1,
+    "framing": {
+      "mode": "smart",
+      "zoom": 100,
+      "focus_x": 28,
+      "focus_y": 100,
+      "height": 186,
+      "blur": 30,
+      "dim": 38,
+      "fade": 62,
+      "radius": 12
+    }
+  },
+  "Обыватель": {
+    "urls": [
+      "https://dnd.su/gallery/bestiary/18_1_1587214785_s.jpg",
+      "https://dnd.su/gallery/bestiary/18_1_1611252761_s.png",
+      "https://dnd.su/gallery/bestiary/18_1_1653554154_s.jpg",
+      "https://dnd.su/gallery/bestiary/18_1_1653554162_s.jpg",
+      "https://dnd.su/gallery/bestiary/18_1_1653554168_s.jpg"
+    ],
+    "index": 1,
+    "framing": {
+      "mode": "smart",
+      "zoom": 112,
+      "focus_x": 50,
+      "focus_y": 6,
+      "height": 186,
+      "blur": 30,
+      "dim": 38,
+      "fade": 62,
+      "radius": 12
+    }
+  },
+  "обычный": {
+    "framing": {
+      "mode": "contain",
+      "zoom": 100,
+      "focus_x": 50,
+      "focus_y": 18,
+      "height": 168,
+      "blur": 32,
+      "dim": 40,
+      "fade": 66,
+      "radius": 12
+    }
+  },
+  "Щитостраж": {
+    "urls": [
+      "https://dnd.su/gallery/bestiary/285_1512466421_s.jpg",
+      "https://dnd.su/gallery/bestiary/285_1_1716113983_s.jpg",
+      "https://dnd.su/gallery/bestiary/285_2_1716113983_s.jpg"
+    ],
+    "index": 2
+  }
+}
