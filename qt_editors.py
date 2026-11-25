@@ -74,13 +74,17 @@ def attack_line(a):
 
 
 def attack_dict(a):
-    return {'name': a.name, 'attack_bonus': a.attack_bonus,
+    data = {'name': a.name, 'attack_bonus': a.attack_bonus,
             'damage_dice_count': a.damage_dice_count,
             'damage_dice_type': a.damage_dice_type,
             'damage_modifier': a.damage_modifier,
             'damage_type': getattr(a, 'damage_type', ''),
             'range_ft': getattr(a, 'range_ft', 5),
             'magical': bool(getattr(a, 'magical', False))}
+    extra = getattr(a, 'extra_damage', None)
+    if extra:
+        data['extra_damage'] = [dict(part) for part in extra]
+    return data
 
 
 class Section(QWidget):
@@ -123,6 +127,7 @@ class AttackDialog(QDialog):
         init = dict(init or {'name': 'Атака', 'attack_bonus': 0, 'damage_dice_count': 1,
                              'damage_dice_type': 'd6', 'damage_modifier': 0,
                              'damage_type': '', 'range_ft': 5, 'magical': False})
+        self._kept_extra = list(init.get('extra_damage') or [])
         lay = QVBoxLayout(self)
         self.name = QLineEdit(init['name'])
         self.dtype = QLineEdit(init.get('damage_type', ''))
@@ -168,6 +173,8 @@ class AttackDialog(QDialog):
              'damage_dice_type': self.dice.currentText(),
              'magical': self.magical.isChecked()}
         d.update({k: s.value() for k, s in self.spins.items()})
+        if self._kept_extra:
+            d['extra_damage'] = self._kept_extra
         return d
 
 
@@ -511,6 +518,14 @@ class SideCreatorDialog(QDialog):
         self.atk.attacks = [attack_dict(a) for a in tmp.attacks]
         self.atk.refresh()
         self.chars.set_data({k: getattr(tmp, k, None) for k in CHAR_KEYS})
+        self._kept_card = {
+            'legendary_actions': getattr(tmp, 'legendary_actions', None),
+            'legendary_resistance': getattr(tmp, 'legendary_resistance', None),
+            'lair_actions': getattr(tmp, 'lair_actions', None),
+            'special_actions': list(getattr(tmp, 'special_actions', None) or []),
+            'bonus_actions': list(getattr(tmp, 'bonus_actions', None) or []),
+            'reactions': list(getattr(tmp, 'reactions', None) or []),
+        }
 
     def confirm(self):
         name = self.cname.text().strip()
@@ -520,10 +535,11 @@ class SideCreatorDialog(QDialog):
         if not self.atk.attacks:
             QMessageBox.warning(self, 'Внимание', 'Добавьте хотя бы одну атаку!')
             return
+        kept = {key: value for key, value in getattr(self, '_kept_card', {}).items() if value}
         EnemyFactory.register_type(name, hp=self.chp.value(), ac=self.cac.value(),
                                    attacks=self.atk.attacks, speed=self.cspd.value(),
                                    regen=self.cregen.value(),
                                    multiattack=self.multiattack_data,
-                                   **self.chars.get_data())
+                                   **self.chars.get_data(), **kept)
         self.ready.emit({'army_type': name, 'strategy': self.strat.currentText()})
         self.accept()

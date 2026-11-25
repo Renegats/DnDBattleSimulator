@@ -145,7 +145,19 @@ class SideCreatorDialog:
                          'damage_dice_type': a.damage_dice_type,
                          'damage_modifier': a.damage_modifier,
                          'damage_type': getattr(a, 'damage_type', ''),
-                         'range_ft': getattr(a, 'range_ft', 5)} for a in tmp.attacks]
+                         'range_ft': getattr(a, 'range_ft', 5),
+                         'magical': bool(getattr(a, 'magical', False)),
+                         **({'extra_damage': [dict(part) for part in a.extra_damage]}
+                            if getattr(a, 'extra_damage', None) else {})}
+                        for a in tmp.attacks]
+        self._kept_card = {
+            'legendary_actions': getattr(tmp, 'legendary_actions', None),
+            'legendary_resistance': getattr(tmp, 'legendary_resistance', None),
+            'lair_actions': getattr(tmp, 'lair_actions', None),
+            'special_actions': list(getattr(tmp, 'special_actions', None) or []),
+            'bonus_actions': list(getattr(tmp, 'bonus_actions', None) or []),
+            'reactions': list(getattr(tmp, 'reactions', None) or []),
+        }
         self._refresh_atk_box()
         self._refresh_atk_box()
         self.editor.set_data(self.chars_data)   # этап 3: пресет доезжает до редактора
@@ -187,7 +199,11 @@ class SideCreatorDialog:
         result = {}
 
         def ok():
-            result.update({k: v.get() for k, v in vars_.items()});
+            result.update({k: v.get() for k, v in vars_.items()})
+            if init.get('extra_damage'):
+                result['extra_damage'] = init['extra_damage']
+            if 'magical' in init:
+                result['magical'] = init['magical']
             d.destroy()
 
         def cancel():
@@ -221,12 +237,13 @@ class SideCreatorDialog:
             messagebox.showwarning('Внимание', 'Добавьте хотя бы одну атаку!', parent=self.win);
             return
         self.chars_data = self.editor.get_data()
+        kept = {key: value for key, value in getattr(self, '_kept_card', {}).items() if value}
         EnemyFactory.register_type(name,
                                    hp=self.hp_var.get(), ac=self.ac_var.get(),
                                    attacks=self.attacks, speed=self.spd_var.get(),
                                    regen=self.regen_var.get(),
                                    multiattack=self.multiattack_data,
-                                   **self.chars_data)
+                                   **self.chars_data, **kept)
         if name not in self.sim.enemy_types:
             self.sim.enemy_types.append(name)
         self.on_result({'army_type': name, 'strategy': self.strat_var.get()})

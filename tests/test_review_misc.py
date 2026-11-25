@@ -60,25 +60,32 @@ class TestFactoryWarning(unittest.TestCase):
 class TestBestiaryCleanup(unittest.TestCase):
 
     def test_importer_num_words_has_no_duplicate_keys(self):
-        tree = ast.parse((ROOT / 'bestiary_importer.py').read_text(encoding='utf-8'))
+        # Словарь остался один, в bestiary_core: Tk-импортёр больше не копирует его.
+        tree = ast.parse((ROOT / 'bestiary_core.py').read_text(encoding='utf-8'))
         found = False
-        for node in ast.walk(tree):
-            if not isinstance(node, ast.ClassDef) or node.name != 'BestiaryImporter':
+        for stmt in tree.body:
+            if not isinstance(stmt, ast.Assign):
                 continue
-            for stmt in node.body:
-                if not isinstance(stmt, ast.Assign):
-                    continue
-                if not any(isinstance(t, ast.Name) and t.id == 'NUM_WORDS' for t in stmt.targets):
-                    continue
-                keys = [ast.literal_eval(key) for key in stmt.value.keys]
-                found = True
-                self.assertEqual(len(keys), len(set(keys)))
-                self.assertEqual(dict(zip(keys, (ast.literal_eval(v) for v in stmt.value.values)))['одним'], 1)
-                self.assertEqual(dict(zip(keys, (ast.literal_eval(v) for v in stmt.value.values)))['две'], 2)
+            if not any(isinstance(t, ast.Name) and t.id == 'NUM_WORDS' for t in stmt.targets):
+                continue
+            keys = [ast.literal_eval(key) for key in stmt.value.keys]
+            found = True
+            self.assertEqual(len(keys), len(set(keys)))
+            values = dict(zip(keys, (ast.literal_eval(v) for v in stmt.value.values)))
+            self.assertEqual(values['одним'], 1)
+            self.assertEqual(values['две'], 2)
+            self.assertEqual(values['два'], 2)
         self.assertTrue(found)
+        importer = (ROOT / 'bestiary_importer.py').read_text(encoding='utf-8')
+        self.assertIn('bestiary_core.parse_statblock', importer)
+        self.assertNotIn('ATTACK_RE', importer)
 
     def test_search_query_is_passed_as_request_params(self):
+        import tempfile
         bestiary_core._PAGES.clear()
+        previous = bestiary_core.CACHE_DIR
+        bestiary_core.CACHE_DIR = Path(tempfile.mkdtemp())
+        self.addCleanup(lambda: setattr(bestiary_core, 'CACHE_DIR', previous))
         seen = {}
 
         class Response:

@@ -1,98 +1,43 @@
+import time
 import tkinter as tk
 from tkinter import ttk, messagebox
 import requests
-from bs4 import BeautifulSoup
-import re
 import threading
-from entities import Enemy, Attack
+
+import bestiary_core
 from ui_components import ScrollableFrame, fit_window_to_screen
-from statblock_parser import parse_characteristics, extract_statblock_text, extract_battle_text
 
 
-def fetch_search_page(query, headers, timeout=10):
-    """Поиск на dnd.su. query передаётся в params — requests сам кодирует URL."""
-    return requests.get('https://dnd.su/bestiary/', params={'search': query},
-                        headers=headers, timeout=timeout)
+def fetch_search_page(query, headers, timeout=10, attempts=3):
+    """Поиск на dnd.su. query передаётся в params — requests сам кодирует URL.
+
+    Повтор на обрыв связи и 429/5xx. Успешный ответ с первого раза сеть не дёргает повторно.
+    """
+    last = None
+    tries = max(1, int(attempts))
+    for attempt in range(tries):
+        try:
+            response = requests.get('https://dnd.su/bestiary/', params={'search': query},
+                                    headers=headers, timeout=timeout)
+            response.encoding = 'utf-8'
+            if response.status_code in bestiary_core.RETRY_STATUS and attempt + 1 < tries:
+                time.sleep(bestiary_core.RETRY_BACKOFF[min(attempt, len(bestiary_core.RETRY_BACKOFF) - 1)])
+                continue
+            return response
+        except (requests.Timeout, requests.ConnectionError) as exc:
+            last = exc
+            if attempt + 1 >= tries:
+                raise
+            time.sleep(bestiary_core.RETRY_BACKOFF[min(attempt, len(bestiary_core.RETRY_BACKOFF) - 1)])
+    if last:
+        raise last
+    raise RuntimeError('Сайт не ответил')
 
 
 class BestiaryImporter:
-    """Класс для импорта монстров с dnd.su"""
+    """Окно импорта Tk. Разбор страницы делегирован bestiary_core."""
 
-    # --- Шаблоны для парсинга (атрибуты КЛАССА) ---
-    MONSTER_URL_RE = re.compile(r'/(?:multiverse/)?bestiary/\d+[-_][\w\-]+/?$')
-    ATTACK_RE = re.compile(
-        r'(?P<name>[А-ЯЁA-Z][^.\n]{2,80}?)\.\s*'
-        r'(?P<kind>Рукопашная|Дальнобойная)\s+атака\s+оружием:?\s*'
-        r'(?P<bonus>[+-]?\d+)\s+к\s+попаданию',
-        re.IGNORECASE)
-    DICE_RE = re.compile(r'(\d+)\s*[кkd]\s*(\d+)(?:\s*([+-]\s*\d+))?')
-    DAMAGE_TYPE_MAP = [
-        ('рубящ', 'рубящий'), ('колющ', 'колющий'), ('пронзающ', 'пронзающий'),
-        ('дробящ', 'дробящий'), ('огнен', 'огненный'), ('кислот', 'кислотный'),
-        ('холод', 'холод'), ('электрич', 'электрический'), ('молни', 'молнии'),
-        ('яд', 'яд'), ('психич', 'психический'), ('силов', 'силовое поле'),
-        ('излуч', 'излучение'), ('некротич', 'некротический'), ('гром', 'гром'),
-    ]
-    HEADERS = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
-                             'AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36'}
-
-    NUM_WORDS = {'одна':1,'одну':1,'одной':1,'одним':1,
-                 'две':2,'двух':2,'двум':2,'двумя':2,
-                 'три':3,'трёх':3,'трём':3,'четыре':4,'четырёх':4,'четырём':4,
-                 'пять':5,'пяти':5,'шесть':6,'шести':6,'семь':7,'семи':7,
-                 'восемь':8,'восьми':8,'девять':9,'девяти':9,'десять':10,'десяти':10}
-    STRIKE_RE = re.compile(
-        r'(?:(?P<num>одн[ауюе]|дв[ауюеи]|тр[еиё]|четыр[еиё]?|пяти?|шести?|семи?|восьми?|девяти?|десяти?|\d+)\s+)?'
-        r'атак[ауеийок]*\s+(?:оружием\s+|частью\s+|по\s+)?'
-        r'(?P<part>[А-ЯЁа-яёA-Za-z][\w\-]*)', re.IGNORECASE)
-    SUFFIXES = sorted(['иями','иям','ами','ями','ам','ям','ом','ем','ов','ев',
-                       'ах','ях','у','ю','а','я','и','ы','е','о'], key=len, reverse=True)
-
-    @classmethod
-    def _norm_word(cls, w):
-        w = w.lower().strip()
-        for suf in cls.SUFFIXES:
-            if w.endswith(suf) and len(w) - len(suf) >= 3:
-                return w[:-len(suf)]
-        return w
-
-    def _match_attack(self, part, attacks):
-        np = self._norm_word(part)
-        if not np:
-            return None
-        for a in attacks:
-            words = {self._norm_word(x) for x in a['name'].split()}
-            if np in words or any(np == wd or (len(np) >= 3 and (np in wd or wd in np)) for wd in words):
-                return a['name']
-        return None
-
-    def parse_multiattack(self, text, attacks):
-        """Вытаскивает мультиатаку из окна текста; возвращает list-of-dict или None."""
-        m = re.search(r'(?:Мультиатака|Multiattack)', text, re.IGNORECASE)
-        if not m:
-            return None
-        window = text[m.end(): m.end() + 320]          # окно на всю фразу мультиатаки
-        strikes, seen_pairs = [], set()
-        for sm in self.STRIKE_RE.finditer(window):
-            raw = sm.group('num')
-            if raw is None:
-                cnt = 1
-            elif raw.isdigit():
-                cnt = int(raw)
-            else:
-                cnt = self.NUM_WORDS.get(self._norm_word(raw) + '' if False else raw.lower(), None)
-                if cnt is None:
-                    # пробуем по основе слова
-                    cnt = next((v for k, v in self.NUM_WORDS.items() if k.startswith(raw.lower()[:3])), 1)
-            name = self._match_attack(sm.group('part'), attacks)
-            if not name:
-                continue                                # преамбула/мусор - отбрасываем
-            key = (name, cnt)
-            if key in seen_pairs:
-                continue
-            seen_pairs.add(key)
-            strikes.append({'attack': name, 'count': cnt})
-        return strikes or None                          # None => воин бьёт одной атакой (деградация)
+    HEADERS = bestiary_core.HEADERS
 
     def __init__(self, parent_root, simulator, on_imported=None, on_cancel=None):
         self.parent_root = parent_root
@@ -201,25 +146,8 @@ class BestiaryImporter:
         self._async(work, ok)
 
     def parse_search_results(self, html, query):
-        soup = BeautifulSoup(html, 'html.parser')
         self.results_listbox.delete(0, tk.END)
-        self.search_results = []
-        seen = set()
-        query_lower = query.lower()
-        for link in soup.find_all('a', href=True):
-            href = link['href']
-            if not self.MONSTER_URL_RE.search(href):
-                continue
-            name = link.get_text(strip=True)
-            if query_lower not in name.lower():
-                continue
-            if not name or href in seen:
-                continue
-            seen.add(href)
-            url = href if href.startswith('http') else f'https://dnd.su{href}'
-            self.search_results.append({'name': name, 'url': url})
-        self.search_results.sort(key=lambda e: (not e['name'].lower().startswith(query_lower),
-                                                e['name'].lower()))
+        self.search_results = bestiary_core.search_monsters(html, query)
         for entry in self.search_results:
             self.results_listbox.insert(tk.END, entry['name'])
         if not self.search_results:
@@ -241,98 +169,29 @@ class BestiaryImporter:
                   text="⏳ Загружаем статблок монстра...", font=('Arial', 11)).pack(pady=20)
 
         def work():
-            response = requests.get(monster_data['url'], headers=self.HEADERS, timeout=10)
-            response.encoding = 'utf-8'
-            if response.status_code != 200:
-                raise RuntimeError(f"Сайт ответил кодом {response.status_code}")
-            return response.text
+            return bestiary_core.fetch_cached(monster_data['url'])
 
         def ok(html):
-            monster_stats = self.parse_statblock(html)
+            monster_stats = self.parse_statblock(html, monster_data['url'])
             self.display_monster_preview(monster_stats)
             self.selected_monster = monster_stats
             self.import_btn.config(state='normal')
 
         self._async(work, ok)
 
-    # ================= ПАРСИНГ (чистый, без сети) =================
-    def parse_statblock(self, html):
-        soup = BeautifulSoup(html, 'html.parser')
-        monster = {'name': '', 'hp': 10, 'ac': 10, 'attacks': [], 'regen': 0, 'speed': 30}
-        name = ''
-        h1 = soup.find('h1')
-        if h1:
-            name = h1.get_text(strip=True)
-        if not name and soup.title and soup.title.string:
-            name = soup.title.string.split('/')[0].strip()
-        name = re.sub(r'\s*\[.*?\]', '', name)
-        name = re.split(r'[—–-]\s*Бестиарий', name)[0]
-        name = re.sub(r'\s*\([A-Za-z]{2,6}\)\s*[—–-].*$', '', name)
-        monster['name'] = name.strip() or 'Без имени'
-
-        # ДВА окна активной редакции: ref (справочный+особенности+хиты/КД/скорость)
-        # и battle (Действия -> атаки/мультиатака). Парсим по окнам, НЕ по полному
-        # get_text(), иначе ловим обе редакции (5e24/5e14) -> дубль атак/хвостов.
-        ref = extract_statblock_text(soup)
-        battle = extract_battle_text(soup)
-
-        spd = re.search(r'Скорость\s*(\d+)\s*футов', ref, re.I)
-        if spd:
-            monster['speed'] = int(spd.group(1))
-        hp = re.search(r'(?:Хиты|Hit\s+Points)[^\d]{0,20}(\d+)', ref, re.I)
-        if hp:
-            monster['hp'] = int(hp.group(1))
-        ac = re.search(r'(?:Класс\s+Доспеха|Armor\s+Class)[^\d]{0,20}(\d+)', ref, re.I)
-        if ac:
-            monster['ac'] = int(ac.group(1))
-        regen = re.search(r'(?:восстанавливает|регенерация)[^\d]{0,40}(\d+)\s+хитов', ref, re.I)
-        if regen:
-            monster['regen'] = int(regen.group(1))
-
-        monster['attacks'] = self.parse_attacks(battle)
-        monster['multiattack'] = self.parse_multiattack(battle, monster['attacks'])
-        monster.update(parse_characteristics(soup, ref))
-        return monster
-
-    def parse_attacks(self, text):
-        attacks = []
-        seen = set()
-        for m in self.ATTACK_RE.finditer(text):
-            name = m.group('name').strip(' _*')
-            bonus = int(m.group('bonus'))
-            window = text[m.end(): m.end() + 250]
-            rm = re.search(r'дистанция\s*(\d+)', window)
-            reach = re.search(r'досягаемость\s*(\d+)', window)
-            if m.group('kind').lower().startswith('дально') and rm:
-                range_ft = int(rm.group(1))
-            elif reach:
-                range_ft = int(reach.group(1))
-            else:
-                range_ft = 5
-            dm = self.DICE_RE.search(window)
-            if not dm:
-                continue
-            count, die = int(dm.group(1)), int(dm.group(2))
-            mod = int(dm.group(3).replace(' ', '')) if dm.group(3) else 0
-            type_window = window[:dm.end() + 60].lower()
-            dtype = next((full for stem, full in self.DAMAGE_TYPE_MAP if stem in type_window), '')
-            key = (name, bonus, count, die)
-            if key in seen:
-                continue
-            seen.add(key)
-            attacks.append({'name': name, 'attack_bonus': bonus,
-                            'damage_dice_count': count, 'damage_dice_type': f'd{die}',
-                            'damage_modifier': mod, 'damage_type': dtype, 'range_ft': range_ft})
-        if not attacks:
-            attacks.append({'name': 'Атака', 'attack_bonus': 0, 'damage_dice_count': 1,
-                            'damage_dice_type': 'd6', 'damage_modifier': 0,
-                            'damage_type': '', 'range_ft': 5})
-        return attacks
+    def parse_statblock(self, html, url='https://dnd.su'):
+        return bestiary_core.parse_statblock(html, url)
 
     def display_monster_preview(self, monster):
         for widget in self.preview_scroll.scrollable_frame.winfo_children():
             widget.destroy()
         preview = self.preview_scroll.scrollable_frame
+        for note in list(monster.get('errors') or []) + list(monster.get('warnings') or []):
+            ttk.Label(preview, text=f"⚠ {note}", font=('Arial', 10, 'bold'),
+                      wraplength=560, justify='left').pack(anchor='w', padx=10, pady=1)
+        if monster.get('warnings') or monster.get('errors'):
+            ttk.Label(preview, text='Импорт не заблокирован: карточку можно забрать и поправить.',
+                      font=('Arial', 9, 'italic')).pack(anchor='w', padx=10, pady=(0, 6))
         ttk.Label(preview, text=f"👾 {monster['name']}", font=('Arial', 14, 'bold')).pack(pady=5)
 
         head = []
@@ -378,11 +237,18 @@ class BestiaryImporter:
                 ttk.Label(preview, text=f"• {tr['name']}. {tr['desc']}",
                           font=('Arial', 9), wraplength=560, justify='left').pack(anchor='w', padx=20)
 
+        legendary = monster.get('legendary_actions') or None
+        if legendary:
+            ttk.Label(preview, text=f"👑 Легендарные действия ({legendary.get('per_round')}/раунд):",
+                      font=('Arial', 12, 'bold')).pack(anchor='w', pady=(8, 2))
+            for option in legendary.get('options') or []:
+                mark = ' · в бою' if option.get('usable') else ''
+                ttk.Label(preview, text=f"• {option.get('name')} (стоит {option.get('cost', 1)}){mark}",
+                          font=('Arial', 10)).pack(anchor='w', padx=20)
         ttk.Label(preview, text="⚔️ Атаки:", font=('Arial', 12, 'bold')).pack(anchor='w', pady=(10, 5))
         for attack in monster['attacks']:
             attack_text = (f"• {attack['name']} ({attack['attack_bonus']:+d}, "
-                           f"{attack['damage_dice_count']}{attack['damage_dice_type']}"
-                           f"{attack['damage_modifier']:+d})")
+                           f"{bestiary_core.format_damage(attack)})")
             ttk.Label(preview, text=attack_text, font=('Arial', 10)).pack(anchor='w', padx=20)
 
         if not sc and not traits and not (monster.get('saves') or monster.get('skills')):
@@ -409,7 +275,9 @@ class BestiaryImporter:
                  if k in ('ability_scores', 'ability_mods', 'saves', 'skills', 'senses',
                           'vulnerabilities', 'resistances', 'immunities',
                           'condition_immunities', 'languages', 'cr', 'prof_bonus',
-                          'size', 'type', 'traits')}
+                          'size', 'type', 'traits', 'legendary_actions',
+                          'legendary_resistance', 'lair_actions', 'special_actions',
+                          'bonus_actions', 'reactions')}
         EnemyFactory.register_type(monster_type,
                                    hp=self.selected_monster['hp'],
                                    ac=self.selected_monster['ac'],

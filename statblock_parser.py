@@ -26,7 +26,8 @@ ABILITY_ORDER = ['str', 'dex', 'con', 'int', 'wis', 'cha']
 ABILITY_LABEL = {'str': 'СИЛ', 'dex': 'ЛОВ', 'con': 'ТЕЛ',
                  'int': 'ИНТ', 'wis': 'МДР', 'cha': 'ХАР'}
 
-SIZE_WORDS = (r'(?:Крошечный|Малый|Средний|Крупный|Огромный|Огромное|Гигантский|'
+SIZE_WORDS = (r'(?:Крошечн\w+|Маленьк\w+|Мал\w+|Средн\w+|Больш\w+|Крупн\w+|'
+              r'Огромн\w+|Громадн\w+|Гигантск\w+|Исполинск\w+|'
               r'Tiny|Small|Medium|Large|Huge|Gargantuan)')
 
 # Однословные подписи (префикс короче слова -> _cut_prefix сдвигает до границы слова).
@@ -288,6 +289,326 @@ def parse_characteristics(soup, text):
         for field in ('languages', 'vulnerabilities', 'resistances',
                       'immunities', 'condition_immunities'):
             _, bare = _parse_kv_list(', '.join(buckets[field])); out[field] = bare
-    except Exception:
-        pass
+    except Exception as exc:
+        out.setdefault('errors', []).append(f'разбор характеристик: {exc}')
     return out
+
+
+def clean_text(value):
+    """Схлопывает пробелы и выкидывает «?» у тултипов dnd.su."""
+    text = (value or '').replace('\xa0', ' ').replace('\u200b', '')
+    text = re.sub(r'\s*\?\s*', ' ', text)
+    return re.sub(r'\s+', ' ', text).strip()
+
+
+def find_statblock_card(soup):
+    """Карточка монстра, без шапки сайта и комментариев."""
+    if soup is None:
+        return None
+    return soup.select_one('ul.params.card__article-body') or soup.select_one('ul.params')
+
+
+_ABIL_KEY = {
+    'сил': 'str', 'лов': 'dex', 'тел': 'con', 'инт': 'int', 'мдр': 'wis', 'хар': 'cha',
+    'str': 'str', 'dex': 'dex', 'con': 'con', 'int': 'int', 'wis': 'wis', 'cha': 'cha',
+}
+_ABIL_LABEL = {'str': 'Сил', 'dex': 'Лов', 'con': 'Тел', 'int': 'Инт', 'wis': 'Мдр', 'cha': 'Хар'}
+_SIZE_LINE = re.compile(
+    r'^(Крошечн\w+|Маленьк\w+|Мал\w+|Средн\w+|Больш\w+|Крупн\w+|Огромн\w+|'
+    r'Громадн\w+|Гигантск\w+|Исполинск\w+|Tiny|Small|Medium|Large|Huge|Gargantuan)'
+    r'\s+(.*)$', re.IGNORECASE)
+
+
+def _ability_key(label):
+    low = (label or '').strip().lower()
+    if low in _ABIL_KEY:
+        return _ABIL_KEY[low]
+    for stem, key in _ABIL_KEY.items():
+        if low.startswith(stem):
+            return key
+    return None
+
+
+def _first_int(text):
+    match = re.search(r'-?\d+', text or '')
+    return int(match.group(0)) if match else None
+
+
+def _signed(text):
+    match = re.search(r'[+-]?\d+', text or '')
+    return int(match.group(0)) if match else None
+
+
+def _pairs(text):
+    result = {}
+    for part in re.split(r'\s*,\s*', text or ''):
+        match = re.match(r'^(.+?)\s+([+-]\d+)$', part.strip())
+        if match:
+            result[match.group(1).strip()] = match.group(2)
+    return result
+
+
+def _senses(text):
+    result = {}
+    for part in re.split(r'\s*,\s*', text or ''):
+        part = part.strip(' .')
+        if not part:
+            continue
+        match = re.match(r'^(.+?)\s+(\d+\s*\S*)$', part)
+        if match:
+            result[match.group(1).strip()] = match.group(2).strip()
+        else:
+            result[part] = ''
+    return result
+
+
+def split_defense_list(text):
+    """«яд; дробящий, колющий, рубящий от немагических атак» -> отдельные записи.
+
+    Хвост «от …» относится ко всем типам своего куска, иначе иммунитет
+    к немагическому дробится на полный иммунитет и одну условную запись.
+    """
+    out = []
+    for chunk in re.split(r'\s*;\s*', (text or '').strip(' .')):
+        chunk = chunk.strip(' .')
+        if not chunk:
+            continue
+        qualifier = ''
+        match = re.search(r'\s+от\s+(.+)$', chunk, re.IGNORECASE)
+        body = chunk
+        if match:
+            qualifier = ' от ' + match.group(1).strip()
+            body = chunk[:match.start()]
+        parts = [part.strip() for part in body.split(',') if part.strip()]
+        if qualifier:
+            out.extend((part + qualifier).lower() for part in parts)
+        elif parts:
+            out.extend(part.lower() for part in parts)
+        elif chunk:
+            out.append(chunk.lower())
+    return out
+
+
+def _defense_field(label):
+    low = (label or '').lower()
+    if 'состоян' in low:
+        return 'condition_immunities'
+    if 'уязвим' in low:
+        return 'vulnerabilities'
+    if 'сопротивл' in low:
+        return 'resistances'
+    if 'иммунитет' in low:
+        return 'immunities'
+    return None
+
+
+def _apply_label(fields, label, value):
+    low = label.lower()
+    blob = clean_text(f'{label} {value}')
+    if 'класс доспеха' in low or 'класс защиты' in low or low.startswith('armor class'):
+        number = _first_int(value or label)
+        if number is not None:
+            fields['ac'] = number
+        return
+    if low.startswith('хиты') or low.startswith('hit point'):
+        number = _first_int(value)
+        if number is not None:
+            fields['hp'] = number
+        return
+    if low.startswith('скорост') or low.startswith('speed'):
+        number = _first_int(value)
+        if number is not None:
+            fields['speed'] = number
+        return
+    if 'опасност' in low or low.startswith('challenge'):
+        cr = re.search(r'(\d+\s*/\s*\d+|\d+)', value or label)
+        if cr:
+            fields['cr'] = re.sub(r'\s+', '', cr.group(1))
+    if ('бонус мастерства' in low or re.search(r'(?:^|\s)бв(?:\s|$)', low)
+            or 'proficiency' in low or 'опасност' in low or low.startswith('challenge')):
+        bonus = re.search(
+            r'(?:бонус мастерства|бв|proficiency(?:\s+bonus)?)\s*([+-]\d+)', blob, re.I)
+        if bonus:
+            fields['prof_bonus'] = bonus.group(1)
+        return
+    field = _defense_field(low)
+    if field and ('урон' in low or 'урону' in low or 'состоян' in low):
+        fields[field] = split_defense_list(value)
+        return
+    if low.startswith('спасброс'):
+        fields['saves'] = _pairs(value)
+        return
+    if low.startswith('навык') or low.startswith('skill'):
+        fields['skills'] = _pairs(value)
+        return
+    if low.startswith('чувств') or low.startswith('sense'):
+        fields['senses'] = _senses(value)
+        return
+    if low.startswith('язык') or low.startswith('language'):
+        fields['languages'] = [part.strip() for part in (value or '').split(',') if part.strip()]
+
+
+def _parse_ability_block(li):
+    scores, mods, saves = {}, {}, {}
+    rows = li.select('.stat-pair-row')
+    if rows:
+        for row in rows:
+            title_node = row.select_one('.title')
+            value_node = row.select_one('.value')
+            mod_node = row.select_one('.mod')
+            save_node = row.select_one('.save')
+            key = _ability_key(title_node.get_text(strip=True) if title_node else '')
+            if not key or value_node is None:
+                continue
+            scores[key] = _first_int(value_node.get_text())
+            mods[key] = _signed(mod_node.get_text() if mod_node else '0') or 0
+            save_bonus = _signed(save_node.get_text()) if save_node else None
+            if save_bonus is not None and save_bonus != mods[key]:
+                saves[_ABIL_LABEL[key]] = f'{save_bonus:+d}'
+        return scores, mods, saves
+    for stat in li.select('.stat'):
+        text = clean_text(stat.get_text(' ', strip=True))
+        match = re.search(
+            r'(сил|лов|тел|инт|мдр|хар)\w*\s*(-?\d+)\s*\(\s*([+-]?\d+)\s*\)', text, re.I)
+        if not match:
+            continue
+        key = _ability_key(match.group(1))
+        if not key:
+            continue
+        scores[key] = int(match.group(2))
+        mods[key] = int(match.group(3))
+    return scores, mods, saves
+
+
+def _own_paragraphs(node):
+    found = []
+    for paragraph in node.find_all('p'):
+        extra = paragraph.find_parent(class_='additionalInfo')
+        if extra is not None and extra in getattr(node, 'descendants', ()):
+            continue
+        text = clean_text(paragraph.get_text(' ', strip=True))
+        if text:
+            found.append(text)
+    return found
+
+
+def _section_key(title):
+    text = clean_text(title).lower()
+    if 'логова' in text:
+        return 'lair'
+    if text.startswith('легендарн'):
+        return 'legendary'
+    if text.startswith('бонусн'):
+        return 'bonus'
+    if text.startswith('реакц'):
+        return 'reactions'
+    if text.startswith('действ'):
+        return 'actions'
+    if text.startswith('особен'):
+        return 'traits'
+    return 'skip'
+
+
+def _trait_from_text(text):
+    match = re.match(r'^([А-ЯЁA-Z][^.]{1,80}?)\s*\.\s+(.+)$', text or '', re.S)
+    if not match:
+        return None
+    return {'name': clean_text(match.group(1)), 'desc': clean_text(match.group(2))}
+
+
+def _heading(li):
+    for heading in li.find_all(['h2', 'h3']):
+        if heading.find_parent(class_='additionalInfo') is not None:
+            continue
+        title = clean_text(heading.get_text(' ', strip=True))
+        if title:
+            return title
+    return ''
+
+
+def empty_card():
+    return {
+        'found': False, 'ac': None, 'hp': None, 'speed': None, 'cr': None,
+        'prof_bonus': None, 'size': None, 'type': None,
+        'ability_scores': {}, 'ability_mods': {}, 'saves': {}, 'skills': {},
+        'senses': {}, 'languages': [], 'vulnerabilities': [], 'resistances': [],
+        'immunities': [], 'condition_immunities': [], 'traits': [],
+        'actions': [], 'bonus': [], 'reactions': [], 'legendary': [],
+        'lair_intro': '', 'lair_items': [],
+    }
+
+
+def extract_card(soup):
+    """Структура карточки dnd.su / next.dnd.su. Нет карточки -> found=False."""
+    card = empty_card()
+    root = find_statblock_card(soup)
+    if root is None:
+        return card
+    card['found'] = True
+    for li in root.find_all('li', recursive=False):
+        classes = ' '.join(li.get('class') or [])
+        if 'abilities' in (li.get('class') or []):
+            scores, mods, saves = _parse_ability_block(li)
+            card['ability_scores'].update({k: v for k, v in scores.items() if v is not None})
+            card['ability_mods'].update(mods)
+            if saves and not card['saves']:
+                card['saves'] = saves
+            continue
+        if 'size-type-alignment' in classes or 'size-type' in classes:
+            size, creature_type = _parse_size_line(clean_text(li.get_text(' ', strip=True)))
+            card['size'], card['type'] = size, creature_type
+            continue
+        title = _heading(li)
+        if title:
+            key = _section_key(title)
+            paragraphs = _own_paragraphs(li)
+            if key == 'traits':
+                for paragraph in paragraphs:
+                    trait = _trait_from_text(paragraph)
+                    if trait:
+                        card['traits'].append(trait)
+            elif key == 'lair':
+                items = [clean_text(sub.get_text(' ', strip=True))
+                         for sub in li.find_all('li')]
+                items = [item for item in items if item]
+                card['lair_intro'] = paragraphs[0] if paragraphs else ''
+                card['lair_items'] = items or paragraphs[1:]
+            elif key in ('actions', 'bonus', 'reactions', 'legendary'):
+                card[key].extend(paragraphs)
+            continue
+        paragraphs = _own_paragraphs(li)
+        if paragraphs:
+            for paragraph in paragraphs:
+                trait = _trait_from_text(paragraph)
+                if trait:
+                    card['traits'].append(trait)
+            continue
+        strong = next((node for node in li.find_all('strong')
+                       if node.find_parent('p') is None), None)
+        if strong is not None:
+            label = clean_text(strong.get_text(' ', strip=True))
+            full = clean_text(li.get_text(' ', strip=True))
+            value = full[len(label):].strip(' :') if full.lower().startswith(label.lower()) else full
+            middle = li.select_one('[data-type=middle]')
+            if middle is not None and label.lower().startswith('хиты'):
+                number = _first_int(middle.get_text())
+                if number is not None:
+                    card['hp'] = number
+                else:
+                    _apply_label(card, label, value)
+            else:
+                _apply_label(card, label, value)
+            continue
+        if card['size'] is None:
+            size, creature_type = _parse_size_line(clean_text(li.get_text(' ', strip=True)))
+            if size:
+                card['size'], card['type'] = size, creature_type
+    return card
+
+
+def _parse_size_line(text):
+    match = _SIZE_LINE.match(text or '')
+    if not match:
+        return None, None
+    creature_type = match.group(2).strip(' ,;.')
+    return match.group(1), (creature_type or None)

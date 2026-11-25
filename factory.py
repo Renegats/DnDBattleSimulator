@@ -174,6 +174,12 @@ class EnemyFactory:
         enemy.size = t.get('size')
         enemy.type = t.get('type')
         enemy.traits = [dict(tr) for tr in (t.get('traits') or [])]
+        enemy.legendary_actions = t.get('legendary_actions')
+        enemy.legendary_resistance = t.get('legendary_resistance')
+        enemy.lair_actions = t.get('lair_actions')
+        enemy.special_actions = list(t.get('special_actions') or [])
+        enemy.bonus_actions = list(t.get('bonus_actions') or [])
+        enemy.reactions = list(t.get('reactions') or [])
         return enemy
 
     @staticmethod
