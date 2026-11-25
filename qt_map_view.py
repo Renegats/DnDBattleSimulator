@@ -4,11 +4,12 @@
 клетки, большой — 2×2, огромный — 3×3, громадный — 4×4. Подсветка досягаемости
 строится по пятну, а не по одной клетке.
 """
+import math
 import os
 
 from PyQt6.QtCore import Qt, pyqtSignal, QRectF, QPointF
 from PyQt6.QtGui import (QBrush, QColor, QFont, QImage, QPainter, QPainterPath,
-                          QPen, QPixmap, QRadialGradient)
+                          QPen, QPixmap, QPolygonF, QRadialGradient)
 from PyQt6.QtWidgets import (QGraphicsEllipseItem, QGraphicsPixmapItem, QGraphicsRectItem,
                              QGraphicsScene, QGraphicsView)
 
@@ -28,6 +29,17 @@ DEFAULT_OPTS = {
     'labels': 'number', 'dead_alpha': 45, 'stroke': 1,
     'glow': True, 'sides': 'classic',
     'bg_opacity': 100, 'bg_mode': 'stretch',
+    'attack_lines': True,
+}
+
+# Стиль отрезка атаки: цвет, толщина, штрих. Координаты приходят в клетках.
+ATTACK_STYLES = {
+    'hit': ('#e74c3c', 2.6, Qt.PenStyle.SolidLine),
+    'crit': ('#f1c40f', 3.8, Qt.PenStyle.SolidLine),
+    'miss': ('#95a5a6', 1.8, Qt.PenStyle.DashLine),
+    'nat1': ('#9b59b6', 2.0, Qt.PenStyle.DotLine),
+    'heal': ('#2ecc71', 2.6, Qt.PenStyle.SolidLine),
+    'move': ('#3498db', 1.8, Qt.PenStyle.DashDotLine),
 }
 
 
@@ -56,6 +68,11 @@ class MapView(QGraphicsView):
         self._bg_path = None
         self._bg_pix = None
         self._bg_cache = {}
+        self._round_lines = []
+        self._focus_lines = []
+        self._focus_enemies = []
+        self._attack_items = []
+        self._focus_items = []
 
     # ---------- фон ----------
     def set_background(self, path):
@@ -155,6 +172,9 @@ class MapView(QGraphicsView):
             f = max(10, value) / 100.0
             self.scale(f, f)
             return
+        if key == 'attack_lines':
+            self._paint_attack_lines()
+            return
         self.rebuild(self._bm, self._sides, self._selected)
 
     def reset_opts(self):
@@ -246,11 +266,130 @@ class MapView(QGraphicsView):
                         covered.add((xx, yy))
         return covered
 
+    def set_round_lines(self, lines):
+        """Линии последнего раунда. Снимает прежние стрелки, сцену не чистит."""
+        self._round_lines = list(lines or [])
+        self._focus_lines = []
+        self._focus_enemies = []
+        self._paint_attack_lines()
+        self._paint_focus_rings()
+
+    def set_focus_lines(self, lines):
+        """Подсветка одной записи поверх линий раунда, без пересборки сцены."""
+        self._focus_lines = list(lines or [])
+        self._paint_attack_lines()
+
+    def focus_creatures(self, enemies):
+        """Кольца вокруг существ и центр кадра. Токены не перерисовываются."""
+        self._focus_enemies = [enemy for enemy in enemies if enemy is not None]
+        self._paint_focus_rings()
+        if self._bm is None or not self._focus_enemies:
+            return
+        rect = None
+        cell = self.opts['cell']
+        for enemy in self._focus_enemies:
+            pos = self._bm.get_pos(enemy)
+            if not pos:
+                continue
+            side = self._bm.cells_of(enemy) * cell
+            piece = QRectF(pos[0] * cell, pos[1] * cell, side, side)
+            rect = piece if rect is None else rect.united(piece)
+        if rect is None:
+            return
+        margin = cell * 1.5
+        self.ensureVisible(rect.adjusted(-margin, -margin, margin, margin), 20, 20)
+        self.centerOn(rect.center())
+
+    def _paint_attack_lines(self):
+        scene = self.scene()
+        for item in self._attack_items:
+            scene.removeItem(item)
+        self._attack_items = []
+        if not self.opts.get('attack_lines', True) or self._bm is None:
+            return
+        dim = bool(self._focus_lines)
+        for spec in self._round_lines:
+            self._add_attack_line(spec, 0.35 if dim else 0.95, 1.0)
+        for spec in self._focus_lines:
+            self._add_attack_line(spec, 1.0, 1.45)
+
+    def _add_attack_line(self, spec, opacity, width_scale):
+        cell = self.opts['cell']
+        r1 = float(spec.get('r1') or 0.45)
+        r2 = float(spec.get('r2') or 0.45)
+        x1 = (float(spec['x1']) + r1) * cell
+        y1 = (float(spec['y1']) + r1) * cell
+        x2 = (float(spec['x2']) + r2) * cell
+        y2 = (float(spec['y2']) + r2) * cell
+        dx, dy = x2 - x1, y2 - y1
+        length = math.hypot(dx, dy)
+        if length < 2:
+            return
+        ux, uy = dx / length, dy / length
+        pad1, pad2 = r1 * cell * 0.92, r2 * cell * 0.92
+        if length <= pad1 + pad2 + 4:
+            pad1 = pad2 = 0
+        sx, sy = x1 + ux * pad1, y1 + uy * pad1
+        ex, ey = x2 - ux * pad2, y2 - uy * pad2
+        color_hex, width, pen_style = ATTACK_STYLES.get(spec.get('style'), ATTACK_STYLES['hit'])
+        color = QColor(color_hex)
+        pen = QPen(color, max(1.0, width * width_scale), pen_style)
+        pen.setCosmetic(True)
+        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        line = self.scene().addLine(sx, sy, ex, ey, pen)
+        line.setOpacity(opacity)
+        line.setZValue(6)
+        line.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
+        self._attack_items.append(line)
+        head = 11 * width_scale
+        spread = 4.5 * width_scale
+        polygon = QPolygonF([
+            QPointF(ex, ey),
+            QPointF(ex - ux * head - uy * spread, ey - uy * head + ux * spread),
+            QPointF(ex - ux * head + uy * spread, ey - uy * head - ux * spread),
+        ])
+        arrow = self.scene().addPolygon(polygon, QPen(Qt.PenStyle.NoPen), QBrush(color))
+        arrow.setOpacity(opacity)
+        arrow.setZValue(6)
+        arrow.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
+        self._attack_items.append(arrow)
+
+    def _paint_focus_rings(self):
+        scene = self.scene()
+        for item in self._focus_items:
+            scene.removeItem(item)
+        self._focus_items = []
+        if self._bm is None:
+            return
+        cell = self.opts['cell']
+        pen = QPen(QColor('#f1c40f'), 3)
+        pen.setCosmetic(True)
+        for enemy in self._focus_enemies:
+            pos = self._bm.get_pos(enemy)
+            if not pos:
+                continue
+            side = self._bm.cells_of(enemy) * cell
+            pad = max(2, side * 0.08)
+            ring = scene.addEllipse(
+                pos[0] * cell - pad, pos[1] * cell - pad, side + 2 * pad, side + 2 * pad,
+                pen, QBrush(Qt.BrushStyle.NoBrush))
+            ring.setZValue(7)
+            ring.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
+            self._focus_items.append(ring)
+
     def rebuild(self, bm, sides, selected=None):
+        lines = list(self._round_lines)
+        focus_lines = list(self._focus_lines)
+        focus_enemies = [enemy for enemy in self._focus_enemies if enemy is not None]
+        self._attack_items = []
+        self._focus_items = []
         self._bm, self._sides, self._selected = bm, sides or [], selected
         sc = self.scene()
         sc.clear()
         self.setBackgroundBrush(QColor(self.pal['canvas_map']))
+        self._round_lines = lines
+        self._focus_lines = focus_lines
+        self._focus_enemies = focus_enemies
         if bm is None:
             return
         o = self.opts
@@ -339,3 +478,5 @@ class MapView(QGraphicsView):
                     t.setPos(x0 + (box - b.width()) / 2, y0 + (box - b.height()) / 2)
                     if not en.alive:
                         t.setOpacity(max(0.1, o['dead_alpha'] / 100.0))
+        self._paint_attack_lines()
+        self._paint_focus_rings()

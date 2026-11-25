@@ -50,6 +50,52 @@ class Attack:
         )
 
 
+class AttackResult:
+    """Пять прежних значений плюс натуральная кость и модификатор.
+
+    `hit, damage, total, critical, info = enemy.perform_attack(...)` работает
+    как раньше: объект итерируется ровно пятью полями.
+    """
+
+    __slots__ = ('hit', 'damage', 'total', 'critical', 'info', 'natural', 'modifier')
+
+    def __init__(self, hit, damage, total, critical, info, natural, modifier):
+        self.hit = bool(hit)
+        self.damage = damage
+        self.total = total
+        self.critical = bool(critical)
+        self.info = info
+        self.natural = natural
+        self.modifier = modifier
+
+    def __iter__(self):
+        yield self.hit
+        yield self.damage
+        yield self.total
+        yield self.critical
+        yield self.info
+
+    def __len__(self):
+        return 5
+
+    def __getitem__(self, index):
+        return (self.hit, self.damage, self.total, self.critical, self.info)[index]
+
+    def __eq__(self, other):
+        if isinstance(other, AttackResult):
+            return (tuple(self) == tuple(other)
+                    and self.natural == other.natural
+                    and self.modifier == other.modifier)
+        if isinstance(other, tuple):
+            return tuple(self) == tuple(other)
+        return NotImplemented
+
+    def __repr__(self):
+        return (f'AttackResult(hit={self.hit}, damage={self.damage}, total={self.total}, '
+                f'critical={self.critical}, info={self.info!r}, natural={self.natural}, '
+                f'modifier={self.modifier})')
+
+
 class Enemy(Subject):
     """Существо в битве. rng — внедряемая зависимость (DI): None => модульный random."""
 
@@ -113,15 +159,20 @@ class Enemy(Subject):
         'double_all' (по умолчанию, так играет стол) — крит удваивает весь урон,
         включая модификатор; 'dice_only' — кости дважды, модификатор один раз.
         Натуральная 1 всегда промах, натуральная 20 всегда попадание.
+
+        Возврат по-прежнему распаковывается в 5 значений. Натуральная кость
+        и модификатор лежат в полях natural / modifier (AttackResult).
         """
-        attack_roll = self._rng.randint(1, 20)
-        total_attack = attack_roll + attack.attack_bonus
-        critical = (attack_roll == 20)
-        if attack_roll == 1:
+        natural = self._rng.randint(1, 20)
+        modifier = attack.attack_bonus
+        total_attack = natural + modifier
+        critical = (natural == 20)
+        if natural == 1:
             hit = False
         else:
             hit = critical or total_attack >= target_ac
         damage_info = ""
+        damage = 0
         if hit:
             dice_type = int(attack.damage_dice_type.split('d')[1])
             rolls = attack.damage_dice_count
@@ -137,8 +188,8 @@ class Enemy(Subject):
                 damage_info += f" ({attack.damage_type})"
             if getattr(attack, 'magical', False):
                 damage_info += " ✦маг."
-            return True, damage, total_attack, critical, damage_info
-        return False, 0, total_attack, critical, damage_info
+        return AttackResult(hit, damage, total_attack, critical, damage_info,
+                            natural, modifier)
 
     def perform_heal(self, attack: Attack) -> int:
         """Сколько хитов восстанавливает лечение: кости + модификатор, без броска атаки."""
