@@ -253,6 +253,11 @@ def parse_attack_block(text, warnings):
     }
     if extras:
         attack['extra_damage'] = extras
+    from effects import parse_on_hit
+    riders, rider_warnings = parse_on_hit(cleaned)
+    if riders:
+        attack['riders'] = riders
+    warnings.extend(rider_warnings)
     return attack
 
 
@@ -302,6 +307,19 @@ def _named_action(text):
     return {'name': clean_text(match.group(1)), 'desc': clean_text(match.group(2))}
 
 
+def _attach_effect(action, warnings):
+    """Кладёт разобранный спасбросок в действие. Неразобранный текст остаётся как есть."""
+    if not action:
+        return None
+    from effects import parse_special_effect
+    effect, warning = parse_special_effect(action.get('name'), action.get('desc'))
+    if effect:
+        action['effect'] = effect
+    elif warning:
+        warnings.append(warning)
+    return action
+
+
 def parse_action_blocks(paragraphs, warnings):
     """Абзацы раздела «Действия» -> атаки, мультиатака, особые действия."""
     attacks, specials, deferred = [], [], []
@@ -321,7 +339,7 @@ def parse_action_blocks(paragraphs, warnings):
                 continue
             named = _named_action(block)
             if named and not named['name'].lower().startswith('попадание'):
-                specials.append(named)
+                specials.append(_attach_effect(named, warnings))
     multi = None
     if deferred:
         multi = parse_multiattack('\n'.join(deferred), attacks, warnings)
@@ -374,7 +392,7 @@ def parse_legendary(paragraphs, attacks, warnings):
                 continue
         option = _legendary_option(paragraph, attacks)
         if option:
-            options.append(option)
+            options.append(_attach_effect(option, warnings))
     if not options and per_round is None:
         return None
     if per_round is None:
@@ -511,10 +529,12 @@ def _apply_card(card, monster):
     monster['multiattack'] = multi
     monster['special_actions'] = specials
     monster['bonus_actions'] = [item for item in
-                                (_named_action(text) for text in card.get('bonus') or [])
+                                (_attach_effect(_named_action(text), monster['warnings'])
+                                 for text in card.get('bonus') or [])
                                 if item]
     monster['reactions'] = [item for item in
-                            (_named_action(text) for text in card.get('reactions') or [])
+                            (_attach_effect(_named_action(text), monster['warnings'])
+                             for text in card.get('reactions') or [])
                             if item]
     monster['legendary_actions'] = parse_legendary(
         card.get('legendary'), attacks, monster['warnings'])

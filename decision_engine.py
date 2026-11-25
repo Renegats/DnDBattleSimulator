@@ -7,6 +7,10 @@
 import re
 from typing import List
 
+from conditions import (HARD_DISABLE, attack_modifiers, charm_blocks,
+                        effective_speed, fear_sources, has_condition,
+                        is_incapacitated)
+
 DMG_CANON_TRIGGERS = [
     ('bludgeoning', ['дроб', 'bludgeon']),
     ('piercing',    ['колю', 'пронз', 'pierc']),
@@ -120,6 +124,16 @@ class DecisionEngine:
         arch = attacker.strategy.__class__.__name__
         target = attacker.strategy.select_target(attacker, sides, ignore)
 
+        if is_incapacitated(attacker):
+            rationale = 'недееспособен: ход пропущен'
+            self._log(unit=attacker.name, side=attacker.side, int_score=int_score,
+                      tier=tier, tier_name=TIER_NAMES[tier], archetype=arch,
+                      target_name=None, target_reason=rationale,
+                      attack_name=None, attack_reason='', candidates=[],
+                      move_intent='hold', move_reason='', multiattack=False,
+                      rationale=rationale)
+            return Decision(None, None, 'hold', 0, tier, rationale)
+
         if target is None:
             self._log(unit=attacker.name, side=attacker.side, int_score=int_score,
                       tier=tier, tier_name=TIER_NAMES[tier], archetype=arch,
@@ -129,7 +143,20 @@ class DecisionEngine:
                       rationale='')
             return Decision(None, None, 'approach', 5, tier, '')
 
+        target, condition_note = self._condition_target(
+            attacker, target, sides, ignore, tier)
+        if target is None:
+            self._log(unit=attacker.name, side=attacker.side, int_score=int_score,
+                      tier=tier, tier_name=TIER_NAMES[tier], archetype=arch,
+                      target_name=None, target_reason=condition_note,
+                      attack_name=None, attack_reason='', candidates=[],
+                      move_intent='hold', move_reason=condition_note,
+                      multiattack=False, rationale=condition_note)
+            return Decision(None, None, 'hold', 5, tier, condition_note)
+
         target_reason = f'архетип {arch} выбрал цель'
+        if condition_note:
+            target_reason = f'{target_reason}; {condition_note}'
         if tier >= 2 and self._all_immune(attacker, target):
             alt = self._first_not_fully_immune(attacker, sides, ignore, skip=target)
             if alt is not None:
@@ -147,9 +174,10 @@ class DecisionEngine:
                       tier=tier, tier_name=TIER_NAMES[tier], archetype=arch,
                       target_name=target.name, target_reason=target_reason,
                       attack_name=None, attack_reason=f'мультиатака: {strikes_desc}',
-                      candidates=[], move_intent='approach', move_reason='',
-                      multiattack=True, rationale='')
-            return Decision(target, None, 'approach', 5, tier, '')
+                      candidates=[], move_intent=self._move_intent(attacker), move_reason='',
+                      multiattack=True, rationale=condition_note or '')
+            return Decision(target, None, self._move_intent(attacker), 5, tier,
+                            condition_note or '')
 
         if tier == 0:
             self._log(unit=attacker.name, side=attacker.side, int_score=int_score,
@@ -158,9 +186,10 @@ class DecisionEngine:
                       attack_name=None,
                       attack_reason=f'Tier 0: решение полностью у архетипа {arch}, '
                                     f'мозг не вмешивается',
-                      candidates=[], move_intent='approach', move_reason='',
-                      multiattack=False, rationale='')
-            return Decision(target, None, 'approach', 5, tier, '')
+                      candidates=[], move_intent=self._move_intent(attacker), move_reason='',
+                      multiattack=False, rationale=condition_note or '')
+            return Decision(target, None, self._move_intent(attacker), 5, tier,
+                            condition_note or '')
 
         dist_now = distance_ft_between(attacker, target)
         attack, reason, candidates = self._pick_attack(attacker, target, tier, dist_now)
@@ -189,6 +218,13 @@ class DecisionEngine:
                            f'(reach {reach}), и ' + ' + '.join(why))
             reason = (reason + '; ' if reason else '') + 'держит дистанцию (стреляет издалека)'
 
+        if effective_speed(attacker) <= 0:
+            move_intent = 'hold'
+            note = 'скорость 0, без сближения'
+            reason = (reason + '; ' if reason else '') + note
+        if condition_note:
+            reason = (reason + '; ' if reason else '') + condition_note
+
         self._log(unit=attacker.name, side=attacker.side, int_score=int_score,
                   tier=tier, tier_name=TIER_NAMES[tier], archetype=arch,
                   target_name=target.name, target_reason=target_reason,
@@ -196,6 +232,98 @@ class DecisionEngine:
                   candidates=candidates, move_intent=move_intent,
                   move_reason=move_reason, multiattack=False, rationale=reason)
         return Decision(target, attack, move_intent, reach, tier, reason)
+
+    def _move_intent(self, attacker, default='approach'):
+        if effective_speed(attacker) <= 0:
+            return 'hold'
+        return default
+
+    def _enemies(self, attacker, sides, ignore):
+        found = []
+        own = getattr(attacker, 'ignore_sides', None) or set()
+        for side_idx, group in enumerate(sides):
+            if side_idx == getattr(attacker, 'side', None) or side_idx in ignore or side_idx in own:
+                continue
+            for enemy in group:
+                if getattr(enemy, 'alive', False) and not charm_blocks(attacker, enemy):
+                    found.append(enemy)
+        return found
+
+    def _reach(self, attacker):
+        attacks = getattr(attacker, 'attacks', None) or []
+        if not attacks:
+            return 5
+        return max(getattr(attack, 'range_ft', 5) for attack in attacks)
+
+    def _rider_disable(self, attacker):
+        found = set()
+        for attack in getattr(attacker, 'attacks', None) or []:
+            for rider in getattr(attack, 'riders', None) or []:
+                if isinstance(rider, dict) and rider.get('condition') in HARD_DISABLE:
+                    found.add(rider['condition'])
+        return found
+
+    def _condition_target(self, attacker, target, sides, ignore, tier):
+        """Очарование, скорость 0, страх, преимущество и уже наложенный контроль."""
+        from battle_strategies import distance_ft_between
+        notes = []
+        enemies = self._enemies(attacker, sides, ignore)
+        if charm_blocks(attacker, target):
+            notes.append('очарован и не атакует источник')
+            target = enemies[0] if enemies else None
+            if target is None:
+                return None, 'очарован и не может атаковать источник'
+        if target is None:
+            return None, '; '.join(notes)
+
+        reach = self._reach(attacker)
+        if effective_speed(attacker) <= 0:
+            notes.append('скорость 0: только цель в досягаемости')
+
+            def in_reach(enemy):
+                return distance_ft_between(attacker, enemy) <= reach
+
+            if not in_reach(target):
+                near = [enemy for enemy in enemies if in_reach(enemy)]
+                target = near[0] if near else None
+                if target is None:
+                    return None, 'скорость 0: нет цели в досягаемости'
+
+        feared = {id(source) for source in fear_sources(attacker, sides)}
+        if feared and target is not None:
+            def must_close(enemy):
+                return (id(enemy) in feared
+                        and distance_ft_between(attacker, enemy) > reach)
+
+            if must_close(target):
+                alt = [enemy for enemy in enemies if not must_close(enemy)]
+                if alt:
+                    notes.append('испуган: не сближается с источником')
+                    target = alt[0]
+                else:
+                    return None, 'испуган: не может приблизиться к источнику'
+
+        if tier >= 2 and target is not None:
+            disables = self._rider_disable(attacker)
+            if disables and all(has_condition(target, cid) for cid in disables):
+                alt = [enemy for enemy in enemies
+                       if not all(has_condition(enemy, cid) for cid in disables)]
+                if alt:
+                    notes.append('не тратит контроль на уже выведенную цель')
+                    target = min(alt, key=lambda enemy: distance_ft_between(attacker, enemy))
+
+            def grants(enemy):
+                adv, dis, _force = attack_modifiers(
+                    attacker, enemy, distance_ft_between(attacker, enemy))
+                return adv and not dis
+
+            if target is not None and not grants(target):
+                better = [enemy for enemy in enemies if grants(enemy)]
+                if better:
+                    notes.append('предпочитает цель, по которой есть преимущество')
+                    target = min(better, key=lambda enemy: (
+                        distance_ft_between(attacker, enemy), getattr(enemy, 'hp', 0)))
+        return target, '; '.join(notes)
 
     # ---------- A5 ----------
     def _all_immune(self, attacker, target) -> bool:
@@ -244,10 +372,13 @@ class DecisionEngine:
                     part_eff = 0.0 if extra_type in imm else (0.5 if extra_type in res else 1.0)
                     part *= part_eff
                 extra_avg += part
+            adv, dis, _force = attack_modifiers(attacker, target, dist_now)
+            factor = 1.25 if adv and not dis else (0.75 if dis and not adv else 1.0)
+            ev = avg * eff + extra_avg
             if use_hit:
                 p_hit = max(0.05, min(0.95, (21 - max(1, ac - a.attack_bonus)) / 20.0))
-                return (avg * eff + extra_avg) * p_hit, eff
-            return avg * eff + extra_avg, eff
+                ev *= p_hit
+            return ev * factor, eff
 
         from battle_strategies import is_healing_attack
         ally = getattr(target, 'side', None) == getattr(attacker, 'side', None)

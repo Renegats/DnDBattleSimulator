@@ -103,6 +103,12 @@ class CombatEvent:
     legendary: bool = False
     rolls: list = field(default_factory=list)
     cost: int | None = None
+    dc: int | None = None
+    save_ability: str | None = None
+    condition: str | None = None
+    naturals: list = field(default_factory=list)
+    advantage: str | None = None
+    resistance_used: bool = False
 
     def to_dict(self):
         data = {}
@@ -121,6 +127,8 @@ class CombatEvent:
                 value = [DamagePart.from_dict(part) for part in (value or [])]
             elif item.name == 'rolls':
                 value = [InitiativeRoll.from_dict(part) for part in (value or [])]
+            elif item.name == 'naturals':
+                value = [int(part) for part in (value or []) if part is not None]
             elif item.name in _POS_FIELDS:
                 value = _as_pos(value)
             kwargs[item.name] = value
@@ -236,6 +244,16 @@ def detail_lines(event: CombatEvent) -> list:
         lines.append(
             f'бросок d20 {event.natural} {mod:+d} = {event.attack_total} '
             f'против КД {event.ac} ({label})')
+        if event.advantage == 'advantage' and len(event.naturals) == 2:
+            lines.append(
+                f'преимущество: кости {event.naturals[0]} и {event.naturals[1]}, '
+                f'взята {event.natural}')
+        elif event.advantage == 'disadvantage' and len(event.naturals) == 2:
+            lines.append(
+                f'помеха: кости {event.naturals[0]} и {event.naturals[1]}, '
+                f'взята {event.natural}')
+        elif event.advantage == 'cancel':
+            lines.append('преимущество и помеха взаимно гасятся')
     elif event.kind == 'attack' and event.attack_total is not None:
         lines.append(f'итог атаки {event.attack_total} против КД {event.ac}')
     for part in event.damages:
@@ -243,6 +261,19 @@ def detail_lines(event: CombatEvent) -> list:
         note = part.note or ''
         lines.append(
             f'{prefix}{part.damage_type or "урон"}: {part.raw} до защит → {part.final} после{note}')
+    if event.kind == 'save':
+        ability = event.save_ability or ''
+        if event.advantage == 'auto_fail' or event.natural is None:
+            lines.append(f'спасбросок {ability}: автоматический провал, Сл {event.dc}')
+        elif event.natural is not None:
+            mod = event.modifier or 0
+            lines.append(
+                f'спасбросок {ability}: d20 {event.natural} {mod:+d} = {event.attack_total} '
+                f'против Сл {event.dc}')
+        if event.resistance_used:
+            lines.append('легендарное сопротивление потрачено')
+    if event.kind in ('condition', 'recharge', 'lair') and event.condition:
+        lines.append(f'состояние: {event.condition}')
     if event.kind == 'heal' and event.heal_amount is not None:
         lines.append(f'лечение +{event.heal_amount}')
     if event.hp_before is not None and event.hp_after is not None and event.kind != 'initiative':
@@ -402,12 +433,15 @@ def _kind_ok(event: CombatEvent, kind: str) -> bool:
         return bool(event.legendary) or event.kind == 'legendary'
     if kind == 'initiative':
         return event.kind == 'initiative'
+    if kind == 'conditions':
+        return event.kind in ('save', 'condition', 'recharge', 'lair')
     return True
 
 
 def _haystack(event: CombatEvent) -> str:
     chunks = [event.text, event.actor, event.target, event.action, event.reason,
-              event.kind, event.result]
+              event.kind, event.result, event.condition, event.save_ability,
+              event.advantage]
     for part in event.damages:
         chunks.append(part.damage_type)
         chunks.append(part.note)

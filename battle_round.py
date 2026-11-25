@@ -77,6 +77,242 @@ def _stamp_reason(events, start, reason):
             event.reason = reason
 
 
+def _bound_events(pairs, round_no, reason):
+    from conditions import describe_removed
+    out = []
+    for creature, cond in pairs:
+        out.append(CombatEvent(
+            kind='condition', result='removed', round=round_no,
+            condition=cond.get('id'),
+            actor=getattr(creature, 'name', None),
+            actor_id=id(creature),
+            actor_side=getattr(creature, 'side', None),
+            reason=reason,
+            text=describe_removed(creature, cond, reason)))
+    return out
+
+
+def _from_note(creature, note, round_no):
+    auto = bool(note.get('auto_fail'))
+    return CombatEvent(
+        kind=note.get('kind') or 'save',
+        result=note.get('result'),
+        text=note.get('text'),
+        round=round_no,
+        actor=getattr(creature, 'name', None),
+        actor_id=id(creature),
+        actor_side=getattr(creature, 'side', None),
+        natural=note.get('natural'),
+        naturals=list(note.get('naturals') or []),
+        modifier=note.get('modifier'),
+        attack_total=note.get('total'),
+        dc=note.get('dc'),
+        ac=note.get('dc'),
+        save_ability=note.get('save_ability'),
+        advantage='auto_fail' if auto else note.get('advantage'),
+        resistance_used=bool(note.get('resistance_used')),
+        condition=note.get('condition'),
+    )
+
+
+def _open_turn(attacker, sides, round_no):
+    from conditions import iter_creatures, release_grapples_from, turn_bounds
+    from effects import roll_recharges
+    events = _bound_events(turn_bounds(attacker, sides, 'start'), round_no, 'начало хода')
+    for creature in iter_creatures(sides):
+        for owner, cond in release_grapples_from(creature, sides):
+            events.extend(_bound_events([(owner, cond)], round_no, 'источник не может держать'))
+    events.extend(roll_recharges(attacker, round_no))
+    return events
+
+
+def _close_turn(attacker, sides, round_no):
+    from conditions import tick_rounds_and_saves, turn_bounds
+    events = [_from_note(attacker, note, round_no)
+              for note in tick_rounds_and_saves(attacker, sides, round_no)]
+    events.extend(_bound_events(turn_bounds(attacker, sides, 'end'), round_no, 'конец хода'))
+    return events
+
+
+def _fear_allow(battle_map, attacker, sides):
+    from conditions import fear_sources, movement_blocked_by_fear
+    if battle_map is None or not fear_sources(attacker, sides):
+        return None
+
+    def allow(hx, hy):
+        origin = battle_map._anchor_h(attacker)
+        return not movement_blocked_by_fear(
+            attacker, origin, (hx, hy), sides, battle_map._anchor_h)
+
+    return allow
+
+
+def _opening_specials(attacker, sides, ignore, battle_map, focus, round_no):
+    from effects import execute_effect, opening_effects, targets_for
+    events = []
+    for effect in opening_effects(attacker):
+        if not targets_for(attacker, effect, sides, ignore, battle_map, focus=focus):
+            continue
+        events.extend(execute_effect(
+            attacker, effect, sides, ignore, battle_map,
+            round_no=round_no, focus=focus))
+    return events
+
+
+def _act_turn(attacker, side_idx, sides, side_names, ignore_sides, battle_map,
+              engine, auto_move, crit_mode, round_no, events,
+              effective_speed, is_incapacitated, try_stand,
+              replacing_effect, should_replace_attacks):
+    """Ход одного существа: состояния, особое действие или удары.
+
+    side_names не используется: сигнатура совпадает с вызовом из раунда,
+    чтобы не тащить лишние замыкания.
+    """
+    del side_names
+    if is_incapacitated(attacker):
+        events.append(CombatEvent(
+            kind='condition', result='skip', round=round_no, condition='incapacitated',
+            actor=attacker.name, actor_id=id(attacker),
+            actor_side=getattr(attacker, 'side', None),
+            text=f'{attacker.name} недееспособен и пропускает ход'))
+        return
+    stood = try_stand(attacker)
+    if stood:
+        cost, _cond = stood
+        events.append(CombatEvent(
+            kind='condition', result='removed', round=round_no, condition='prone',
+            actor=attacker.name, actor_id=id(attacker),
+            actor_side=getattr(attacker, 'side', None),
+            text=(f'{attacker.name} встаёт, тратя {cost} фт (половина скорости). '
+                  f'Состояние «сбит с ног» снято')))
+
+    ignore = ignore_sides.get(side_idx, set())
+    decision = engine.decide(attacker, sides, ignore)
+    target = decision.target
+    breath = replacing_effect(attacker)
+    plan_breath = should_replace_attacks(
+        attacker, breath, sides, ignore, battle_map, target)
+    if not plan_breath:
+        events.extend(_opening_specials(
+            attacker, sides, ignore, battle_map, target, round_no))
+    if not target:
+        fired = _replacing_special(
+            attacker, breath if plan_breath else None, sides, ignore,
+            battle_map, None, round_no)
+        if fired:
+            events.extend(fired)
+            return
+        events.append(CombatEvent(
+            kind='no_target', round=round_no, actor=attacker.name,
+            actor_id=id(attacker), actor_side=getattr(attacker, 'side', None),
+            text=f'{attacker.name} - нет подходящих целей для атаки'))
+        return
+    if decision.rationale:
+        events.append(CombatEvent(
+            kind='decision', round=round_no, actor=attacker.name,
+            actor_id=id(attacker), actor_side=getattr(attacker, 'side', None),
+            target=getattr(target, 'name', None), target_id=id(target),
+            target_side=getattr(target, 'side', None),
+            reason=decision.rationale,
+            action=getattr(decision.attack, 'name', None),
+            text=f'🧠 {attacker.name}: {decision.rationale}'))
+
+    if decision.attack is None:     # делегат (tier0/1) или мультиатака
+        strikes = resolve_strikes(attacker, target)
+        if not strikes:
+            events.append(CombatEvent(
+                kind='no_attack', round=round_no, actor=attacker.name,
+                actor_id=id(attacker), actor_side=getattr(attacker, 'side', None),
+                target=getattr(target, 'name', None), target_id=id(target),
+                target_side=getattr(target, 'side', None),
+                text=f'{attacker.name} - нет доступных атак'))
+            return
+        reach = strike_reach(strikes)
+    else:                           # smart-одиночная (tier>=2)
+        strikes = [decision.attack]
+        reach = decision.target_dist_ft
+
+    move_reach = reach
+    if plan_breath and breath is not None:
+        move_reach = max(reach, int(breath.get('range_ft') or 0))
+    budget = effective_speed(attacker)
+    allow = _fear_allow(battle_map, attacker, sides)
+    in_reach = True
+    if battle_map is not None and \
+            battle_map.get_pos(attacker) and battle_map.get_pos(target):
+        dist = battle_map.distance_ft(attacker, target)
+        if decision.move_intent == 'hold' and dist <= move_reach:
+            pass
+        elif dist > move_reach and auto_move and budget - int(getattr(attacker, 'moved_ft', 0) or 0) >= 5:
+            origin = battle_map.get_pos(attacker)
+            battle_map.move_towards(attacker, target, budget,
+                                    reach_ft=move_reach, allow=allow)
+            dest = battle_map.get_pos(attacker)
+            if origin and dest and (origin[0], origin[1]) != (dest[0], dest[1]):
+                events.append(CombatEvent(
+                    kind='move', round=round_no, actor=attacker.name,
+                    actor_id=id(attacker), actor_side=getattr(attacker, 'side', None),
+                    target=getattr(target, 'name', None), target_id=id(target),
+                    target_side=getattr(target, 'side', None),
+                    action='движение',
+                    from_pos=(origin[0], origin[1]), to_pos=(dest[0], dest[1]),
+                    reason=decision.rationale or None,
+                    text=(f'{attacker.name} перемещается {format_pos(origin)} → '
+                          f'{format_pos(dest)}')))
+            dist = battle_map.distance_ft(attacker, target)
+        if plan_breath:
+            fired = _replacing_special(
+                attacker, breath, sides, ignore, battle_map, target, round_no)
+            if fired:
+                start = len(events)
+                events.extend(fired)
+                _stamp_reason(events, start, decision.rationale)
+                return
+        if dist > reach:
+            in_reach = False
+            events.append(CombatEvent(
+                kind='out_of_reach', round=round_no, actor=attacker.name,
+                actor_id=id(attacker), actor_side=getattr(attacker, 'side', None),
+                target=getattr(target, 'name', None), target_id=id(target),
+                target_side=getattr(target, 'side', None),
+                reason=decision.rationale or None,
+                text=(f'{attacker.name} не может достать {target.name} '
+                      f'({dist} фт > {reach} фт)')))
+        elif decision.attack is None and decision.tier <= 1 \
+                and not getattr(attacker, 'multiattack', None):
+            strikes = resolve_strikes(attacker, target)
+            if not strikes:
+                return
+    elif plan_breath:
+        fired = _replacing_special(
+            attacker, breath, sides, ignore, battle_map, target, round_no)
+        if fired:
+            start = len(events)
+            events.extend(fired)
+            _stamp_reason(events, start, decision.rationale)
+            return
+    if not in_reach:
+        return
+
+    before = len(events)
+    execute_strikes(attacker, target, strikes, sides, ignore_sides, battle_map,
+                    crit_mode=crit_mode, round_no=round_no, events=events)
+    _stamp_reason(events, before, decision.rationale)
+
+
+def _replacing_special(attacker, effect, sides, ignore, battle_map, focus, round_no):
+    from effects import consume_recharge, execute_effect, targets_for
+    if effect is None:
+        return []
+    if not targets_for(attacker, effect, sides, ignore, battle_map, focus=focus):
+        return []
+    events = execute_effect(
+        attacker, effect, sides, ignore, battle_map, round_no=round_no, focus=focus)
+    if effect.get('recharge'):
+        consume_recharge(attacker, effect.get('name'))
+    return events
+
+
 def run_round(sides, side_names, ignore_sides, battle_map, engine, auto_move=True,
               crit_mode='double_all', rng=None, round_no=None):
     """Один раунд боя. outcome: 'continue' | 'over' | 'empty'.
@@ -117,6 +353,15 @@ def run_round(sides, side_names, ignore_sides, battle_map, engine, auto_move=Tru
         for enemy in side:
             refresh_legendary_pool(enemy, reset=False)
 
+    from conditions import effective_speed, is_incapacitated, try_stand
+    from effects import replacing_effect, run_lair, should_replace_attacks
+
+    for side in sides:
+        for enemy in side:
+            if enemy.alive and getattr(enemy, 'lair_actions', None):
+                events.extend(run_lair(
+                    enemy, sides, ignore_sides, battle_map, round_no))
+
     previous = None
     for _total, _dex, _tie, side_idx, attacker in order:
         if previous is not None:
@@ -128,81 +373,14 @@ def run_round(sides, side_names, ignore_sides, battle_map, engine, auto_move=Tru
             continue
         refresh_legendary_pool(attacker, reset=True)  # пул возвращается в начале своего хода
         previous = attacker
-        decision = engine.decide(attacker, sides, ignore_sides.get(side_idx, set()))
-        target = decision.target
-        if not target:
-            events.append(CombatEvent(
-                kind='no_target', round=round_no, actor=attacker.name,
-                actor_id=id(attacker), actor_side=getattr(attacker, 'side', None),
-                text=f'{attacker.name} - нет подходящих целей для атаки'))
-            continue
-        if decision.rationale:
-            events.append(CombatEvent(
-                kind='decision', round=round_no, actor=attacker.name,
-                actor_id=id(attacker), actor_side=getattr(attacker, 'side', None),
-                target=getattr(target, 'name', None), target_id=id(target),
-                target_side=getattr(target, 'side', None),
-                reason=decision.rationale,
-                action=getattr(decision.attack, 'name', None),
-                text=f'🧠 {attacker.name}: {decision.rationale}'))
-
-        if decision.attack is None:     # делегат (tier0/1) или мультиатака
-            strikes = resolve_strikes(attacker, target)
-            if not strikes:
-                events.append(CombatEvent(
-                    kind='no_attack', round=round_no, actor=attacker.name,
-                    actor_id=id(attacker), actor_side=getattr(attacker, 'side', None),
-                    target=getattr(target, 'name', None), target_id=id(target),
-                    target_side=getattr(target, 'side', None),
-                    text=f'{attacker.name} - нет доступных атак'))
-                continue
-            reach = strike_reach(strikes)
-        else:                           # smart-одиночная (tier>=2)
-            strikes = [decision.attack]
-            reach = decision.target_dist_ft
-
-        if battle_map is not None and \
-                battle_map.get_pos(attacker) and battle_map.get_pos(target):
-            dist = battle_map.distance_ft(attacker, target)
-            if decision.move_intent == 'hold' and dist <= reach:
-                pass                    # держим дистанцию
-            elif dist > reach and auto_move:
-                origin = battle_map.get_pos(attacker)
-                battle_map.move_towards(attacker, target, attacker.speed,
-                                        reach_ft=reach)
-                dest = battle_map.get_pos(attacker)
-                if origin and dest and (origin[0], origin[1]) != (dest[0], dest[1]):
-                    events.append(CombatEvent(
-                        kind='move', round=round_no, actor=attacker.name,
-                        actor_id=id(attacker), actor_side=getattr(attacker, 'side', None),
-                        target=getattr(target, 'name', None), target_id=id(target),
-                        target_side=getattr(target, 'side', None),
-                        action='движение',
-                        from_pos=(origin[0], origin[1]), to_pos=(dest[0], dest[1]),
-                        reason=decision.rationale or None,
-                        text=(f'{attacker.name} перемещается {format_pos(origin)} → '
-                              f'{format_pos(dest)}')))
-                dist = battle_map.distance_ft(attacker, target)
-            if dist > reach:
-                events.append(CombatEvent(
-                    kind='out_of_reach', round=round_no, actor=attacker.name,
-                    actor_id=id(attacker), actor_side=getattr(attacker, 'side', None),
-                    target=getattr(target, 'name', None), target_id=id(target),
-                    target_side=getattr(target, 'side', None),
-                    reason=decision.rationale or None,
-                    text=(f'{attacker.name} не может достать {target.name} '
-                          f'({dist} фт > {reach} фт)')))
-                continue
-            if decision.attack is None and decision.tier <= 1 \
-                    and not getattr(attacker, 'multiattack', None):
-                strikes = resolve_strikes(attacker, target)
-                if not strikes:
-                    continue
-
-        before = len(events)
-        execute_strikes(attacker, target, strikes, sides, ignore_sides, battle_map,
-                        crit_mode=crit_mode, round_no=round_no, events=events)
-        _stamp_reason(events, before, decision.rationale)
+        events.extend(_open_turn(attacker, sides, round_no))
+        try:
+            _act_turn(attacker, side_idx, sides, side_names, ignore_sides, battle_map,
+                      engine, auto_move, crit_mode, round_no, events,
+                      effective_speed, is_incapacitated, try_stand,
+                      replacing_effect, should_replace_attacks)
+        finally:
+            events.extend(_close_turn(attacker, sides, round_no))
     if previous is not None:
         legendary_after_turn(
             previous, sides, ignore_sides, battle_map, crit_mode,

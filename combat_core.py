@@ -99,9 +99,8 @@ def _roll_component(attacker, comp, critical, crit_mode):
     return max(0, total)
 
 
-def modify_damage(target, raw, damage_type, magical=False):
-    """Чистая функция: считает итоговый урон, НЕ наносит его.
-    magical=True снимает условные иммунитеты/сопротивления «от немагического»."""
+def _typed_damage(target, raw, damage_type, magical=False):
+    """Иммунитет, уязвимость и сопротивление типа. Без окаменения."""
     canon = dmg_canon(damage_type)
     if not canon or raw <= 0:
         return raw, ''
@@ -121,6 +120,28 @@ def modify_damage(target, raw, damage_type, magical=False):
     if magical and any(is_nonmagical_only(x) and dmg_canon(x) == canon for x in raw_imm):
         return raw, " ✦ магическое оружие пробило иммунитет к немагическому"
     return raw, ''
+
+
+def _petrified_damage(target, raw, final, note, canon):
+    """Окаменение: иммунитет к яду и сопротивление любому урону (не стакается)."""
+    from conditions import has_condition
+    if not has_condition(target, 'petrified') or final <= 0:
+        return final, note
+    if canon == 'poison':
+        return 0, f'{note} → 0 (окаменение: иммунитет к яду)'.strip()
+    if 'сопротивление' in (note or ''):
+        return final, note
+    if 'уязвимость' in (note or ''):
+        return raw, f'{note} → {raw} (окаменение гасит уязвимость)'
+    halved = final // 2
+    return halved, f'{note} → {halved} (окаменение: сопротивление)'.strip()
+
+
+def modify_damage(target, raw, damage_type, magical=False):
+    """Чистая функция: считает итоговый урон, НЕ наносит его.
+    magical=True снимает условные иммунитеты/сопротивления «от немагического»."""
+    final, note = _typed_damage(target, raw, damage_type, magical)
+    return _petrified_damage(target, raw, final, note, dmg_canon(damage_type))
 
 
 def _apply_heal(attacker, target, atk):
@@ -211,7 +232,7 @@ def execute_strikes(attacker, target, strikes, sides, ignore_sides, battle_map,
                 continue
             target = alt
         hit_events, killed = _attack_strike(
-            attacker, target, atk, battle_map, crit_mode, round_no, legendary)
+            attacker, target, atk, battle_map, crit_mode, round_no, legendary, sides)
         produced.extend(hit_events)
         any_killed = any_killed or killed
     if events is not None:
@@ -242,8 +263,33 @@ def _heal_strike(attacker, target, atk, battle_map, round_no, legendary):
         max_hp=getattr(target, 'max_hp', None), **common)]
 
 
-def _attack_strike(attacker, target, atk, battle_map, crit_mode, round_no, legendary):
-    roll = attacker.perform_attack(atk, target.ac, crit_mode=crit_mode)
+def _advantage_mark(roll):
+    mode = getattr(roll, 'advantage', None) or 'normal'
+    dice = list(getattr(roll, 'naturals', None) or [])
+    if mode == 'advantage' and len(dice) == 2:
+        return f' [преимущество {dice[0]}/{dice[1]}]'
+    if mode == 'disadvantage' and len(dice) == 2:
+        return f' [помеха {dice[0]}/{dice[1]}]'
+    if mode == 'cancel':
+        return ' [преимущество и помеха гасятся]'
+    return ''
+
+
+def _attack_distance(attacker, target, battle_map):
+    if (battle_map is not None and battle_map.get_pos(attacker)
+            and battle_map.get_pos(target)):
+        return battle_map.distance_ft(attacker, target)
+    return distance_ft_between(attacker, target)
+
+
+def _attack_strike(attacker, target, atk, battle_map, crit_mode, round_no, legendary,
+                   sides=None):
+    from conditions import attack_modifiers
+    advantage, disadvantage, force_crit = attack_modifiers(
+        attacker, target, _attack_distance(attacker, target, battle_map))
+    roll = attacker.perform_attack(
+        atk, target.ac, crit_mode=crit_mode, advantage=advantage,
+        disadvantage=disadvantage, force_crit=force_crit)
     hit, damage, attack_roll, critical, damage_info, natural, modifier = _roll_details(roll, atk)
     result = _strike_result(hit, critical, natural)
     common = _actor_fields(attacker, target, battle_map)
@@ -264,31 +310,43 @@ def _attack_strike(attacker, target, atk, battle_map, crit_mode, round_no, legen
             parts.append(DamagePart(label, raw, extra_final, note, True))
         crit_text = " КРИТИЧЕСКИЙ УДАР!" if critical else ""
         extra_text = (' ' + ' '.join(extra_notes)) if extra_notes else ''
+        mark = _advantage_mark(roll)
         text = (f"{attacker.name} → {target.name} ({atk.name}: "
-                f"{attack_roll} vs AC {target.ac}) - ПОПАДАНИЕ!{crit_text} "
+                f"{attack_roll} vs AC {target.ac}){mark} - ПОПАДАНИЕ!{crit_text} "
                 f"{damage_info}{dmg_note}{extra_text}")
         after = getattr(target, 'hp', None)
         event = CombatEvent(
             kind='attack', result=result, crit=bool(critical), text=text,
             action=getattr(atk, 'name', None), natural=natural, modifier=modifier,
+            naturals=list(getattr(roll, 'naturals', None) or []),
+            advantage=getattr(roll, 'advantage', None),
             attack_total=attack_roll, ac=getattr(target, 'ac', None),
             damages=parts, hp_before=before, hp_after=after,
             max_hp=getattr(target, 'max_hp', None),
             round=round_no, legendary=legendary, **common)
         produced = [event]
         killed = not getattr(target, 'alive', True)
+        if not killed:
+            from effects import apply_on_hit
+            produced.extend(apply_on_hit(
+                attacker, target, atk, sides, round_no, legendary=legendary))
         if killed:
             produced.append(CombatEvent(
                 kind='death', result='death', text=f"☠️ {target.name} УНИЧТОЖЕН!",
                 action=getattr(atk, 'name', None), hp_before=before, hp_after=after,
                 max_hp=getattr(target, 'max_hp', None),
                 round=round_no, legendary=legendary, **common))
+            from effects import on_creature_down
+            produced.extend(on_creature_down(target, sides, round_no, actor=attacker))
         return produced, killed
+    mark = _advantage_mark(roll)
     text = (f"{attacker.name} → {target.name} ({atk.name}: "
-            f"{attack_roll} vs AC {target.ac}) - ПРОМАХ!")
+            f"{attack_roll} vs AC {target.ac}){mark} - ПРОМАХ!")
     event = CombatEvent(
         kind='attack', result=result, crit=False, text=text,
         action=getattr(atk, 'name', None), natural=natural, modifier=modifier,
+        naturals=list(getattr(roll, 'naturals', None) or []),
+        advantage=getattr(roll, 'advantage', None),
         attack_total=attack_roll, ac=getattr(target, 'ac', None),
         damages=[], hp_before=before, hp_after=before,
         max_hp=getattr(target, 'max_hp', None),
@@ -309,8 +367,9 @@ def legendary_after_turn(just_acted, sides, ignore_sides, battle_map,
                          crit_mode=DEFAULT_CRIT_MODE, *, round_no=None, events=None):
     """Конец чужого хода: каждое другое легендарное существо тратит одно действие.
 
-    В бой уходит только вариант, который сводится к уже известной атаке и
-    достаёт цель. Спасброски, перемещение и действия логова здесь не считаются.
+    Атака, которая достаёт цель, или разбираемое действие со спасброском.
+    Перемещение и неразобранный текст по-прежнему пропускаются.
+    Недееспособное существо легендарное действие не тратит.
     Возврат — список прежних текстовых строк. events, если передан, получает
     те же CombatEvent.
     """
@@ -326,10 +385,36 @@ def legendary_after_turn(just_acted, sides, ignore_sides, battle_map,
     return [event.text for event in produced if event.text is not None]
 
 
+def _best_legendary_effect(enemy, block, remaining, ignore, sides, battle_map):
+    from conditions import HARD_DISABLE
+    from effects import average_damage, targets_for
+    best = None
+    for option in block.get('options') or []:
+        effect = option.get('effect') if isinstance(option, dict) else None
+        if not isinstance(effect, dict):
+            continue
+        cost = int(option.get('cost') or 1)
+        if cost > remaining:
+            continue
+        group = targets_for(enemy, effect, sides, ignore, battle_map)
+        if not group:
+            continue
+        score = average_damage(effect.get('damage')) * len(group)
+        conditions = effect.get('conditions') or []
+        if any(item in HARD_DISABLE for item in conditions):
+            score += 8 * len(group)
+        elif conditions:
+            score += 3 * len(group)
+        if best is None or score > best[0]:
+            best = (score, option, effect, cost)
+    return best
+
+
 def _spend_legendary(enemy, sides, ignore_sides, battle_map, crit_mode, round_no=None):
     from battle_strategies import damage_score
+    from conditions import is_incapacitated
     block = getattr(enemy, 'legendary_actions', None)
-    if not block:
+    if not block or is_incapacitated(enemy):
         return []
     refresh_legendary_pool(enemy, reset=False)
     remaining = int(getattr(enemy, 'legendary_remaining', 0) or 0)
@@ -353,6 +438,23 @@ def _spend_legendary(enemy, sides, ignore_sides, battle_map, crit_mode, round_no
         score = damage_score(attack) * max(1, int(option.get('count') or 1))
         if best is None or score > best[0]:
             best = (score, option, attack, target, cost)
+    effect_best = _best_legendary_effect(
+        enemy, block, remaining, ignore, sides, battle_map)
+    attack_score = best[0] if best is not None else -1
+    if effect_best is not None and effect_best[0] > attack_score:
+        _score, option, effect, cost = effect_best
+        from effects import consume_recharge, execute_effect
+        produced = execute_effect(
+            enemy, effect, sides, ignore, battle_map, round_no=round_no,
+            legendary=True)
+        if effect.get('recharge'):
+            consume_recharge(enemy, option.get('name') or effect.get('name'))
+        enemy.legendary_remaining = remaining - cost
+        for event in produced:
+            event.legendary = True
+            if not event.reason:
+                event.reason = option.get('name')
+        return produced
     if best is None:
         return []
     _score, option, attack, target, cost = best

@@ -15,7 +15,8 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QComboBox, QPushButton, QCheckBox,
                              QScrollArea, QSplitter, QStackedWidget, QGroupBox, QFrame,
                              QMessageBox, QFileDialog, QDialog, QTableWidget,
-                             QTableWidgetItem, QHeaderView, QButtonGroup, QSlider)
+                             QTableWidgetItem, QHeaderView, QButtonGroup, QSlider,
+                             QMenu)
 
 import battle_round
 from battle_history import BattleHistory, apply_snapshot, capture_battle, ensure_uid
@@ -757,6 +758,11 @@ class MainWindow(QMainWindow):
                 r = QHBoxLayout()
                 cb = QCheckBox()
                 lab = QLabel(self._enemy_text(e))
+                lab.setToolTip(self._enemy_tip(e))
+                lab.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+                lab.customContextMenuRequested.connect(
+                    lambda pos, en=e, widget=lab: self.open_condition_menu(
+                        en, widget.mapToGlobal(pos)))
                 lab.mouseDoubleClickEvent = lambda ev, en=e: self.edit_one(en)
                 r.addWidget(cb)
                 r.addWidget(lab, 1)
@@ -775,21 +781,85 @@ class MainWindow(QMainWindow):
 
     @staticmethod
     def _enemy_text(e):
+        from conditions import condition_marks
         status = '🟢' if e.alive else '🔴'
         atk = ', '.join(f'{a.name}{"✦" if getattr(a, "magical", False) else ""}'
                         f'+{a.attack_bonus}' for a in e.attacks)
-        return f'{status} {e.name}: {e.hp}/{e.max_hp} HP [{atk}]'
+        marks = condition_marks(e)
+        suffix = f' · {marks}' if marks else ''
+        return f'{status} {e.name}: {e.hp}/{e.max_hp} HP [{atk}]{suffix}'
+
+    @staticmethod
+    def _enemy_tip(e):
+        from conditions import condition_tooltip
+        return condition_tooltip(e)
+
+    def open_condition_menu(self, enemy, global_pos):
+        from conditions import CATALOG, active_conditions, condition_name
+        if enemy is None:
+            return
+        menu = QMenu(self)
+        add = menu.addMenu('Наложить состояние')
+        for condition_id, label, _short, _color, hidden in CATALOG:
+            if hidden or condition_id == 'exhaustion':
+                continue
+            add.addAction(label, lambda _checked=False, cid=condition_id: self._impose(
+                enemy, cid))
+        levels = menu.addMenu('Истощение')
+        for level in range(0, 7):
+            title = 'снять' if level == 0 else f'уровень {level}'
+            levels.addAction(title, lambda _checked=False, value=level: self._set_exhaustion(
+                enemy, value))
+        remove = menu.addMenu('Снять состояние')
+        current = [item for item in active_conditions(enemy) if isinstance(item, dict)]
+        if not current:
+            empty = remove.addAction('нет состояний')
+            empty.setEnabled(False)
+        for item in current:
+            title = condition_name(item.get('id'))
+            if item.get('id') == 'exhaustion':
+                title = f'{title} {item.get("level")}'
+            remove.addAction(title, lambda _checked=False, cond=item: self._lift(enemy, cond))
+        menu.exec(global_pos)
+
+    def _impose(self, enemy, condition_id):
+        from conditions import apply_condition, permanent_duration
+        if apply_condition(enemy, condition_id, duration=permanent_duration(),
+                           note='вручную') is None:
+            self.status.showMessage(
+                f'{enemy.name} не получает состояние (иммунитет или уже нельзя)')
+            return
+        self._after_condition_edit(enemy, f'состояние: {enemy.name}')
+
+    def _set_exhaustion(self, enemy, level):
+        from conditions import set_exhaustion
+        set_exhaustion(enemy, level)
+        self._after_condition_edit(enemy, f'истощение: {enemy.name}')
+
+    def _lift(self, enemy, cond):
+        from conditions import remove_condition
+        remove_condition(enemy, cond=cond, reason='снято вручную')
+        self._after_condition_edit(enemy, f'снято состояние: {enemy.name}')
+
+    def _after_condition_edit(self, enemy, label):
+        self.refresh_all_labels()
+        if self.battle_map is not None:
+            self.map_view.rebuild(self.battle_map, self.sides, self.selected)
+        self.on_token(enemy)
+        self._commit(label)
 
     def refresh_dirty(self):
         for e in list(self.dirty):
             lab = self.enemy_labels.get(e)
             if lab is not None:
                 lab.setText(self._enemy_text(e))
+                lab.setToolTip(self._enemy_tip(e))
         self.dirty.clear()
 
     def refresh_all_labels(self):
         for e, lab in self.enemy_labels.items():
             lab.setText(self._enemy_text(e))
+            lab.setToolTip(self._enemy_tip(e))
         self.dirty.clear()
 
     def run_round(self):
@@ -1224,6 +1294,7 @@ class MainWindow(QMainWindow):
         split = QSplitter(Qt.Orientation.Vertical)
         self.map_view = MapView(self.theme.palette())
         self.map_view.token_clicked.connect(self.on_token)
+        self.map_view.token_menu.connect(self.open_condition_menu)
         self.map_view.cell_clicked.connect(self.on_cell)
         self.map_view.token_dragged.connect(self.on_token_dragged)
         self.map_view.image_dropped.connect(self._apply_background_path)
@@ -1348,10 +1419,14 @@ class MainWindow(QMainWindow):
     def on_token(self, enemy):
         self.selected = enemy
         self.map_view.rebuild(self.battle_map, self.sides, self.selected)
+        from conditions import condition_marks, effective_speed
         pos = self.battle_map.get_pos(enemy)
-        left = enemy.speed - getattr(enemy, 'moved_ft', 0)
+        speed = effective_speed(enemy)
+        left = speed - getattr(enemy, 'moved_ft', 0)
+        marks = condition_marks(enemy)
+        tail = f', {marks}' if marks else ''
         self.map_info.setText(f'{enemy.name}: HP {enemy.hp}/{enemy.max_hp}, AC {enemy.ac}, '
-                              f'клетка {pos}, скорость {enemy.speed} фт, остаток {left} фт')
+                              f'клетка {pos}, скорость {speed} фт, остаток {left} фт{tail}')
         self._note_selection()
 
     def on_token_dragged(self, enemy, x, y):
@@ -1370,7 +1445,11 @@ class MainWindow(QMainWindow):
         dist = max(abs(x - pos[0]), abs(y - pos[1])) * 5
         if dist == 0:
             return
-        left = self.selected.speed - getattr(self.selected, 'moved_ft', 0)
+        from conditions import effective_speed, has_condition, is_incapacitated, try_stand
+        speed_now = effective_speed(self.selected)
+        if has_condition(self.selected, 'prone') and not is_incapacitated(self.selected):
+            try_stand(self.selected)
+        left = speed_now - getattr(self.selected, 'moved_ft', 0)
         if dist > left:
             QMessageBox.information(self, 'Движение',
                                     f'Не хватает скорости: нужно {dist} фт, осталось {left} фт')
@@ -1408,6 +1487,7 @@ class MainWindow(QMainWindow):
                 'crit_mode': self.crit_mode.currentData() or 'double_all',
                 'map_opts': dict(self.map_view.opts),
                 'map_bg': self.map_view.background_path,
+                'battle': capture_battle(self),
             }
             with open(path, 'w', encoding='utf-8') as f:
                 json.dump(data, f, ensure_ascii=False, indent=2)
@@ -1456,8 +1536,22 @@ class MainWindow(QMainWindow):
                 self._sync_map_controls()
                 self.cols = 0
                 self.relayout_cards()
-                self.status.showMessage(
-                    f'Настройки загружены: сторон {n}. Нажмите «Создать армии».')
+                battle = data.get('battle')
+                if isinstance(battle, dict) and battle.get('sides'):
+                    info = apply_snapshot(battle, self)
+                    self.rebuild_battle_lists()
+                    self.refresh_alliances()
+                    self.log_panel.set_roster(self.sides, self.side_names)
+                    if info.events_changed:
+                        self.log_panel.load_events(self.battle_events)
+                    self.selected = info.selected
+                    self.map_view.rebuild(self.battle_map, self.sides, self.selected)
+                    self.status.showMessage(
+                        f'Бой загружен: сторон {len(self.sides)}, '
+                        f'раунд {self.round_no}.')
+                else:
+                    self.status.showMessage(
+                        f'Настройки загружены: сторон {n}. Нажмите «Создать армии».')
             except Exception as e:
                 QMessageBox.critical(self, 'Ошибка', f'Ошибка при загрузке: {e}')
                 return
