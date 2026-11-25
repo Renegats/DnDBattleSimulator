@@ -9,6 +9,12 @@ from ui_components import ScrollableFrame, fit_window_to_screen
 from statblock_parser import parse_characteristics, extract_statblock_text, extract_battle_text
 
 
+def fetch_search_page(query, headers, timeout=10):
+    """Поиск на dnd.su. query передаётся в params — requests сам кодирует URL."""
+    return requests.get('https://dnd.su/bestiary/', params={'search': query},
+                        headers=headers, timeout=timeout)
+
+
 class BestiaryImporter:
     """Класс для импорта монстров с dnd.su"""
 
@@ -30,8 +36,8 @@ class BestiaryImporter:
     HEADERS = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
                              'AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36'}
 
-    NUM_WORDS = {'одна':1,'одну':1,'одной':1,'одним':1,'одним':1,
-                 'две':2,'двух':2,'двум':2,'двумя':2,'две':2,
+    NUM_WORDS = {'одна':1,'одну':1,'одной':1,'одним':1,
+                 'две':2,'двух':2,'двум':2,'двумя':2,
                  'три':3,'трёх':3,'трём':3,'четыре':4,'четырёх':4,'четырём':4,
                  'пять':5,'пяти':5,'шесть':6,'шести':6,'семь':7,'семи':7,
                  'восемь':8,'восьми':8,'девять':9,'девяти':9,'десять':10,'десяти':10}
@@ -182,8 +188,7 @@ class BestiaryImporter:
         self.results_listbox.insert(tk.END, "⏳ Ищем на dnd.su... (окно живёт, идёт загрузка)")
 
         def work():
-            response = requests.get(f"https://dnd.su/bestiary/?search={query}",
-                                    headers=self.HEADERS, timeout=10)
+            response = fetch_search_page(query, self.HEADERS, timeout=10)
             response.encoding = 'utf-8'
             if response.status_code != 200:
                 raise RuntimeError(f"Сайт ответил кодом {response.status_code}")

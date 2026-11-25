@@ -1,4 +1,8 @@
+import logging
+
 from entities import Enemy, Attack
+
+logger = logging.getLogger(__name__)
 
 
 def _creature_def(hp, ac, attacks, speed=30, regen=0, multiattack=None, *,
@@ -195,6 +199,8 @@ class CreatureRegistry:
             return self.custom[type_name]
         if type_name in self.defs:
             return self.defs[type_name]
+        logger.warning(
+            "Неизвестный тип существа %r — используется «обычный»", type_name)
         return self.defs.get('обычный')
 
     def register(self, type_name, **data):

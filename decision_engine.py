@@ -240,12 +240,20 @@ class DecisionEngine:
                 return avg * p_hit * eff, eff
             return avg * eff, eff
 
-        reachable = [a for a in attacker.attacks if getattr(a, 'range_ft', 5) >= dist_now]
-        pool, prefer_far = (reachable, False) if reachable else (list(attacker.attacks), True)
+        from battle_strategies import is_healing_attack
+        ally = getattr(target, 'side', None) == getattr(attacker, 'side', None)
+        catalog = list(attacker.attacks)
+        if ally:
+            catalog = [a for a in catalog if is_healing_attack(a)]
+        else:
+            catalog = [a for a in catalog if not is_healing_attack(a)]
+
+        reachable = [a for a in catalog if getattr(a, 'range_ft', 5) >= dist_now]
+        pool, prefer_far = (reachable, False) if reachable else (list(catalog), True)
 
         best, best_ev, best_eff, best_reach = None, -1.0, -1.0, None
         candidates = []
-        for a in attacker.attacks:
+        for a in catalog:
             r = getattr(a, 'range_ft', 5)
             magical = bool(getattr(a, 'magical', False))
             ev, eff = metrics(a)

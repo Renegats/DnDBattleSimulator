@@ -269,24 +269,31 @@ def search_monsters(html, query):
     return out
 
 
-def fetch(url):
-    r = requests.get(url, headers=HEADERS, timeout=(6, 20))
+def fetch(url, params=None):
+    r = requests.get(url, headers=HEADERS, timeout=(6, 20), params=params)
     r.encoding = 'utf-8'
     if r.status_code != 200:
         raise RuntimeError(f'Сайт ответил кодом {r.status_code}')
     return r.text
 
 
-def fetch_cached(url):
-    hit = _PAGES.get(url)
+def _cache_key(url, params=None):
+    if not params:
+        return url
+    return requests.Request('GET', url, params=params).prepare().url
+
+
+def fetch_cached(url, params=None):
+    key = _cache_key(url, params)
+    hit = _PAGES.get(key)
     if hit is not None:
-        _PAGES.move_to_end(url)
+        _PAGES.move_to_end(key)
         return hit
-    return _remember(_PAGES, url, fetch(url))
+    return _remember(_PAGES, key, fetch(url, params=params))
 
 
 def fetch_search(query):
-    return fetch_cached(f'https://dnd.su/bestiary/?search={query}')
+    return fetch_cached('https://dnd.su/bestiary/', params={'search': query})
 
 
 def load_monster(url):

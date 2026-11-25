@@ -1,6 +1,7 @@
 import tkinter as tk
 from tkinter import ttk, messagebox
 
+from combat_core import CRIT_MODE_LABELS, normalize_crit_mode
 from entities import Attack, Enemy
 from ui_components import ScrollableFrame, fit_window_to_screen
 from observer import Observer
@@ -31,6 +32,7 @@ class BattleUI:
         self._dirty_enemies = set()
         self.label_by_enemy = {}
         self.ui_suspend = False
+        self.crit_damage_mode = 'double_all'
 
     def setup_battle_ui(self):
         """Настройка интерфейса битвы"""
@@ -134,6 +136,19 @@ class BattleUI:
         self.copy_btn.pack(side='left', padx=5)
         ttk.Button(button_container, text="🔍 Анализ сражения",
                    command=self.open_decision_analysis).pack(side='left', padx=5)
+        mode = normalize_crit_mode(getattr(self, 'crit_damage_mode', 'double_all'))
+        self.crit_damage_mode = mode
+        self.crit_mode_var = tk.StringVar(value=CRIT_MODE_LABELS[mode])
+        ttk.Label(button_container, text='Крит:').pack(side='left', padx=(12, 2))
+        crit_box = ttk.Combobox(button_container, textvariable=self.crit_mode_var,
+                                values=list(CRIT_MODE_LABELS.values()),
+                                state='readonly', width=26)
+        crit_box.pack(side='left', padx=4)
+
+        def _sync_crit(_event=None):
+            self.crit_damage_mode = normalize_crit_mode(self.crit_mode_var.get())
+
+        crit_box.bind('<<ComboboxSelected>>', _sync_crit)
 
     def _select_all_results(self, event=None):
         w = self.battle_results_text

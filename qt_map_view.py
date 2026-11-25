@@ -7,7 +7,8 @@
 import os
 
 from PyQt6.QtCore import Qt, pyqtSignal, QRectF, QPointF
-from PyQt6.QtGui import QBrush, QColor, QFont, QImage, QPainter, QPen, QPixmap, QRadialGradient
+from PyQt6.QtGui import (QBrush, QColor, QFont, QImage, QPainter, QPainterPath,
+                          QPen, QPixmap, QRadialGradient)
 from PyQt6.QtWidgets import (QGraphicsEllipseItem, QGraphicsPixmapItem, QGraphicsRectItem,
                              QGraphicsScene, QGraphicsView)
 
@@ -316,9 +317,10 @@ class MapView(QGraphicsView):
                 pen = QPen(QColor('#ffffff' if is_sel else '#000000'),
                            max(1, o['stroke'] + (1 if is_sel else 0)))
                 if cells >= 2:
-                    item = sc.addRoundedRect(x0, y0, box, box,
-                                             max(3.0, box * 0.14), max(3.0, box * 0.14),
-                                             pen, fill)
+                    path = QPainterPath()
+                    radius = max(3.0, box * 0.14)
+                    path.addRoundedRect(QRectF(x0, y0, box, box), radius, radius)
+                    item = sc.addPath(path, pen, fill)
                 else:
                     item = sc.addEllipse(x0, y0, box, box, pen, fill)
                 if not en.alive:

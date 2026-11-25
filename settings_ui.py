@@ -3,6 +3,7 @@ from tkinter import ttk, messagebox, filedialog
 import json
 import os
 from datetime import datetime
+from combat_core import normalize_crit_mode, CRIT_MODE_LABELS
 from entities import Attack, Enemy
 from battle_strategies import AggressiveStrategy, DefensiveStrategy, RandomStrategy, SupportStrategy
 
@@ -44,6 +45,9 @@ class SettingsUI:
             from factory import EnemyFactory
             custom_types_snapshot = dict(getattr(EnemyFactory, 'CUSTOM_TYPES', {}))
 
+            if hasattr(self, 'crit_mode_var'):
+                self.crit_damage_mode = normalize_crit_mode(self.crit_mode_var.get())
+
             settings = {
                 'num_sides': self.num_sides_var.get(),
                 'side_names': [var.get() for var in self.side_name_vars],
@@ -53,7 +57,8 @@ class SettingsUI:
                 'custom_types': custom_types_snapshot,
                 'alliance_settings': current_alliance_settings if current_alliance_settings else self.alliance_settings,
                 'ignore_sides': {str(k): list(v) for k, v in self.ignore_sides.items()} if hasattr(self,
-                                                                                                   'ignore_sides') else {}
+                                                                                                   'ignore_sides') else {},
+                'crit_mode': normalize_crit_mode(getattr(self, 'crit_damage_mode', 'double_all')),
             }
 
             with open(filename, 'w', encoding='utf-8') as f:
@@ -112,6 +117,10 @@ class SettingsUI:
                 self.alliance_settings = settings['alliance_settings']
             if 'ignore_sides' in settings:
                 self.ignore_sides = {int(k): set(v) for k, v in settings['ignore_sides'].items()}
+
+            self.crit_damage_mode = normalize_crit_mode(settings.get('crit_mode', 'double_all'))
+            if hasattr(self, 'crit_mode_var'):
+                self.crit_mode_var.set(CRIT_MODE_LABELS[self.crit_damage_mode])
 
             messagebox.showinfo("Успех", f"Настройки загружены!\nСторон восстановлено: {num_sides}")
         except Exception as e:

@@ -18,9 +18,24 @@ def reachable_attacks(attacker, target):
     return ok if ok else list(attacker.attacks)
 
 
+_HEAL_MARKERS = ('лечение', 'heal', 'восстановление')
+
+
+def is_healing_attack(attack) -> bool:
+    """Лечение — не атака: без броска против КД, восстанавливает хиты."""
+    name = str(getattr(attack, 'name', '') or '').lower()
+    return any(marker in name for marker in _HEAL_MARKERS)
+
+
 def damage_score(a):
-    """Оценка среднего потенциала урона атаки"""
-    return a.damage_dice_count * int(a.damage_dice_type[1:]) + a.damage_modifier
+    """Средний урон атаки: count * (sides + 1) / 2 + mod."""
+    sides = int(str(a.damage_dice_type).split('d')[-1])
+    return a.damage_dice_count * (sides + 1) / 2.0 + a.damage_modifier
+
+
+def _offensive_pool(attacker, target):
+    """Атаки, которыми бьют врага. Лечение в этот пул не входит."""
+    return [a for a in reachable_attacks(attacker, target) if not is_healing_attack(a)]
 
 
 class BattleStrategy(ABC):
@@ -80,7 +95,10 @@ class AggressiveStrategy(BattleStrategy):
                                  lambda pool: min(pool, key=lambda e: e.hp))
 
     def select_attack(self, attacker, target):
-        return max(reachable_attacks(attacker, target), key=damage_score)
+        pool = _offensive_pool(attacker, target)
+        if not pool:
+            return None
+        return max(pool, key=damage_score)
 
 
 class DefensiveStrategy(BattleStrategy):
@@ -92,9 +110,10 @@ class DefensiveStrategy(BattleStrategy):
                                                   max((a.attack_bonus for a in e.attacks), default=0)))
 
     def select_attack(self, attacker, target):
-        if not attacker.attacks:
+        pool = _offensive_pool(attacker, target)
+        if not pool:
             return None
-        return max(reachable_attacks(attacker, target), key=lambda a: a.attack_bonus)
+        return max(pool, key=lambda a: a.attack_bonus)
 
 
 class RandomStrategy(BattleStrategy):
@@ -104,35 +123,38 @@ class RandomStrategy(BattleStrategy):
         return self._pick_target(attacker, enemies, lambda pool: random.choice(pool))
 
     def select_attack(self, attacker, target):
-        if not attacker.attacks:
+        pool = _offensive_pool(attacker, target)
+        if not pool:
             return None
-        return random.choice(reachable_attacks(attacker, target))
+        return random.choice(pool)
 
 
 class SupportStrategy(BattleStrategy):
     """Поддержка - лечит самого раненого СОЮЗНИКА из доступных, иначе бьёт врага."""
     def select_target(self, attacker, all_sides, ignore_sides):
-        # Сначала раненые союзники (тоже с учётом дистанции - лекарь подбегает к ближнему)
-        allies = []
-        for side_idx, side_enemies in enumerate(all_sides):
-            if side_idx == attacker.side and side_idx not in ignore_sides:
-                allies.extend([e for e in side_enemies
-                               if e.alive and e.hp < e.max_hp * 0.7])
-        if allies:
-            return self._pick_target(attacker, allies,
-                                     lambda pool: min(pool, key=lambda e: e.hp / e.max_hp))
-        # Союзников лечить некого - атакуем врага по правилам агрессора
+        # Раненых союзников ищем только если есть чем лечить, иначе поддержка
+        # била бы союзника обычной атакой.
+        if any(is_healing_attack(a) for a in attacker.attacks):
+            allies = []
+            for side_idx, side_enemies in enumerate(all_sides):
+                if side_idx == attacker.side and side_idx not in ignore_sides:
+                    allies.extend([e for e in side_enemies
+                                   if e.alive and e is not attacker
+                                   and e.hp < e.max_hp * 0.7])
+            if allies:
+                return self._pick_target(attacker, allies,
+                                         lambda pool: min(pool, key=lambda e: e.hp / e.max_hp))
         enemies = self._collect_enemies(attacker, all_sides, ignore_sides)
         return self._pick_target(attacker, enemies,
                                  lambda pool: min(pool, key=lambda e: e.hp))
 
     def select_attack(self, attacker, target):
-        if not attacker.attacks:
+        if not attacker.attacks or target is None:
             return None
-        if target.side == attacker.side:
-            healing = [a for a in attacker.attacks if
-                       "лечение" in a.name.lower() or "heal" in a.name.lower()
-                       or "восстановление" in a.name.lower()]
-            if healing:
-                return healing[0]
-        return max(reachable_attacks(attacker, target), key=damage_score)
+        if getattr(target, 'side', None) == attacker.side:
+            healing = [a for a in attacker.attacks if is_healing_attack(a)]
+            return healing[0] if healing else None
+        pool = _offensive_pool(attacker, target)
+        if not pool:
+            return None
+        return max(pool, key=damage_score)

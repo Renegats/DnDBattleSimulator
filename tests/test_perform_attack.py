@@ -59,6 +59,35 @@ class TestPerformAttack(unittest.TestCase):
         self.assertEqual(damage, 14, 'крит удваивает урон: (5+2)*2')
         self.assertIn('14 урона', info)
 
+    def test_natural_1_always_misses_even_if_total_beats_ac(self):
+        # d20=1, бонус +19, КД 10: сумма 20 >= 10, но натуральная 1 — всегда промах.
+        # Скрипт из одного броска: кость урона при промахе не кидается.
+        e = make_enemy(ScriptedRng([1]), attack=club(bonus=19))
+        hit, damage, total, critical, info = e.perform_attack(club(bonus=19), 10)
+        self.assertFalse(hit, 'натуральная 1 всегда промах')
+        self.assertFalse(critical)
+        self.assertEqual(damage, 0)
+        self.assertEqual(total, 20)
+        self.assertEqual(info, '')
+
+    def test_critical_dice_only_rolls_dice_twice_and_adds_modifier_once(self):
+        # RAW: две кости d6 (5 и 3) + модификатор 2 один раз = 10, а не (5+2)*2.
+        e = make_enemy(ScriptedRng([20, 5, 3]), attack=club(mod=2))
+        hit, damage, total, critical, info = e.perform_attack(
+            club(mod=2), 99, crit_mode='dice_only')
+        self.assertTrue(hit, 'натуральная 20 попадает даже в КД 99')
+        self.assertTrue(critical)
+        self.assertEqual(total, 20)
+        self.assertEqual(damage, 10)
+        self.assertIn('10 урона', info)
+
+    def test_unknown_crit_mode_keeps_double_all_default(self):
+        e = make_enemy(ScriptedRng([20, 5]), attack=club(mod=2))
+        _hit, damage, _total, critical, _info = e.perform_attack(
+            club(mod=2), 99, crit_mode='неизвестный')
+        self.assertTrue(critical)
+        self.assertEqual(damage, 14, 'неизвестный режим не меняет дефолт «удвоить всё»')
+
     def test_hit_without_critical(self):
         e = make_enemy(ScriptedRng([10, 4]), attack=club(bonus=5))
         hit, damage, total, critical, info = e.perform_attack(club(bonus=5), 10)
@@ -79,9 +108,11 @@ class TestPerformAttack(unittest.TestCase):
         self.assertEqual(info, '')
 
     def test_negative_damage_clamped_to_zero(self):
-        e = make_enemy(ScriptedRng([1, 1]), attack=club(bonus=5, mod=-10))
+        # d20=2 (не 1: натуральная 1 теперь всегда промах), бонус +5 бьёт КД 1.
+        e = make_enemy(ScriptedRng([2, 1]), attack=club(bonus=5, mod=-10))
         hit, damage, total, critical, info = e.perform_attack(club(bonus=5, mod=-10), 1)
         self.assertTrue(hit)
+        self.assertEqual(total, 7)
         self.assertEqual(damage, 0, 'damage=max(0, raw) защищает от отрицательного урона')
         self.assertIn('0 урона', info)
 

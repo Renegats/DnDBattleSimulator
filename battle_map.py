@@ -90,7 +90,8 @@ class BattleMapUI:
                 for dy in range(-reach, reach + 1):
                     for dx in range(-reach, reach + 1):
                         nx, ny = pos[0] + dx, pos[1] + dy
-                        if bm.cell_free(nx, ny, ignore_id=id(self.selected_enemy)):
+                        if bm.cell_free(nx, ny, ignore_id=id(self.selected_enemy),
+                                        enemy=self.selected_enemy):
                             c.create_rectangle(nx * CELL_PX + 1, ny * CELL_PX + 1,
                                                (nx + 1) * CELL_PX - 1, (ny + 1) * CELL_PX - 1,
                                                fill=p['canvas_reach'], outline='')
@@ -135,7 +136,8 @@ class BattleMapUI:
                 messagebox.showinfo("Движение",
                                     f"Не хватает скорости: нужно {dist} фт, осталось {left} фт")
                 return
-            if bm.cell_free(x, y, ignore_id=id(self.selected_enemy)):
+            if bm.cell_free(x, y, ignore_id=id(self.selected_enemy),
+                            enemy=self.selected_enemy):
                 bm.place(self.selected_enemy, x, y)
                 self.selected_enemy.moved_ft = getattr(self.selected_enemy, 'moved_ft', 0) + dist
                 self.draw_map()
