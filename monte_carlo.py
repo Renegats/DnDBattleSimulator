@@ -319,6 +319,7 @@ def spawn_scene(snapshot, rng):
     map_state = snapshot.get('map')
     if map_state:
         battle_map = BattleMap(int(map_state['width']), int(map_state['height']))
+        battle_map.load_terrain(map_state.get('terrain'))
         positions = map_state.get('positions') or {}
         for side in sides:
             for enemy in side:

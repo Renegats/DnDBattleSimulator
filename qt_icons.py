@@ -80,6 +80,15 @@ def _draw(p, kind, size):
         p.drawLine(QPointF(cx, y0 + w * 0.08), QPointF(cx, y0 + w * 0.92))
         p.drawArc(QRectF(x0 - w * 0.05, y0, w * 0.62, w * 0.92), 0, 180 * 16)
         p.drawArc(QRectF(cx - w * 0.05, y0, w * 0.62, w * 0.92), 0, -180 * 16)
+    elif kind == 'terrain':
+        p.drawPolyline(QPolygonF([
+            QPointF(x0, y0 + w * 0.72),
+            QPointF(x0 + w * 0.32, y0 + w * 0.28),
+            QPointF(x0 + w * 0.52, y0 + w * 0.48),
+            QPointF(x0 + w * 0.78, y0 + w * 0.14),
+            QPointF(x0 + w, y0 + w * 0.72),
+        ]))
+        p.drawLine(QPointF(x0, y0 + w), QPointF(x0 + w, y0 + w))
     else:
         p.drawEllipse(QPointF(cx, cy), w * 0.2, w * 0.2)
 

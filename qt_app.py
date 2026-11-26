@@ -18,6 +18,7 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QMessageBox, QFileDialog, QDialog, QTableWidget,
                              QTableWidgetItem, QHeaderView, QSlider,
                              QMenu, QDockWidget, QToolBar, QToolButton, QTabWidget,
+                             QButtonGroup,
                              QListWidget, QListWidgetItem, QSizePolicy)
 
 from qt_icons import tool_icon
@@ -115,6 +116,8 @@ class MainWindow(QMainWindow):
         self._nav_index = 0
         self._relocate = None
         self._sheets = []
+        self._terrain_brush = 'wall'
+        self._terrain_dirty = False
         self._esc = QShortcut(QKeySequence(Qt.Key.Key_Escape), self)
         self._esc.setContext(Qt.ShortcutContext.WindowShortcut)
         self._esc.activated.connect(self._cancel_relocate)
@@ -247,6 +250,9 @@ class MainWindow(QMainWindow):
             'pause', 'Пауза автобоя', self.pause_auto, 'pause_button')
         self.settings_btn = self._tool_button(
             'settings', 'Настройки боя', self._show_settings, 'settings_button')
+        self.terrain_btn = self._tool_button(
+            'terrain', 'Рельеф — кисть клеток, протяните по карте',
+            self._on_terrain_button, 'terrain_button', checkable=True)
         self.theme_btn = IconButton('moon' if self.theme.current == 'dark' else 'sun',
                                     self.theme.palette(), size=36)
         self.theme_btn.setToolTip('Переключить тему')
@@ -263,6 +269,7 @@ class MainWindow(QMainWindow):
         bar.addWidget(self.btn_undo)
         bar.addWidget(self.btn_redo)
         bar.addSeparator()
+        bar.addWidget(self.terrain_btn)
         bar.addWidget(self.settings_btn)
         spacer = QWidget()
         spacer.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Expanding)
@@ -404,6 +411,16 @@ class MainWindow(QMainWindow):
         self._menu_action(self.menu_view, 'Участники', lambda: self._show_dock_tab(0))
         self._menu_action(self.menu_view, 'Журнал', lambda: self._show_dock_tab(1))
         self._menu_action(self.menu_view, 'Бестиарий', lambda: self._show_dock_tab(2))
+        self.menu_view.addSeparator()
+        self.act_terrain = QAction('Рельеф', self)
+        self.act_terrain.setObjectName('act_terrain')
+        self.act_terrain.setCheckable(True)
+        self.act_terrain.setToolTip('Рисовать рельеф на карте')
+        self.act_terrain.setStatusTip('Рисовать рельеф на карте')
+        self.act_terrain.toggled.connect(self.set_terrain_mode)
+        self.menu_view.addAction(self.act_terrain)
+        self.act_clear_terrain = self._menu_action(
+            self.menu_view, 'Очистить рельеф', self.clear_terrain, 'act_clear_terrain')
         self.menu_view.addSeparator()
         self._menu_action(self.menu_view, 'Переключить тему', self.toggle_theme)
         self._menu_action(self.menu_view, 'Сбросить расположение панелей', self.reset_layout)
@@ -1012,7 +1029,10 @@ class MainWindow(QMainWindow):
             map_w = max(24, 4 * n)
             zone_cols = max(1, map_w // n)
             map_h = max(16, (max_side + zone_cols - 1) // zone_cols + 2)
+            old_map = self.battle_map
             self.battle_map = BattleMap(width=map_w, height=map_h)
+            if old_map is not None:
+                self.battle_map.copy_terrain_from(old_map)
             self.ignore_sides = {}
             self.selected = None
             self.round_no = 0
@@ -1585,6 +1605,10 @@ class MainWindow(QMainWindow):
             self.manual_bar.hide()
         if getattr(self, 'map_view', None) is not None:
             self.map_view.set_aiming(False)
+            self.map_view.set_cover_hover(False)
+            self.map_view.set_cover_overlay(None, None)
+            if getattr(self, 'terrain_btn', None) is not None and self.terrain_btn.isChecked():
+                self.map_view.set_terrain_mode(True)
 
     def _ask_manual(self, attacker):
         self._manual_actor = attacker
@@ -1604,6 +1628,7 @@ class MainWindow(QMainWindow):
             'токен — цель атаки.')
         self.manual_bar.show()
         self._apply_manual_action()
+        self.map_view.set_terrain_mode(False)
         self.map_view.set_aiming(True)
         loop = QEventLoop()
         self._manual_loop = loop
@@ -1655,6 +1680,8 @@ class MainWindow(QMainWindow):
         self._manual_include = None
         self._aim_locked = False
         self.map_view.set_preview_cells([])
+        self.map_view.set_cover_hover(False)
+        self.map_view.set_cover_overlay(None, None)
         if kind == 'effect' and effect is not None:
             from effects import best_placement
             side = getattr(self._manual_actor, 'side', 0)
@@ -1669,8 +1696,10 @@ class MainWindow(QMainWindow):
                 'Повторный клик по существу в области «на выбор» включает и исключает его.')
             self.manual_go.setEnabled(True)
         elif kind == 'attack':
-            self.manual_hint.setText('Кликните по токену — это цель атаки.')
+            self.manual_hint.setText(
+                'Кликните по токену — это цель атаки. Полное укрытие выбрать нельзя.')
             self.manual_go.setEnabled(False)
+            self.map_view.set_cover_hover(True)
         else:
             self.manual_hint.setText('У существа нет действий. Ход можно пропустить.')
             self.manual_go.setEnabled(False)
@@ -1721,6 +1750,29 @@ class MainWindow(QMainWindow):
         self._manual_include = None
         self._refresh_manual_hit()
 
+    def _manual_cover(self, enemy):
+        battle_map = self.battle_map
+        attacker = getattr(self, '_manual_actor', None)
+        if (battle_map is None or attacker is None or not battle_map.has_terrain()
+                or battle_map.get_pos(attacker) is None or battle_map.get_pos(enemy) is None):
+            return None
+        return battle_map.combat_cover(attacker, enemy)
+
+    def on_hover_target(self, enemy):
+        if self._manual_loop is None or getattr(self, '_manual_kind', None) != 'attack':
+            return
+        attacker = getattr(self, '_manual_actor', None)
+        if enemy is None or enemy is attacker or not getattr(enemy, 'alive', False):
+            if self._manual_target is None:
+                self.map_view.set_cover_overlay(None, None)
+            return
+        cover = self._manual_cover(enemy)
+        if not cover:
+            return
+        from terrain import COVER_LABEL
+        self.map_view.set_cover_overlay(enemy, cover)
+        self.status.showMessage(f'{enemy.name}: {COVER_LABEL.get(cover, cover)}')
+
     def on_aim(self, x, y):
         if self._manual_loop is None or self._aim_locked or self._manual_kind != 'effect':
             return
@@ -1736,11 +1788,22 @@ class MainWindow(QMainWindow):
         if enemy is None or enemy is self._manual_actor or not getattr(enemy, 'alive', False):
             return
         if self._manual_kind == 'attack':
+            cover = self._manual_cover(enemy)
+            if cover == 'total':
+                self._manual_target = None
+                self.manual_go.setEnabled(False)
+                self.manual_hit.setText(f'{enemy.name}: полное укрытие, цель недоступна')
+                self.map_view.set_cover_overlay(enemy, cover)
+                return
             self._manual_target = enemy
             self.manual_go.setEnabled(True)
             self.selected = enemy
             self.map_view.rebuild(self.battle_map, self.sides, self._manual_actor)
             self._refresh_manual_hit()
+            if cover:
+                from terrain import COVER_LABEL
+                self.manual_hit.setText(f'{self.manual_hit.text()} · {COVER_LABEL[cover]}')
+                self.map_view.set_cover_overlay(enemy, cover)
             return
         if self._manual_kind != 'effect':
             return
@@ -2079,7 +2142,9 @@ class MainWindow(QMainWindow):
         for sheet in list(self._sheets):
             sheet.close()
         if self.battle_map is not None:
-            self.battle_map = BattleMap(self.battle_map.width, self.battle_map.height)
+            old_map = self.battle_map
+            self.battle_map = BattleMap(old_map.width, old_map.height)
+            self.battle_map.copy_terrain_from(old_map)
         self._refresh_roster(None)
         self._commit('очистка поля')
         self.status.showMessage('Поле очищено. Шаблоны сторон на месте.')
@@ -2484,11 +2549,15 @@ class MainWindow(QMainWindow):
         self.map_view.token_dragged.connect(self.on_token_dragged)
         self.map_view.image_dropped.connect(self._apply_background_path)
         self.map_view.aim_moved.connect(self.on_aim)
+        self.map_view.terrain_cell.connect(self.on_terrain_cell)
+        self.map_view.terrain_stroke_finished.connect(self.finish_terrain_stroke)
+        self.map_view.hover_target.connect(self.on_hover_target)
         self.map_view.setToolTip(
             'Колесо — зум. Тяни поле — панорама. Клик по токену — выбрать. '
             'Перетащи токен или кликни по зелёной клетке — ход. '
             'Правый щелчок по токену — карточка и действия, по пустой клетке — '
-            'добавить существо. Ctrl+Z — отмена. Картинку можно бросить на поле.')
+            'добавить существо. «Рельеф» на тулбаре рисует клетки. '
+            'Ctrl+Z — отмена. Картинку можно бросить на поле.')
         lay.addWidget(self.map_view, 1)
         self.manual_bar = QFrame()
         self.manual_bar.setObjectName('manual_bar')
@@ -2528,12 +2597,141 @@ class MainWindow(QMainWindow):
         bar_lay.addWidget(self.manual_hint)
         bar_lay.addWidget(self.manual_hit)
         lay.addWidget(self.manual_bar)
+        self._build_terrain_bar()
+        lay.addWidget(self.terrain_bar)
         self.map_info = QLabel(
             'Токен не выбран. Правый щелчок по пустой клетке — добавить существо.')
         self.map_info.setProperty('role', 'muted')
         self.map_info.setContentsMargins(8, 0, 8, 6)
         lay.addWidget(self.map_info)
         return page
+
+    def _build_terrain_bar(self):
+        from terrain import KIND_LABEL, KINDS
+        bar = QFrame()
+        bar.setObjectName('terrain_bar')
+        bar.setProperty('role', 'card')
+        bar.hide()
+        lay = QHBoxLayout(bar)
+        lay.setContentsMargins(8, 6, 8, 6)
+        lay.setSpacing(6)
+        title = QLabel('Рельеф')
+        title.setProperty('role', 'title')
+        lay.addWidget(title)
+        self._terrain_group = QButtonGroup(self)
+        self._terrain_group.setExclusive(True)
+        swatch = {
+            'wall': '#5c6574',
+            'difficult': '#8a9a4a',
+            'water': '#2e86ab',
+            'half': '#e0b341',
+            'three_quarters': '#e07a3d',
+            'total': '#8e3d55',
+        }
+        short = {
+            'wall': 'Стена',
+            'difficult': 'Трудная',
+            'water': 'Вода',
+            'half': '½ укрытие',
+            'three_quarters': '¾ укрытие',
+            'total': 'Полное',
+        }
+        self._terrain_buttons = {}
+        for kind in KINDS:
+            button = QPushButton(short[kind])
+            button.setObjectName(f'brush_{kind}')
+            button.setCheckable(True)
+            button.setCursor(Qt.CursorShape.PointingHandCursor)
+            button.setToolTip(KIND_LABEL[kind])
+            button.setStatusTip(KIND_LABEL[kind])
+            color = swatch[kind]
+            button.setStyleSheet(
+                f'QPushButton {{ background: {color}; color: #ffffff; '
+                f'border: 1px solid {color}; }}'
+                f'QPushButton:checked {{ border: 2px solid #ffffff; font-weight: bold; }}')
+            button.clicked.connect(lambda _checked=False, key=kind: self.set_terrain_brush(key))
+            self._terrain_group.addButton(button)
+            self._terrain_buttons[kind] = button
+            lay.addWidget(button)
+        self._terrain_buttons['wall'].setChecked(True)
+        eraser = QPushButton('Ластик')
+        eraser.setObjectName('brush_eraser')
+        eraser.setCheckable(True)
+        eraser.setCursor(Qt.CursorShape.PointingHandCursor)
+        eraser.setToolTip('Стирает рельеф. Правая кнопка на карте тоже стирает.')
+        eraser.clicked.connect(lambda _checked=False: self.set_terrain_brush('erase'))
+        self._terrain_group.addButton(eraser)
+        self._terrain_buttons['erase'] = eraser
+        lay.addWidget(eraser)
+        clear = QPushButton('Очистить')
+        clear.setObjectName('brush_clear')
+        clear.setProperty('variant', 'danger')
+        clear.setCursor(Qt.CursorShape.PointingHandCursor)
+        clear.setToolTip('Убрать весь рельеф с карты')
+        clear.clicked.connect(self.clear_terrain)
+        lay.addWidget(clear)
+        lay.addStretch()
+        self.terrain_bar = bar
+
+    def _on_terrain_button(self, checked):
+        self.set_terrain_mode(bool(checked))
+
+    def set_terrain_mode(self, on):
+        on = bool(on)
+        button = getattr(self, 'terrain_btn', None)
+        action = getattr(self, 'act_terrain', None)
+        for widget in (button, action):
+            if widget is None:
+                continue
+            widget.blockSignals(True)
+            widget.setChecked(on)
+            widget.blockSignals(False)
+        if getattr(self, 'terrain_bar', None) is not None:
+            self.terrain_bar.setVisible(on)
+        if getattr(self, 'map_view', None) is not None:
+            self.map_view.set_terrain_mode(on and self._manual_loop is None)
+        if on:
+            self.status.showMessage(
+                'Рельеф: протяните кисть по клеткам. Правая кнопка — ластик. '
+                'Штрих отменяется целиком.')
+        else:
+            self.status.showMessage('Режим рельефа выключен.')
+
+    def set_terrain_brush(self, kind):
+        self._terrain_brush = kind
+        button = self._terrain_buttons.get(kind)
+        if button is not None and not button.isChecked():
+            button.setChecked(True)
+
+    def on_terrain_cell(self, x, y, erase):
+        if self.battle_map is None or self._manual_loop is not None:
+            return
+        if not (0 <= int(x) < self.battle_map.width and 0 <= int(y) < self.battle_map.height):
+            return
+        kind = None if erase or self._terrain_brush == 'erase' else self._terrain_brush
+        if self.battle_map.terrain_at(x, y) == kind:
+            return
+        self.battle_map.set_terrain(x, y, kind)
+        self._terrain_dirty = True
+        self.map_view.refresh_terrain()
+
+    def finish_terrain_stroke(self):
+        if not self._terrain_dirty:
+            return
+        self._terrain_dirty = False
+        self.map_view.rebuild(self.battle_map, self.sides, self.selected)
+        self._commit('рельеф')
+        self.status.showMessage('Рельеф изменён.')
+
+    def clear_terrain(self):
+        if self.battle_map is None or not self.battle_map.has_terrain():
+            self.status.showMessage('На карте нет рельефа.')
+            return
+        self.battle_map.clear_terrain()
+        self._terrain_dirty = False
+        self.map_view.rebuild(self.battle_map, self.sides, self.selected)
+        self._commit('очистка рельефа')
+        self.status.showMessage('Рельеф очищен.')
 
     def _apply_background_path(self, path):
         if not self.map_view.set_background(path):
@@ -2665,7 +2863,15 @@ class MainWindow(QMainWindow):
         pos = self.battle_map.get_pos(self.selected)
         if not pos:
             return
-        dist = max(abs(x - pos[0]), abs(y - pos[1])) * 5
+        if self.battle_map.has_terrain():
+            snapped = self.battle_map.snap_move(self.selected, x, y)
+            dest, dist = snapped
+            if dest is None:
+                self.status.showMessage('Туда не пройти: стена или нет пути.')
+                return
+            x, y = dest
+        else:
+            dist = max(abs(x - pos[0]), abs(y - pos[1])) * 5
         if dist == 0:
             return
         from conditions import effective_speed, has_condition, is_incapacitated, try_stand

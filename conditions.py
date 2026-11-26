@@ -524,10 +524,11 @@ class SaveRoll:
 
     __slots__ = ('ability', 'natural', 'naturals', 'modifier', 'total', 'dc',
                  'success', 'auto_fail', 'advantage', 'resistance_used',
-                 'resistance_left')
+                 'resistance_left', 'cover_bonus')
 
     def __init__(self, ability, natural, naturals, modifier, total, dc, success,
-                 auto_fail, advantage, resistance_used, resistance_left):
+                 auto_fail, advantage, resistance_used, resistance_left,
+                 cover_bonus=0):
         self.ability = ability
         self.natural = natural
         self.naturals = list(naturals or [])
@@ -539,6 +540,7 @@ class SaveRoll:
         self.advantage = advantage
         self.resistance_used = bool(resistance_used)
         self.resistance_left = resistance_left
+        self.cover_bonus = int(cover_bonus or 0)
 
 
 def _roll_d20(rng, advantage, disadvantage):
@@ -557,8 +559,11 @@ def _roll_d20(rng, advantage, disadvantage):
 
 def saving_throw(creature, ability, dc, *, rng=None, advantage=False,
                  disadvantage=False, allow_legendary=True, disabling=False,
-                 damage_fail=0, damage_success=0):
-    """d20 + бонус против Сл. Натуральные 20 и 1 не автоуспех и не автопровал."""
+                 damage_fail=0, damage_success=0, bonus=0):
+    """d20 + бонус против Сл. Натуральные 20 и 1 не автоуспех и не автопровал.
+
+    bonus — укрытие к спасброску Ловкости. Ноль не меняет бросок.
+    """
     ability = ability_of(ability) or ability or 'dex'
     source = rng or getattr(creature, '_rng', None) or random
     disadvantage = bool(disadvantage) or save_disadvantage(creature, ability)
@@ -568,16 +573,18 @@ def saving_throw(creature, ability, dc, *, rng=None, advantage=False,
         dc_value = int(dc)
     except (TypeError, ValueError):
         dc_value = 10
+    cover = int(bonus or 0)
     if auto:
         roll = SaveRoll(ability, None, [], modifier, None, dc_value, False,
-                        True, 'auto_fail', False, legendary_resistance_remaining(creature))
+                        True, 'auto_fail', False, legendary_resistance_remaining(creature),
+                        cover)
     else:
         dice, mode, kept = _roll_d20(source, bool(advantage), disadvantage)
         natural = dice[0] if mode == 'cancel' else kept
-        total = int(natural) + int(modifier)
+        total = int(natural) + int(modifier) + cover
         roll = SaveRoll(ability, natural, dice, modifier, total, dc_value,
                         total >= dc_value, False, mode, False,
-                        legendary_resistance_remaining(creature))
+                        legendary_resistance_remaining(creature), cover)
     if (not roll.success and allow_legendary
             and legendary_resistance_remaining(creature) > 0
             and worth_legendary_resistance(
@@ -756,8 +763,10 @@ def save_text(creature, roll, *, title=None):
         elif roll.advantage == 'cancel':
             dice = ', преимущество и помеха гасятся'
         mod = roll.modifier or 0
+        cover = int(getattr(roll, 'cover_bonus', 0) or 0)
+        cover_txt = f' укрытие {cover:+d}' if cover else ''
         body = (f'{head} {roll.total} против Сл {roll.dc} '
-                f'(d20 {roll.natural} {mod:+d}{dice}) — '
+                f'(d20 {roll.natural} {mod:+d}{cover_txt}{dice}) — '
                 f'{"успех" if roll.success and not roll.resistance_used else "провал"}')
     if roll.resistance_used:
         left = roll.resistance_left
