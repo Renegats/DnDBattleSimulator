@@ -1,7 +1,7 @@
 """Qt-фронтенд симулятора: карта в центре, тулбар и прячущаяся панель.
 
-Редкие правила собраны в диалоге «Настройки боя». Вкладка армий остаётся
-отдельной страницей: перенос на карту — следующий шаг, см. docs/ui-redesign.md.
+Редкие правила — в диалоге «Настройки боя». Шаблоны отрядов — в немодальном
+окне «Стороны». Существо правится карточкой с карты и из списка участников.
 """
 import json
 import os
@@ -10,7 +10,7 @@ import sys
 from datetime import datetime
 
 from PyQt6.QtCore import QSettings, QSize, Qt, QEventLoop, QTimer
-from PyQt6.QtGui import QAction, QActionGroup, QColor, QKeySequence, QPixmap
+from PyQt6.QtGui import QAction, QActionGroup, QColor, QKeySequence, QPixmap, QShortcut
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QHBoxLayout, QGridLayout, QLabel, QLineEdit, QSpinBox,
                              QComboBox, QPushButton, QCheckBox,
@@ -24,8 +24,6 @@ from qt_icons import tool_icon
 
 import battle_round
 from battle_history import BattleHistory, apply_snapshot, capture_battle, ensure_uid
-from battle_strategies import (AggressiveStrategy, DefensiveStrategy,
-                               RandomStrategy, SupportStrategy)
 from combat_core import normalize_crit_mode
 from combat_log import dump_log, map_marks, render_log
 from decision_engine import DecisionEngine
@@ -37,7 +35,8 @@ from qt_combat_log import CombatLogPanel
 from qt_widgets import IconButton, PortraitCard
 import qt_async
 import portraits
-from qt_editors import SideCreatorDialog, CreatureEditDialog, Section, STRATS
+from qt_editors import SideCreatorDialog, Section, STRATS, make_strategy
+from qt_creature_sheet import AddCreatureDialog, CreatureSheet
 
 from battle_map_model import BattleMap
 
@@ -114,6 +113,11 @@ class MainWindow(QMainWindow):
         self._current = None
         self._round_busy = False
         self._nav_index = 0
+        self._relocate = None
+        self._sheets = []
+        self._esc = QShortcut(QKeySequence(Qt.Key.Key_Escape), self)
+        self._esc.setContext(Qt.ShortcutContext.WindowShortcut)
+        self._esc.activated.connect(self._cancel_relocate)
         self._auto_timer = QTimer(self)
         self._auto_timer.setInterval(700)
         self._auto_timer.timeout.connect(self._auto_tick)
@@ -130,20 +134,22 @@ class MainWindow(QMainWindow):
         v.setSpacing(0)
         self.stack = QStackedWidget()
         v.addWidget(self.stack)
-        self.stack.addWidget(self._build_setup())
         self.map_page = self._build_map()
+        self.map_page.setObjectName('map_page')
         self.stack.addWidget(self.map_page)
 
         self.roster_page = self._build_roster()
         self.log_page = self._build_log_tab()
         self._build_settings_dialog()
         self._build_dock()
+        self._build_sides_dialog()
         self._build_toolbar()
         self._fill_menus()
 
         self.status = self.statusBar()
         self.status.showMessage(
-            'Карта — основная сцена. Стороны собираются отдельно: кнопка армий или меню «Вид».')
+            'Карта — основная сцена. Правый щелчок по клетке добавляет существо, '
+            'по токену — открывает карточку.')
         self.add_card()
         self.add_card()
         page = self._restore_layout()
@@ -178,19 +184,8 @@ class MainWindow(QMainWindow):
         if idx not in (0, 1, 2, 3):
             idx = 0
         self._nav_index = idx
-        self.stack.setCurrentIndex(0 if idx == 0 else 1)
-        armies = idx == 0
-        if hasattr(self, 'armies_btn'):
-            self.armies_btn.blockSignals(True)
-            self.armies_btn.setChecked(armies)
-            self.armies_btn.blockSignals(False)
-        for action, on in ((getattr(self, 'act_armies_page', None), armies),
-                           (getattr(self, 'act_map_page', None), not armies)):
-            if action is None:
-                continue
-            action.blockSignals(True)
-            action.setChecked(on)
-            action.blockSignals(False)
+        if self.stack.count():
+            self.stack.setCurrentIndex(0)
         if idx == 1 and hasattr(self, 'side_tabs'):
             self.side_dock.show()
             self.side_tabs.setCurrentIndex(0)
@@ -239,8 +234,8 @@ class MainWindow(QMainWindow):
         self.addToolBar(Qt.ToolBarArea.LeftToolBarArea, bar)
 
         self.armies_btn = self._tool_button(
-            'armies', 'Настройка армий', self._on_armies_button, 'armies_button',
-            checkable=True)
+            'armies', 'Стороны — шаблоны отрядов', self._on_armies_button,
+            'armies_button', checkable=True)
         self.create_btn = self._tool_button(
             'create', 'Создать армии', self.create_armies, 'create_button')
         self.round_btn = self._tool_button(
@@ -276,7 +271,10 @@ class MainWindow(QMainWindow):
         self._apply_tool_icons()
 
     def _on_armies_button(self, checked):
-        self.select_tab(0 if checked else 3)
+        if checked:
+            self.show_sides()
+        elif getattr(self, 'sides_dialog', None) is not None:
+            self.sides_dialog.hide()
 
     def _show_settings(self, section=None):
         if section == 'alliances' and hasattr(self, '_sec_alliances'):
@@ -294,6 +292,8 @@ class MainWindow(QMainWindow):
         settings.setValue('page', self._nav_index)
         if getattr(self, 'settings_dialog', None) is not None:
             settings.setValue('settingsGeometry', self.settings_dialog.saveGeometry())
+        if getattr(self, 'sides_dialog', None) is not None:
+            settings.setValue('sidesGeometry', self.sides_dialog.saveGeometry())
 
     def _restore_layout(self):
         settings = self._settings()
@@ -312,6 +312,9 @@ class MainWindow(QMainWindow):
         dialog_geo = settings.value('settingsGeometry')
         if dialog_geo is not None and getattr(self, 'settings_dialog', None) is not None:
             self.settings_dialog.restoreGeometry(dialog_geo)
+        sides_geo = settings.value('sidesGeometry')
+        if sides_geo is not None and getattr(self, 'sides_dialog', None) is not None:
+            self.sides_dialog.restoreGeometry(sides_geo)
         page = settings.value('page', 0)
         try:
             page = int(page)
@@ -358,6 +361,11 @@ class MainWindow(QMainWindow):
             self.menu_battle, 'Пауза', self.pause_auto, 'act_pause',
             tip='Остановить автобой')
         self._menu_action(self.menu_battle, 'Создать армии', self.create_armies)
+        self._menu_action(self.menu_battle, 'Стороны…', self.show_sides, 'act_sides')
+        self._menu_action(self.menu_battle, 'Добавить сторону', self.add_side, 'act_add_side')
+        self._menu_action(self.menu_battle, 'Добавить существо…', self.prompt_add_creature,
+                          'act_add_creature')
+        self._menu_action(self.menu_battle, 'Очистить поле', self.clear_field, 'act_clear_field')
         self.menu_battle.addSeparator()
         self.act_manual = QAction('Ручное управление', self)
         self.act_manual.setObjectName('act_manual')
@@ -389,17 +397,7 @@ class MainWindow(QMainWindow):
 
         self._menu_action(self.menu_sim, 'Анализ сражения', self.open_analysis)
 
-        self.act_armies_page = self._menu_action(
-            self.menu_view, 'Настройка армий', lambda: self.select_tab(0),
-            checkable=True)
-        self.act_map_page = self._menu_action(
-            self.menu_view, 'Карта боя', lambda: self.select_tab(3), checkable=True)
-        pages = QActionGroup(self)
-        pages.setExclusive(True)
-        pages.addAction(self.act_armies_page)
-        pages.addAction(self.act_map_page)
-        self.act_armies_page.setChecked(True)
-        self.menu_view.addSeparator()
+        self._menu_action(self.menu_view, 'Стороны…', self.show_sides, 'act_view_sides')
         dock_action = self.side_dock.toggleViewAction()
         dock_action.setText('Панель боя')
         self.menu_view.addAction(dock_action)
@@ -442,7 +440,7 @@ class MainWindow(QMainWindow):
     def start_auto(self):
         if not self.sides:
             QMessageBox.warning(self, 'Автобой',
-                                'Сначала создайте армии на странице «Настройка армий».')
+                                'Сначала поставьте существ на карту или создайте армии.')
             return
         if self._auto_timer.isActive():
             return
@@ -470,7 +468,8 @@ class MainWindow(QMainWindow):
         self.run_round()
 
     def _on_bestiary_import(self, name):
-        self.status.showMessage(f'Бестиарий: импортирован «{name}».')
+        self.status.showMessage(f'Бестиарий: «{name}». Укажите клетку и сторону.')
+        self.prompt_add_creature(type_name=name)
 
     def toggle_theme(self):
         name = self.theme.toggle()
@@ -551,7 +550,7 @@ class MainWindow(QMainWindow):
         if not self.sides:
             QMessageBox.warning(
                 self, 'Пакетная симуляция',
-                'Сначала создайте армии на вкладке «Настройка армий».')
+                'Сначала поставьте существ на карту или создайте армии.')
             return
         app = QApplication.instance()
         if app is not None:
@@ -706,6 +705,51 @@ class MainWindow(QMainWindow):
         row.addStretch()
         lay.addLayout(row)
         return page
+
+    def _build_sides_dialog(self):
+        dialog = QDialog(self)
+        dialog.setObjectName('sides_dialog')
+        dialog.setWindowTitle('Стороны')
+        dialog.setModal(False)
+        dialog.resize(960, 680)
+        lay = QVBoxLayout(dialog)
+        lay.setContentsMargins(10, 10, 10, 10)
+        note = QLabel(
+            'Шаблон отряда: имя, состав, тактика, число и портрет. '
+            '«Создать армии» ставит всех на карту. Одно существо — '
+            'правый щелчок по пустой клетке или «Бой → Добавить существо…».')
+        note.setWordWrap(True)
+        note.setProperty('role', 'muted')
+        lay.addWidget(note)
+        lay.addWidget(self._build_setup(), 1)
+        dialog.finished.connect(self._sides_closed)
+        dialog.hide()
+        self.sides_dialog = dialog
+
+    def show_sides(self):
+        dialog = getattr(self, 'sides_dialog', None)
+        if dialog is None:
+            return
+        dialog.show()
+        dialog.raise_()
+        dialog.activateWindow()
+        if hasattr(self, 'armies_btn'):
+            self.armies_btn.blockSignals(True)
+            self.armies_btn.setChecked(True)
+            self.armies_btn.blockSignals(False)
+        self.cols = 0
+        self.relayout_cards()
+
+    def _sides_closed(self, _result=0):
+        if not hasattr(self, 'armies_btn'):
+            return
+        self.armies_btn.blockSignals(True)
+        self.armies_btn.setChecked(False)
+        self.armies_btn.blockSignals(False)
+
+    def add_side(self):
+        self.add_card()
+        self.show_sides()
 
     def relayout_cards(self):
         if not hasattr(self, 'plus_btn'):
@@ -954,16 +998,13 @@ class MainWindow(QMainWindow):
         self.pause_auto()
         try:
             self.sides, self.side_names = [], []
-            strat_cls = {'случайная': RandomStrategy, 'агрессивная': AggressiveStrategy,
-                         'защитная': DefensiveStrategy, 'поддержка': SupportStrategy}
             for i, c in enumerate(self.cards):
                 name = c['name'].text().strip() or f'Сторона {chr(65 + i)}'
                 self.side_names.append(name)
-                cls = strat_cls[c['strat'].currentText()]
                 side = []
                 for j in range(c['count'].value()):
                     e = EnemyFactory.create_enemy(c['type'], f'{name}_{j + 1}', i)
-                    e.strategy = cls()
+                    e.strategy = make_strategy(c['strat'].currentText())
                     side.append(e)
                 self.sides.append(side)
             n = len(self.sides)
@@ -1021,6 +1062,8 @@ class MainWindow(QMainWindow):
         self.initiative_list.setObjectName('initiative_list')
         self.initiative_list.setMaximumHeight(168)
         self.initiative_list.itemDoubleClicked.connect(self._focus_initiative_item)
+        self.initiative_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.initiative_list.customContextMenuRequested.connect(self._initiative_menu)
         lay.addWidget(self.initiative_list)
         self.battle_scroll = QScrollArea()
         self.battle_scroll.setWidgetResizable(True)
@@ -1029,6 +1072,8 @@ class MainWindow(QMainWindow):
         self.battle_lay.setContentsMargins(0, 0, 0, 0)
         self.battle_scroll.setWidget(self.battle_host)
         lay.addWidget(self.battle_scroll, 1)
+        lay.addWidget(self._outline('Добавить существо…', self.prompt_add_creature,
+                                    'add_creature'))
         lay.addWidget(self._outline('Массовое редактирование', self.mass_edit))
         return page
 
@@ -1184,8 +1229,9 @@ class MainWindow(QMainWindow):
     def rebuild_battle_lists(self):
         clear_layout(self.battle_lay)
         self.enemy_labels, self.side_checks = {}, []
-        if not self.sides:
-            hint = QLabel('Сначала создайте армии: кнопка армий или меню «Вид».')
+        if not any(self.sides):
+            hint = QLabel('На карте пока никого. Правый щелчок по клетке, '
+                          '«Добавить существо…» или «Создать армии».')
             hint.setProperty('role', 'muted')
             self.battle_lay.addWidget(hint)
             self.battle_lay.addStretch()
@@ -1213,7 +1259,7 @@ class MainWindow(QMainWindow):
                 lab.setToolTip(self._enemy_tip(e))
                 lab.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
                 lab.customContextMenuRequested.connect(
-                    lambda pos, en=e, widget=lab: self.open_condition_menu(
+                    lambda pos, en=e, widget=lab: self.open_token_menu(
                         en, widget.mapToGlobal(pos)))
                 lab.mouseDoubleClickEvent = lambda ev, en=e: self.edit_one(en)
                 r.addWidget(cb)
@@ -1298,12 +1344,49 @@ class MainWindow(QMainWindow):
                 listing.setCurrentItem(item)
                 return
 
-    def open_condition_menu(self, enemy, global_pos):
-        from conditions import CATALOG, active_conditions, condition_name
+    def _initiative_menu(self, pos):
+        item = self.initiative_list.itemAt(pos)
+        if item is None:
+            return
+        enemy = item.data(Qt.ItemDataRole.UserRole)
         if enemy is None:
             return
+        self.open_token_menu(enemy, self.initiative_list.mapToGlobal(pos))
+
+    def open_token_menu(self, enemy, global_pos):
+        if enemy is None:
+            return
+        menu = self.build_token_menu(enemy)
+        menu.exec(global_pos)
+
+    def build_token_menu(self, enemy):
+        """Контекстное меню токена и строки участника. Не блокирует само по себе."""
+        from conditions import CATALOG, active_conditions, condition_name
         menu = QMenu(self)
+        menu.setObjectName('token_menu')
+        sheet = menu.addAction('Карточка существа', lambda: self.edit_one(enemy))
+        sheet.setObjectName('token_sheet')
+        menu.addSeparator()
+        duplicate = menu.addAction('Дублировать', lambda: self.duplicate_enemy(enemy))
+        duplicate.setObjectName('token_duplicate')
+        delete = menu.addAction('Удалить…', lambda: self.delete_enemy(enemy))
+        delete.setObjectName('token_delete')
+        sides = menu.addMenu('Сменить сторону')
+        sides.setObjectName('token_side')
+        for index, name in enumerate(self.side_names):
+            action = sides.addAction(
+                name, lambda _checked=False, idx=index, who=enemy: self.change_enemy_side(
+                    who, idx))
+            action.setCheckable(True)
+            action.setChecked(index == getattr(enemy, 'side', None))
+        if self.side_names:
+            sides.addSeparator()
+        sides.addAction('Новая сторона…', lambda who=enemy: self.change_enemy_side(who, -1))
+        move = menu.addAction('Переместить', lambda: self.begin_relocate(enemy))
+        move.setObjectName('token_move')
+        menu.addSeparator()
         add = menu.addMenu('Наложить состояние')
+        add.setObjectName('token_conditions')
         for condition_id, label, _short, _color, hidden in CATALOG:
             if hidden or condition_id == 'exhaustion':
                 continue
@@ -1324,7 +1407,26 @@ class MainWindow(QMainWindow):
             if item.get('id') == 'exhaustion':
                 title = f'{title} {item.get("level")}'
             remove.addAction(title, lambda _checked=False, cond=item: self._lift(enemy, cond))
+        return menu
+
+    def open_cell_menu(self, x, y, global_pos):
+        if self._manual_loop is not None:
+            return
+        menu = self.build_cell_menu(x, y)
         menu.exec(global_pos)
+
+    def build_cell_menu(self, x, y):
+        menu = QMenu(self)
+        menu.setObjectName('cell_menu')
+        action = menu.addAction(
+            'Добавить существо сюда…',
+            lambda: self.prompt_add_creature(x, y))
+        action.setObjectName('cell_add')
+        return menu
+
+    def open_condition_menu(self, enemy, global_pos):
+        """Совместимость: полный контекст токена, не только состояния."""
+        self.open_token_menu(enemy, global_pos)
 
     def _impose(self, enemy, condition_id):
         from conditions import apply_condition, permanent_duration
@@ -1711,22 +1813,325 @@ class MainWindow(QMainWindow):
         if not enemies:
             QMessageBox.warning(self, 'Внимание', 'Выберите хотя бы одно существо!')
             return
-        label = (f'правка: {enemies[0].name}' if len(enemies) == 1
-                 else f'правка: {len(enemies)} существ')
-        d = CreatureEditDialog(self, enemies)
-        if d.exec() == QDialog.DialogCode.Accepted:
-            self.refresh_all_labels()
-            self.map_view.rebuild(self.battle_map, self.sides, self.selected)
-            self.status.showMessage(f'Обновлено существ: {len(enemies)}')
-            self._commit(label)
+        self.open_creature_sheet(enemies)
 
     def edit_one(self, enemy):
-        label = f'правка: {enemy.name}'
-        d = CreatureEditDialog(self, [enemy])
-        if d.exec() == QDialog.DialogCode.Accepted:
-            self.refresh_all_labels()
-            self.map_view.rebuild(self.battle_map, self.sides, self.selected)
-            self._commit(label)
+        if enemy is None:
+            return
+        self.open_creature_sheet([enemy])
+
+    def open_creature_sheet(self, enemies):
+        enemies = [enemy for enemy in enemies if enemy is not None]
+        if not enemies:
+            return None
+        sheet = CreatureSheet(self, enemies, self._side_labels())
+        sheet.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
+        sheet.applied.connect(lambda _checked=False, who=sheet: self._on_sheet_applied(who))
+        sheet.destroyed.connect(lambda *_args, who=sheet: self._forget_sheet(who))
+        self._sheets.append(sheet)
+        sheet.show()
+        sheet.raise_()
+        sheet.activateWindow()
+        return sheet
+
+    def _forget_sheet(self, sheet):
+        self._sheets = [item for item in self._sheets if item is not sheet]
+
+    def _close_sheets_for(self, enemy):
+        for sheet in list(self._sheets):
+            if enemy in getattr(sheet, 'enemies', ()):
+                sheet.close()
+
+    def _on_sheet_applied(self, sheet):
+        enemies = [enemy for enemy in sheet.enemies if self._holds(enemy)]
+        if not enemies:
+            return
+        label = (f'правка: {enemies[0].name}' if len(enemies) == 1
+                 else f'правка: {len(enemies)} существ')
+        sheet.write_creatures()
+        self._reassign_side(enemies, sheet.chosen_side())
+        focus = enemies[0]
+        self.selected = focus
+        self._refresh_roster(focus)
+        self._commit(label)
+        self.status.showMessage(f'Карточка применена: {focus.name}')
+
+    def _holds(self, enemy):
+        return any(enemy in side for side in self.sides)
+
+    def _side_labels(self):
+        if self.side_names:
+            return list(self.side_names)
+        if self.cards:
+            return [card['name'].text().strip() or f'Сторона {chr(65 + i)}'
+                    for i, card in enumerate(self.cards)]
+        return ['Сторона A']
+
+    def _ensure_side(self, index):
+        if index < 0:
+            index = len(self.sides)
+        while len(self.sides) <= index:
+            i = len(self.sides)
+            if i < len(self.cards):
+                name = self.cards[i]['name'].text().strip() or f'Сторона {chr(65 + i)}'
+            elif i < 26:
+                name = f'Сторона {chr(65 + i)}'
+            else:
+                name = f'Сторона {i + 1}'
+            self.sides.append([])
+            self.side_names.append(name)
+        while len(self.side_names) < len(self.sides):
+            i = len(self.side_names)
+            self.side_names.append(f'Сторона {chr(65 + i)}' if i < 26 else f'Сторона {i + 1}')
+        return index
+
+    def _ensure_map(self):
+        if self.battle_map is None:
+            self.battle_map = BattleMap(24, 16)
+        return self.battle_map
+
+    def _nearest_free(self, enemy, x, y):
+        battle_map = self.battle_map
+        if battle_map is None:
+            return None
+
+        def snap(value):
+            return round(float(value) * 2) / 2
+
+        x, y = snap(x), snap(y)
+        if battle_map.cell_free(x, y, enemy=enemy):
+            return x, y
+        limit = max(battle_map.width, battle_map.height) * 2
+        for radius in range(1, limit + 1):
+            for dx in range(-radius, radius + 1):
+                for dy in range(-radius, radius + 1):
+                    if max(abs(dx), abs(dy)) != radius:
+                        continue
+                    nx, ny = snap(x + dx * 0.5), snap(y + dy * 0.5)
+                    if battle_map.cell_free(nx, ny, enemy=enemy):
+                        return nx, ny
+        return None
+
+    def _refresh_roster(self, focus=None):
+        self.rebuild_battle_lists()
+        self.refresh_alliances()
+        self.log_panel.set_roster(self.sides, self.side_names)
+        self.map_view.rebuild(self.battle_map, self.sides, focus if focus is not None
+                              else self.selected)
+        self._refresh_initiative()
+        if focus is not None:
+            self.on_token(focus)
+        elif self.selected is None:
+            self.map_info.setText(
+                'Токен не выбран. Правый щелчок по пустой клетке — добавить существо.')
+
+    def _unique_name(self, base):
+        existing = {enemy.name for side in self.sides for enemy in side}
+        if base not in existing:
+            return base
+        candidate = f'{base} (копия)'
+        number = 2
+        while candidate in existing:
+            candidate = f'{base} (копия {number})'
+            number += 1
+        return candidate
+
+    def prompt_add_creature(self, x=None, y=None, type_name=None):
+        # Кнопка и пункт меню передают bool от clicked/triggered — это не координата.
+        if isinstance(x, bool) or not isinstance(x, (int, float)):
+            x = None
+        if isinstance(y, bool) or not isinstance(y, (int, float)):
+            y = None
+        if self._manual_loop is not None:
+            self.status.showMessage('Сначала закончите ручной ход.')
+            return None
+        dialog = AddCreatureDialog(
+            self, types_available(), self._side_labels(),
+            cell=None if x is None or y is None else (x, y),
+            current_type=type_name)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return None
+        data = dialog.result_data()
+        if not data['name'] or not data['type']:
+            QMessageBox.warning(self, 'Существо', 'Нужны имя и состав.')
+            return None
+        if x is None or y is None:
+            x, y = 1, 1
+        return self.add_creature_at(x, y, data['type'], data['side'], data['name'],
+                                    data['strategy'])
+
+    def add_creature_at(self, x, y, type_name, side=0, name=None, strategy='случайная'):
+        if self._manual_loop is not None:
+            self.status.showMessage('Сначала закончите ручной ход.')
+            return None
+        side = self._ensure_side(side)
+        name = (name or f'{type_name} {len(self.sides[side]) + 1}').strip()
+        name = self._unique_name(name)
+        enemy = EnemyFactory.create_enemy(type_name, name, side)
+        enemy.strategy = make_strategy(strategy)
+        self._ensure_map()
+        spot = self._nearest_free(enemy, x, y)
+        if spot is None:
+            QMessageBox.warning(self, 'Карта', 'Нет свободного места для существа.')
+            return None
+        self.sides[side].append(enemy)
+        self.battle_map.place(enemy, spot[0], spot[1])
+        enemy.moved_ft = 0
+        self.selected = enemy
+        self._refresh_roster(enemy)
+        self._commit(f'существо: {enemy.name}')
+        self.status.showMessage(f'На карте: {enemy.name}')
+        return enemy
+
+    def duplicate_enemy(self, enemy):
+        if enemy is None or not self._holds(enemy) or self._manual_loop is not None:
+            return None
+        import copy
+        from entities import Enemy
+        data = copy.deepcopy(enemy.to_dict())
+        data['name'] = self._unique_name(enemy.name)
+        data.pop('uid', None)
+        clone = Enemy.from_dict(data)
+        clone.initiative_bonus = int(getattr(enemy, 'initiative_bonus', 0) or 0)
+        side = self._ensure_side(int(getattr(enemy, 'side', 0) or 0))
+        clone.side = side
+        self._ensure_map()
+        origin = self.battle_map.get_pos(enemy) or (0, 0)
+        spot = self._nearest_free(clone, origin[0] + 1, origin[1])
+        if spot is None:
+            QMessageBox.warning(self, 'Карта', 'Нет свободного места для копии.')
+            return None
+        self.sides[side].append(clone)
+        self.battle_map.place(clone, spot[0], spot[1])
+        clone.moved_ft = 0
+        self.selected = clone
+        self._refresh_roster(clone)
+        self._commit(f'дублирование {enemy.name}')
+        self.status.showMessage(f'Копия: {clone.name}')
+        return clone
+
+    def delete_enemy(self, enemy):
+        if enemy is None or not self._holds(enemy):
+            return False
+        if self._manual_loop is not None:
+            self.status.showMessage('Сначала закончите ручной ход.')
+            return False
+        answer = QMessageBox.question(
+            self, 'Удалить существо?', f'Удалить «{enemy.name}» с карты?',
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+        if answer != QMessageBox.StandardButton.Yes:
+            return False
+        name = enemy.name
+        for side in self.sides:
+            if enemy in side:
+                side.remove(enemy)
+                break
+        if self.battle_map is not None:
+            self.battle_map.unplace(enemy)
+        if self.selected is enemy:
+            self.selected = None
+        if self._relocate is enemy:
+            self._relocate = None
+        self._close_sheets_for(enemy)
+        self._refresh_roster(None)
+        self._commit(f'удаление {name}')
+        self.status.showMessage(f'Удалено: {name}')
+        return True
+
+    def change_enemy_side(self, enemy, side_index):
+        if enemy is None or not self._holds(enemy) or self._manual_loop is not None:
+            return
+        self._reassign_side([enemy], side_index)
+        self.selected = enemy
+        self._refresh_roster(enemy)
+        side_name = self.side_names[enemy.side] if enemy.side < len(self.side_names) else ''
+        self._commit(f'сторона: {enemy.name}')
+        self.status.showMessage(f'{enemy.name} → {side_name}')
+
+    def _reassign_side(self, enemies, side_index):
+        side_index = self._ensure_side(side_index)
+        for enemy in list(enemies):
+            if enemy.side == side_index and enemy in self.sides[side_index]:
+                continue
+            for row in self.sides:
+                if enemy in row:
+                    row.remove(enemy)
+            self.sides[side_index].append(enemy)
+            enemy.side = side_index
+
+    def clear_field(self):
+        if self._manual_loop is not None:
+            self.status.showMessage('Сначала закончите ручной ход.')
+            return
+        if not any(self.sides):
+            self.status.showMessage('На карте нет существ.')
+            return
+        answer = QMessageBox.question(
+            self, 'Очистить поле?',
+            'Убрать всех существ с карты? Шаблоны сторон в окне «Стороны» останутся.',
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        for side in self.sides:
+            side.clear()
+        self.selected = None
+        self._relocate = None
+        for sheet in list(self._sheets):
+            sheet.close()
+        if self.battle_map is not None:
+            self.battle_map = BattleMap(self.battle_map.width, self.battle_map.height)
+        self._refresh_roster(None)
+        self._commit('очистка поля')
+        self.status.showMessage('Поле очищено. Шаблоны сторон на месте.')
+
+    def begin_relocate(self, enemy):
+        if enemy is None or not self._holds(enemy):
+            return
+        if self._manual_loop is not None:
+            self.status.showMessage('Сначала закончите ручной ход.')
+            return
+        self._ensure_map()
+        self._relocate = enemy
+        self.on_token(enemy)
+        self.status.showMessage(
+            f'Кликните клетку — «{enemy.name}» встанет туда без затраты скорости. '
+            'Esc отменяет.')
+
+    def _finish_relocate(self, x, y):
+        enemy = self._relocate
+        if enemy is None or not self._holds(enemy):
+            self._relocate = None
+            return
+        self._ensure_map()
+        if not self.battle_map.cell_free(x, y, ignore_id=id(enemy), enemy=enemy):
+            self.status.showMessage('Клетка занята. Выберите другую или нажмите Esc.')
+            return
+        previous = self.battle_map.get_pos(enemy)
+        self.battle_map.place(enemy, x, y)
+        placed = self.battle_map.get_pos(enemy)
+        self._relocate = None
+        if previous == placed:
+            self.on_token(enemy)
+            self.status.showMessage('Перемещение отменено: та же клетка.')
+            return
+        self.selected = enemy
+        self.map_view.rebuild(self.battle_map, self.sides, enemy)
+        self.on_token(enemy)
+        self._commit(f'перемещение {enemy.name}')
+
+    def _cancel_relocate(self):
+        if self._relocate is None:
+            return
+        name = self._relocate.name
+        self._relocate = None
+        self.status.showMessage(f'Перемещение «{name}» отменено.')
+
+    def keyPressEvent(self, event):
+        if event.key() == Qt.Key.Key_Escape and self._relocate is not None:
+            self._cancel_relocate()
+            event.accept()
+            return
+        super().keyPressEvent(event)
 
     def show_status(self):
         lines = ['=== ТЕКУЩИЙ СТАТУС ===']
@@ -2073,15 +2478,17 @@ class MainWindow(QMainWindow):
         lay.setSpacing(4)
         self.map_view = MapView(self.theme.palette())
         self.map_view.token_clicked.connect(self.on_token)
-        self.map_view.token_menu.connect(self.open_condition_menu)
+        self.map_view.token_menu.connect(self.open_token_menu)
+        self.map_view.cell_menu.connect(self.open_cell_menu)
         self.map_view.cell_clicked.connect(self.on_cell)
         self.map_view.token_dragged.connect(self.on_token_dragged)
         self.map_view.image_dropped.connect(self._apply_background_path)
         self.map_view.aim_moved.connect(self.on_aim)
         self.map_view.setToolTip(
             'Колесо — зум. Тяни поле — панорама. Клик по токену — выбрать. '
-            'Перетащи токен или кликни по зелёной клетке — ход. Ctrl+Z — отмена. '
-            'Картинку можно бросить на поле.')
+            'Перетащи токен или кликни по зелёной клетке — ход. '
+            'Правый щелчок по токену — карточка и действия, по пустой клетке — '
+            'добавить существо. Ctrl+Z — отмена. Картинку можно бросить на поле.')
         lay.addWidget(self.map_view, 1)
         self.manual_bar = QFrame()
         self.manual_bar.setObjectName('manual_bar')
@@ -2121,7 +2528,8 @@ class MainWindow(QMainWindow):
         bar_lay.addWidget(self.manual_hint)
         bar_lay.addWidget(self.manual_hit)
         lay.addWidget(self.manual_bar)
-        self.map_info = QLabel('Токен не выбран. Армии собираются на отдельной странице.')
+        self.map_info = QLabel(
+            'Токен не выбран. Правый щелчок по пустой клетке — добавить существо.')
         self.map_info.setProperty('role', 'muted')
         self.map_info.setContentsMargins(8, 0, 8, 6)
         lay.addWidget(self.map_info)
@@ -2248,6 +2656,9 @@ class MainWindow(QMainWindow):
     def on_cell(self, x, y):
         if self._manual_loop is not None:
             self._manual_click_cell(x, y)
+            return
+        if self._relocate is not None:
+            self._finish_relocate(x, y)
             return
         if self.battle_map is None or self.selected is None or not self.selected.alive:
             return

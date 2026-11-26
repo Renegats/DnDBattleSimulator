@@ -51,16 +51,18 @@ class TestQtShell(unittest.TestCase):
                          'Пакетная симуляция…')
         battle = _texts(self._menu('Бой'))
         for title in ('Провести раунд', 'Автобой', 'Пауза', 'Создать армии',
-                      'Ручное управление', 'Настройки боя…'):
+                      'Стороны…', 'Добавить сторону', 'Добавить существо…',
+                      'Очистить поле', 'Ручное управление', 'Настройки боя…'):
             self.assertIn(title, battle)
         file_menu = _texts(self._menu('Файл'))
         for title in ('Сохранить настройки', 'Загрузить настройки',
                       'Экспорт журнала', 'Экспорт карты PNG'):
             self.assertIn(title, file_menu)
         view = _texts(self._menu('Вид'))
-        for title in ('Настройка армий', 'Карта боя', 'Панель боя',
-                      'Участники', 'Журнал', 'Бестиарий'):
+        for title in ('Стороны…', 'Панель боя', 'Участники', 'Журнал', 'Бестиарий'):
             self.assertIn(title, view)
+        self.assertNotIn('Настройка армий', view)
+        self.assertNotIn('Карта боя', view)
 
     def test_toolbar_buttons_have_names_and_tips(self):
         bar = self.win.findChild(QToolBar, 'battle_toolbar')
@@ -94,10 +96,12 @@ class TestQtShell(unittest.TestCase):
         self.assertTrue(self.win.auto_move.isChecked())
 
     def test_pages_and_saved_dock(self):
-        self.assertEqual(self.win.stack.currentIndex(), 0)
+        self.assertEqual(self.win.stack.count(), 1)
+        self.assertIs(self.win.stack.currentWidget(), self.win.map_page)
+        self.assertFalse(self.win.sides_dialog.isVisible())
+        self.win.select_tab(1)
+        self.assertEqual(self.win.side_tabs.currentIndex(), 0)
         self.win.select_tab(3)
-        self.assertEqual(self.win.stack.currentIndex(), 1)
-        self.assertTrue(self.win.act_map_page.isChecked())
         self.win.show()
         self._app.processEvents()
         self.win.side_dock.hide()
@@ -108,7 +112,8 @@ class TestQtShell(unittest.TestCase):
             again.show()
             self._app.processEvents()
             self.assertFalse(again.side_dock.isVisible())
-            self.assertEqual(again.stack.currentIndex(), 1)
+            self.assertIs(again.stack.currentWidget(), again.map_page)
+            self.assertFalse(again.sides_dialog.isVisible())
             again.reset_layout()
             self._app.processEvents()
             self.assertTrue(again.side_dock.isVisible())

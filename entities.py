@@ -156,6 +156,7 @@ class Enemy(Subject):
         self.save_immunities = []
         self.lair_index = 0
         self.lair_warned = False
+        self.initiative_bonus = 0
         self._rng = rng if rng is not None else random
 
     def take_damage(self, damage: int):
@@ -276,6 +277,7 @@ class Enemy(Subject):
             'save_immunities': list(self.save_immunities or []),
             'lair_index': int(self.lair_index or 0),
             'lair_warned': bool(self.lair_warned),
+            'initiative_bonus': int(getattr(self, 'initiative_bonus', 0) or 0),
         }
 
     @classmethod
@@ -319,6 +321,10 @@ class Enemy(Subject):
         enemy.save_immunities = list(data.get('save_immunities') or [])
         enemy.lair_index = int(data.get('lair_index') or 0)
         enemy.lair_warned = bool(data.get('lair_warned') or False)
+        try:
+            enemy.initiative_bonus = int(data.get('initiative_bonus') or 0)
+        except (TypeError, ValueError):
+            enemy.initiative_bonus = 0
 
         strategy_type = data.get('strategy_type', 'RandomStrategy')
         from battle_strategies import (AggressiveStrategy, DefensiveStrategy,

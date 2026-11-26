@@ -59,6 +59,17 @@ class TestInitiative(unittest.TestCase):
         self.assertEqual([row[4].name for row in order], ['Быстрый', 'Медленный'])
         self.assertEqual(order[0][0], order[1][0])
 
+    def test_initiative_bonus_stacks_on_dex_and_defaults_to_zero(self):
+        plain = unit('Ровный', 0, dex=10)
+        boosted = unit('С бонусом', 1, dex=10)
+        boosted.initiative_bonus = 5
+        order = living_initiative([[plain], [boosted]], rng=ScriptedRng([10, 1, 10, 1]))
+        self.assertEqual([row.enemy.name for row in order], ['С бонусом', 'Ровный'])
+        self.assertEqual(order[0].modifier, 5)
+        self.assertEqual(order[0].total, 15)
+        self.assertEqual(order[1].modifier, 0)
+        self.assertEqual(order[1].total, 10)
+
     def test_same_dex_tie_break_roll(self):
         left = unit('А', 0, dex=12)
         right = unit('Б', 1, dex=12)

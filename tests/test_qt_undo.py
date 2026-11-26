@@ -9,14 +9,13 @@ os.environ.setdefault('QT_QPA_PLATFORM', 'offscreen')
 
 from PyQt6.QtCore import Qt, QEvent, QPointF
 from PyQt6.QtGui import QKeySequence, QMouseEvent
-from PyQt6.QtWidgets import QApplication, QDialog, QFileDialog, QMessageBox
+from PyQt6.QtWidgets import QApplication, QFileDialog, QMessageBox
 
 from battle_history import capture_battle
 from battle_map_model import BattleMap
 from entities import Attack, Enemy
 from factory import EnemyFactory
 from qt_app import MainWindow
-from qt_editors import CreatureEditDialog
 
 
 def _app():
@@ -198,20 +197,20 @@ class TestQtUndo(unittest.TestCase):
     def test_edit_alliance_and_side_cards(self):
         win, left, _right = self._window()
         try:
-            def fake_exec(dialog):
-                dialog.enemies[0].ac = 19
-                dialog.enemies[0].name = 'Орк-вождь'
-                dialog.enemies[0].hp = dialog.enemies[0].max_hp
-                return QDialog.DialogCode.Accepted
-
-            with mock.patch.object(CreatureEditDialog, 'exec', fake_exec):
-                win.edit_one(left)
+            sheet = win.open_creature_sheet([left])
+            self.assertFalse(sheet.isModal())
+            sheet.name.setText('Орк-вождь')
+            sheet.ac.setValue(19)
+            sheet.hp.setValue(left.max_hp)
+            self.assertTrue(sheet.apply_changes())
             self.assertEqual(left.ac, 19)
+            self.assertEqual(left.name, 'Орк-вождь')
             win.do_undo()
             self.assertEqual(left.ac, 14)
             self.assertEqual(left.name, 'Орк 3')
             win.do_redo()
             self.assertEqual(left.name, 'Орк-вождь')
+            sheet.close()
 
             third = _fighter('Гном 1', 2, hp=10)
             win.sides.append([third])

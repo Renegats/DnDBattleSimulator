@@ -32,6 +32,15 @@ def dex_modifier(enemy) -> int:
     return 0
 
 
+def _initiative_bonus(enemy) -> int:
+    """Дополнительный бонус к броску, помимо мода Ловкости. По умолчанию 0."""
+    raw = getattr(enemy, 'initiative_bonus', 0)
+    try:
+        return int(raw or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
 def dex_score(enemy) -> int:
     scores = getattr(enemy, 'ability_scores', None) or {}
     raw = scores.get('dex') if isinstance(scores, dict) else None
@@ -46,7 +55,8 @@ def dex_score(enemy) -> int:
 def living_initiative(sides, rng=None):
     """Живые существа по убыванию инициативы.
 
-    Бросок: d20 + мод Ловкости. Ничья: большее значение Ловкости, затем
+    Бросок: d20 + мод Ловкости + дополнительный бонус (по умолчанию 0).
+    Ничья: большее значение Ловкости, затем
     повторный d20. rng, если передан, бросает за всех; иначе — rng существа
     (внедряемый _rng, иначе модульный random).
     """
@@ -59,7 +69,7 @@ def living_initiative(sides, rng=None):
             if source is None:
                 source = getattr(enemy, '_rng', None) or random
             natural = source.randint(1, 20)
-            modifier = dex_modifier(enemy)
+            modifier = dex_modifier(enemy) + _initiative_bonus(enemy)
             total = natural + modifier
             tie = source.randint(1, 20)
             rows.append(InitiativeEntry(
