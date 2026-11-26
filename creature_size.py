@@ -4,6 +4,8 @@
 Огромный 15×15 (3), Громадный 20×20 (4). Модель поля хранит занятость в
 полуклетках, поэтому крошечные реально помещаются по четыре в клетку.
 """
+from functools import lru_cache
+
 SIZE_ORDER = ['tiny', 'small', 'medium', 'large', 'huge', 'gargantuan']
 
 SIZE_CELLS = {'tiny': 0.5, 'small': 1.0, 'medium': 1.0,
@@ -31,11 +33,17 @@ def canon_size(text) -> str:
     """Русский/английский текст статблока -> ключ размера. Пусто -> Средний."""
     if not text:
         return 'medium'
-    low = str(text).strip().lower()
+    if text in SIZE_CELLS:
+        return text
+    return _canon_size_text(str(text).strip().lower())
+
+
+@lru_cache(maxsize=256)
+def _canon_size_text(low):
     if low in SIZE_CELLS:
         return low
     for key, stems in _TRIGGERS:
-        if any(s in low for s in stems):
+        if any(stem in low for stem in stems):
             return key
     return 'medium'
 
