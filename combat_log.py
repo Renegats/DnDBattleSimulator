@@ -109,6 +109,9 @@ class CombatEvent:
     naturals: list = field(default_factory=list)
     advantage: str | None = None
     resistance_used: bool = False
+    area_cells: list = field(default_factory=list)
+    area_origin: tuple | None = None
+    area_ids: list = field(default_factory=list)
 
     def to_dict(self):
         data = {}
@@ -129,7 +132,11 @@ class CombatEvent:
                 value = [InitiativeRoll.from_dict(part) for part in (value or [])]
             elif item.name == 'naturals':
                 value = [int(part) for part in (value or []) if part is not None]
-            elif item.name in _POS_FIELDS:
+            elif item.name == 'area_cells':
+                value = [_as_pos(part) for part in (value or []) if _as_pos(part)]
+            elif item.name == 'area_ids':
+                value = [int(part) for part in (value or []) if part is not None]
+            elif item.name in _POS_FIELDS or item.name == 'area_origin':
                 value = _as_pos(value)
             kwargs[item.name] = value
         return cls(**kwargs)
@@ -284,6 +291,8 @@ def detail_lines(event: CombatEvent) -> list:
         lines.append('легендарное действие')
     if event.reason and event.reason not in (event.text or ''):
         lines.append(f'причина: {event.reason}')
+    if event.area_cells:
+        lines.append(f'клеток области: {len(event.area_cells)}')
     return lines
 
 
