@@ -46,6 +46,7 @@ ATTACK_STYLES = {
 class MapView(QGraphicsView):
     token_clicked = pyqtSignal(object)
     token_menu = pyqtSignal(object, object)
+    cell_menu = pyqtSignal(float, float, object)
     cell_clicked = pyqtSignal(float, float)
     token_dragged = pyqtSignal(object, float, float)
     image_dropped = pyqtSignal(str)
@@ -234,12 +235,16 @@ class MapView(QGraphicsView):
 
     def mousePressEvent(self, e):
         if e.button() == Qt.MouseButton.RightButton:
+            point = e.globalPosition().toPoint()
             enemy = self._token_at(e.pos())
             if enemy is not None:
-                point = e.globalPosition().toPoint()
                 self.token_menu.emit(enemy, point)
-                e.accept()
-                return
+            elif not self._aiming:
+                sp = self.mapToScene(e.pos())
+                x, y = self._cell_at(sp, self.opts['cell'])
+                self.cell_menu.emit(x, y, point)
+            e.accept()
+            return
         if e.button() == Qt.MouseButton.LeftButton:
             enemy = self._token_at(e.pos())
             if enemy is not None and not self._aiming:
