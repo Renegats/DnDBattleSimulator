@@ -35,10 +35,7 @@ import qt_async
 import portraits
 from qt_editors import SideCreatorDialog, CreatureEditDialog, Section, STRATS
 
-try:
-    from battle_map_model import BattleMap
-except ImportError:
-    from battle_map import BattleMap
+from battle_map_model import BattleMap
 
 MAX_SIDES = 26
 

@@ -377,10 +377,7 @@ class TestRoundLog(unittest.TestCase):
                 else:
                     continue
                 for name in names:
-                    self.assertFalse(
-                        name == 'tkinter' or name.startswith('tkinter.')
-                        or name.startswith('PyQt'),
-                        name)
+                    self.assertFalse(name.startswith('PyQt'), name)
 
     def _sample(self):
         attacker = unit('Боец', 0, rng=ScriptedRng([10, 4]), attacks=[axe('Топор')])

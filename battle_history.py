@@ -1,4 +1,4 @@
-"""История отмены боя. Без Qt и без tkinter.
+"""История отмены боя. Без привязки к интерфейсу.
 
 Снимок — обычный словарь, который можно положить в JSON. Отмена возвращает
 снимок «до», повтор — сохранённый снимок «после», без нового броска костей.
@@ -12,10 +12,7 @@ from combat_log import CombatEvent
 from entities import Enemy
 from factory import EnemyFactory
 
-try:
-    from battle_map_model import BattleMap
-except ImportError:
-    from battle_map import BattleMap
+from battle_map_model import BattleMap
 
 
 HISTORY_LIMIT = 100

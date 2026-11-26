@@ -1,8 +1,7 @@
-"""Инициатива 5e, лечение и делегирование Tk-раунда в run_round."""
+"""Инициатива 5e, лечение и режим крита в run_round."""
 import random
 import unittest
 
-from battle_logic import BattleLogic
 from battle_round import living_initiative, run_round
 from battle_strategies import AggressiveStrategy, SupportStrategy
 from combat_core import execute_strikes
@@ -175,22 +174,16 @@ class TestHealing(unittest.TestCase):
         self.assertEqual(ally.hp, 19, 'кость 6 + мод 3, без броска против КД')
 
 
-class TestBattleLogicDelegate(unittest.TestCase):
+class TestCritModeRound(unittest.TestCase):
 
-    def test_missing_log_widget_does_not_crash_and_uses_crit_mode(self):
+    def test_dice_only_crit_mode_reaches_the_round(self):
         attacker = unit(
             'А', 0, hp=40, ac=18, dex=20,
             attacks=[Attack('Меч', 0, 1, 'd6', 2, 'рубящий')],
             rng=ScriptedRng([20, 1, 20, 6, 1]))
         target = unit('Б', 1, hp=30, ac=10, dex=8, rng=random.Random(1))
-        logic = BattleLogic(DecisionEngine())
-        logic.sides = [[attacker], [target]]
-        logic.side_names = ['А', 'Б']
-        logic.ignore_sides = {}
-        logic.auto_move = False
-        logic.crit_damage_mode = 'dice_only'
-        logic._run_round_inner()
-        self.assertFalse(hasattr(logic, 'battle_results_text'))
+        run_round([[attacker], [target]], ['А', 'Б'], {}, None, DecisionEngine(),
+                  auto_move=False, crit_mode='dice_only')
         self.assertEqual(target.hp, 21, 'крит «только кости»: 6+1+2, не (6+2)*2')
 
 

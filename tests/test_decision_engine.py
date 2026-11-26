@@ -1,9 +1,9 @@
 """Юнит-тесты слоя принятия решений (decision_engine.DecisionEngine.decide).
 
-Плод DI шага 1 + разделения слоёв: decide() проверяется БЕЗ tkinter, БЕЗ
-battle_map, БЕЗ бросков кубиков. Граф импортов: unittest -> decision_engine ->
-battle_strategies(abc, random). Ни один узел не тянет tkinter => тест изолирован
-от GUI. Достижимость цели живёт ЕДИНСТВЕННЫМ владельцем в _pick_target архетипа
+Плод DI шага 1 + разделения слоёв: decide() проверяется без интерфейса, без
+карты и без бросков кубиков. Граф импортов: unittest -> decision_engine ->
+battle_strategies(abc, random). Тест изолирован от GUI. Достижимость цели
+живёт единственным владельцем в _pick_target архетипа
 (tier1/2/speed) - A1 из decide удалён, чтобы две оси не дрались за выбор цели.
 
 Вид test double = Fake (реальные данные состояния: pos/attacks/int/hp/ac),
