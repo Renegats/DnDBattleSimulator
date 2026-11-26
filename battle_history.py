@@ -24,10 +24,12 @@ class RestoreResult:
     """Что поменялось при наложении снимка. Интерфейсу этого хватает, чтобы
     не пересобирать списки и журнал, если изменились только хиты или клетка."""
 
-    def __init__(self, roster_changed, events_changed, selected):
+    def __init__(self, roster_changed, events_changed, selected, selection=None):
         self.roster_changed = roster_changed
         self.events_changed = events_changed
         self.selected = selected
+        self.selection = list(selection if selection is not None
+                              else ([selected] if selected is not None else []))
 
 
 class BattleHistory:
@@ -145,28 +147,107 @@ def _setup_rows(source):
     return _plain(getattr(source, 'setup', None) or [])
 
 
+def _attack_sig(enemy):
+    rows = []
+    for attack in enemy.attacks:
+        rows.append((
+            attack.name, attack.attack_bonus, attack.damage_dice_count,
+            attack.damage_dice_type, attack.damage_modifier, attack.damage_type,
+            attack.range_ft, bool(attack.magical),
+            tuple(tuple(sorted(part.items())) for part in (attack.extra_damage or [])),
+            tuple(tuple(sorted(part.items())) for part in (attack.riders or [])),
+        ))
+    return tuple(rows)
+
+
+def _cond_sig(enemy):
+    rows = []
+    for item in enemy.conditions or []:
+        if isinstance(item, dict):
+            rows.append(tuple(sorted((str(key), _plain(value)) for key, value in item.items())))
+        else:
+            rows.append((str(item),))
+    return tuple(rows)
+
+
+def _text_bag(value):
+    if isinstance(value, dict):
+        return tuple(sorted((str(key), str(item)) for key, item in value.items()))
+    if isinstance(value, (list, tuple)):
+        return tuple(_text_bag(item) if isinstance(item, (dict, list, tuple)) else item
+                     for item in value)
+    return value
+
+
+def _enemy_sig(enemy, pos):
+    """Поля, которые правят бой и карточка. Совпадение — прежняя запись ещё верна."""
+    return (
+        enemy.name, enemy.max_hp, enemy.hp, enemy.ac, enemy.side, bool(enemy.alive),
+        _num(enemy.regen), _num(enemy.speed), _pair(pos),
+        _num(getattr(enemy, 'moved_ft', 0) or 0),
+        enemy.strategy.__class__.__name__,
+        tuple(sorted(int(item) for item in (enemy.ignore_sides or ()))),
+        _attack_sig(enemy), _cond_sig(enemy),
+        _text_bag(enemy.ability_scores), _text_bag(enemy.ability_mods),
+        _text_bag(enemy.saves), _text_bag(enemy.skills), _text_bag(enemy.senses),
+        _text_bag(enemy.vulnerabilities), _text_bag(enemy.resistances),
+        _text_bag(enemy.immunities), _text_bag(enemy.condition_immunities),
+        _text_bag(enemy.languages), enemy.cr, enemy.prof_bonus, enemy.size, enemy.type,
+        _text_bag(enemy.traits), _text_bag(enemy.multiattack),
+        enemy.legendary_remaining, enemy.legendary_resistance_remaining,
+        _text_bag(enemy.recharge_state), _text_bag(enemy.save_immunities),
+        int(enemy.lair_index or 0), bool(enemy.lair_warned),
+        int(getattr(enemy, 'initiative_bonus', 0) or 0),
+        id(enemy.legendary_actions), id(enemy.legendary_resistance),
+        id(enemy.lair_actions), id(enemy.special_actions),
+        id(enemy.bonus_actions), id(enemy.reactions),
+    )
+
+
 def _enemy_record(enemy, battle_map):
+    if battle_map is not None and battle_map.get_pos(enemy) is not None:
+        pos = battle_map.get_pos(enemy)
+    else:
+        pos = getattr(enemy, 'pos', None)
+    sig = _enemy_sig(enemy, pos)
+    cached = getattr(enemy, '_snap_cache', None)
+    if cached is not None and cached[0] == sig:
+        return cached[1]
     record = _plain(enemy.to_dict())
     record['uid'] = ensure_uid(enemy)
     record['moved_ft'] = _num(getattr(enemy, 'moved_ft', 0) or 0)
     record['ignore_sides'] = sorted(int(item) for item in (record.get('ignore_sides') or []))
-    if battle_map is not None and battle_map.get_pos(enemy) is not None:
-        record['pos'] = _pair(battle_map.get_pos(enemy))
-    else:
-        record['pos'] = _pair(record.get('pos'))
+    record['pos'] = _pair(pos)
+    enemy._snap_cache = (sig, record)
     return record
 
 
+# Повторный снимок журнала не сериализует старые строки заново.
+_EVENT_CACHE = {}
+
+
 def _event_record(event, id_to_uid):
-    data = _plain(event.to_dict())
-    for key in ('actor_id', 'target_id'):
-        if data.get(key) in id_to_uid:
-            data[key] = id_to_uid[data[key]]
+    actor = id_to_uid.get(getattr(event, 'actor_id', None))
+    target = id_to_uid.get(getattr(event, 'target_id', None))
+    area = tuple(id_to_uid.get(item, item) for item in (getattr(event, 'area_ids', None) or []))
+    key = (id(event), getattr(event, 'kind', None), getattr(event, 'round', None),
+           getattr(event, 'text', None), actor, target, area)
+    cached = _EVENT_CACHE.get(key[0])
+    if cached is not None and cached[0] == key:
+        return cached[1]
+    data = event.to_dict()
+    for field, value in (('actor_id', actor), ('target_id', target)):
+        if value is not None and getattr(event, field, None) in id_to_uid:
+            data[field] = value
     if data.get('area_ids'):
-        data['area_ids'] = [id_to_uid.get(item, item) for item in data['area_ids']]
+        data['area_ids'] = list(area)
     for roll in data.get('rolls') or []:
         if isinstance(roll, dict) and roll.get('actor_id') in id_to_uid:
             roll['actor_id'] = id_to_uid[roll['actor_id']]
+    _EVENT_CACHE[key[0]] = (key, data)
+    if len(_EVENT_CACHE) > 20000:
+        _EVENT_CACHE.clear()
+        _EVENT_CACHE[key[0]] = (key, data)
     return data
 
 
@@ -215,6 +296,11 @@ def capture_battle(source):
     selected_uid = None
     if selected is not None:
         selected_uid = ensure_uid(selected)
+    group = getattr(source, 'selection', None)
+    if group is None:
+        selected_uids = [selected_uid] if selected_uid else []
+    else:
+        selected_uids = [ensure_uid(enemy) for enemy in group if enemy is not None]
 
     return {
         'sides': records,
@@ -229,6 +315,7 @@ def capture_battle(source):
         'setup': _setup_rows(source),
         'custom_types': _plain(dict(EnemyFactory.CUSTOM_TYPES)),
         'selected_uid': selected_uid,
+        'selected_uids': selected_uids,
     }
 
 
@@ -362,4 +449,14 @@ def apply_snapshot(snapshot, target):
             if selected is not None:
                 break
     target.selected = selected
-    return RestoreResult(roster_changed, events_changed, selected)
+    by_uid = {enemy.uid: enemy for side in new_sides for enemy in side}
+    wanted = snapshot.get('selected_uids')
+    if wanted is None:
+        wanted = [selected_uid] if selected_uid else []
+    group = [by_uid[uid] for uid in wanted if uid in by_uid]
+    if hasattr(target, 'selection'):
+        target.selection = group
+    if selected is None and group:
+        selected = group[-1]
+        target.selected = selected
+    return RestoreResult(roster_changed, events_changed, selected, group)

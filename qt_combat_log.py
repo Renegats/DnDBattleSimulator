@@ -337,8 +337,14 @@ class CombatLogPanel(QWidget):
         self._quiet = False
 
     def append_round(self, events):
-        self.model.append_round(events)
-        self._reveal_last()
+        for view in self._views:
+            view.setUpdatesEnabled(False)
+        try:
+            self.model.append_round(events)
+            self._reveal_last()
+        finally:
+            for view in self._views:
+                view.setUpdatesEnabled(True)
 
     def add_note(self, text):
         from combat_log import CombatEvent
@@ -359,6 +365,8 @@ class CombatLogPanel(QWidget):
         Тихий режим, чтобы перерисовка не считалась кликом по записи.
         """
         self._quiet = True
+        for view in self._views:
+            view.setUpdatesEnabled(False)
         self.model.clear()
         batch = []
         kind = None
@@ -385,6 +393,7 @@ class CombatLogPanel(QWidget):
         self._reveal_last()
         for view in self._views:
             view.expandAll()
+            view.setUpdatesEnabled(True)
         self._quiet = False
 
     def _reveal_last(self):

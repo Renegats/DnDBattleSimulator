@@ -43,6 +43,14 @@ class BattleMap:
         self.cell_map = {}       # (int x, int y) -> enemy (якорь, для совместимости)
         self._occ = {}           # (hx, hy) полуклетки -> enemy
         self._terrain = {}       # (x, y) клетка 5 фт -> тип рельефа
+        self._sight_stamp = 0
+        self._cover_cache = {}
+        self._reach_cache = {}
+        self._body_cache = {}
+        self._pair_cache = {}
+        self._squares_cache = None
+        self._owners = {}
+        self._alive_tuple = None
 
     # ---------- габариты ----------
     @staticmethod
@@ -113,6 +121,14 @@ class BattleMap:
             n = 2
         return self._area_free(int(round(x * 2)), int(round(y * 2)), n, ignore_id)
 
+    def _drop_sight_cache(self):
+        """Позиции или рельеф изменились — старые линии обзора больше не годны."""
+        self._sight_stamp += 1
+        self._cover_cache.clear()
+        self._reach_cache.clear()
+        self._pair_cache.clear()
+        self._squares_cache = None
+
     def unplace(self, enemy):
         eid = id(enemy)
         for key, occ in list(self._occ.items()):
@@ -123,6 +139,8 @@ class BattleMap:
                 self.cell_map.pop(key, None)
         self.positions.pop(eid, None)
         self._enemies.pop(eid, None)
+        self._body_cache.pop(eid, None)
+        self._drop_sight_cache()
 
     def place(self, enemy, x, y):
         self.unplace(enemy)
@@ -136,6 +154,18 @@ class BattleMap:
         self._enemies[id(enemy)] = enemy
         self.cell_map[(hx // 2, hy // 2)] = enemy
         enemy.pos = pos
+        self._watch(enemy)
+
+    def _watch(self, enemy):
+        """Смерть и лечение меняют, закрывает ли тело обзор. Карта слушает сама."""
+        if getattr(enemy, 'attach', None) is None:
+            return
+        if not any(observer is self for observer in enemy._observers):
+            enemy.attach(self)
+
+    def update(self, subject):
+        self._body_cache.pop(id(subject), None)
+        self._drop_sight_cache()
 
     def get_pos(self, enemy):
         return self.positions.get(id(enemy))
@@ -168,16 +198,23 @@ class BattleMap:
             return
         cleaned = canon_kind(kind)
         if cleaned is None:
-            self._terrain.pop((ix, iy), None)
+            if self._terrain.pop((ix, iy), None) is not None:
+                self._drop_sight_cache()
+            return
+        if self._terrain.get((ix, iy)) == cleaned:
             return
         self._terrain[(ix, iy)] = cleaned
+        self._drop_sight_cache()
 
     def paint_terrain(self, cells, kind):
         for cell in cells or ():
             self.set_terrain(cell[0], cell[1], kind)
 
     def clear_terrain(self):
+        if not self._terrain:
+            return
         self._terrain.clear()
+        self._drop_sight_cache()
 
     def terrain_records(self):
         """Список [x, y, тип] для JSON. Пустой рельеф — пустой список."""
@@ -231,15 +268,58 @@ class BattleMap:
             return base * 2
         return base
 
-    def _creature_cells(self, attacker, target):
-        cells = set()
+    def _sync_alive(self):
+        """Смерть без notify() тоже сбрасывает кэш: сравниваем флаги живых."""
+        sig = tuple(getattr(enemy, 'alive', False) for enemy in self._enemies.values())
+        if sig == self._alive_tuple:
+            return
+        self._alive_tuple = sig
+        self._cover_cache.clear()
+        self._reach_cache.clear()
+        self._pair_cache.clear()
+        self._squares_cache = None
+
+    def _body_squares(self, enemy):
+        """Клетки пятна. Повтор с той же позицией не пересчитывает размер."""
+        pos = self.get_pos(enemy)
+        if not pos:
+            return ()
+        size = self.cells_of(enemy)
+        cached = self._body_cache.get(id(enemy))
+        if cached is not None and cached[0] == pos and cached[1] == size:
+            return cached[2]
+        squares = tuple(occupied_squares(pos, size))
+        self._body_cache[id(enemy)] = (pos, size, squares)
+        return squares
+
+    def _living_squares(self):
+        if self._squares_cache is not None:
+            return self._squares_cache
+        squares = set()
+        owners = {}
         for enemy in self._enemies.values():
-            if enemy is attacker or enemy is target or not getattr(enemy, 'alive', False):
+            if not getattr(enemy, 'alive', False):
                 continue
-            pos = self.get_pos(enemy)
-            if not pos:
-                continue
-            cells.update(occupied_squares(pos, self.cells_of(enemy)))
+            cells = self._body_squares(enemy)
+            owners[id(enemy)] = cells
+            squares.update(cells)
+        self._owners = owners
+        self._squares_cache = squares
+        return squares
+
+    def _creature_cells(self, attacker, target):
+        self._sync_alive()
+        key = (id(attacker), id(target))
+        hit = self._pair_cache.get(key)
+        if hit is not None:
+            return hit
+        self._living_squares()
+        cells = set(self._squares_cache)
+        for who in (attacker, target):
+            extra = self._owners.get(id(who))
+            if extra:
+                cells.difference_update(extra)
+        self._pair_cache[key] = cells
         return cells
 
     def cover_between(self, attacker, target, creatures=False, origin=None):
@@ -251,10 +331,17 @@ class BattleMap:
         dest = self.get_pos(target)
         if origin is None or dest is None:
             return COVER_NONE
+        self._sync_alive()
+        key = (id(attacker), id(target), origin, dest, bool(creatures))
+        cached = self._cover_cache.get(key)
+        if cached is not None:
+            return cached
         others = self._creature_cells(attacker, target) if creatures else ()
-        return cover_against(
+        result = cover_against(
             origin, self.cells_of(attacker), dest, self.cells_of(target),
             self._terrain, others)
+        self._cover_cache[key] = result
+        return result
 
     def combat_cover(self, attacker, target):
         """Укрытие для броска. На карте без рельефа всегда «нет», чтобы старые
@@ -349,6 +436,8 @@ class BattleMap:
         self.cell_map.clear()
         self._enemies.clear()
         self._occ.clear()
+        self._body_cache.clear()
+        self._drop_sight_cache()
 
     def random_placement(self, sides):
         """Случайно по своей зоне; крупные расселяются первыми."""
@@ -515,8 +604,21 @@ class BattleMap:
     def can_reach_shot(self, enemy, target, speed_ft, reach_ft):
         """Можно ли в этот запас футов встать так, чтобы цель была видна и в досягаемости.
 
-        Кости боя не тратит: порядок обхода фиксированный.
+        Кости боя не тратит: порядок обхода фиксированный. Повтор того же
+        запроса с теми же позициями берётся из кэша и тоже не бросает кости.
         """
+        self._sync_alive()
+        moved = int(getattr(enemy, 'moved_ft', 0) or 0)
+        key = (id(enemy), id(target), self.get_pos(enemy), self.get_pos(target),
+               int(speed_ft), moved, float(reach_ft))
+        cached = self._reach_cache.get(key)
+        if cached is not None:
+            return cached
+        result = self._can_reach_shot(enemy, target, speed_ft, reach_ft)
+        self._reach_cache[key] = result
+        return result
+
+    def _can_reach_shot(self, enemy, target, speed_ft, reach_ft):
         if not self._terrain:
             return True
         if self.get_pos(enemy) is None or self.get_pos(target) is None:
@@ -692,6 +794,39 @@ class BattleMap:
             else:
                 spent = step * 2.5
             enemy.moved_ft = min(max_ft, getattr(enemy, 'moved_ft', 0) + spent)
+
+    def try_shift_group(self, members, dx, dy):
+        """Сдвинуть живые пятна на (dx, dy) клеток, не ломая взаимное расположение.
+
+        Клетка назначения свободна от чужих и от стен. Если хотя бы одному
+        некуда встать, карта остаётся как была. Скорость не списывается:
+        это перестановка мастера, а не шаг в раунде.
+        """
+        dx, dy = float(dx), float(dy)
+        if abs(dx) < 1e-9 and abs(dy) < 1e-9:
+            return False
+        group = [enemy for enemy in members if enemy is not None and self.get_pos(enemy)]
+        if not group:
+            return False
+        origins = [(enemy, self.get_pos(enemy)) for enemy in group]
+        for enemy, _pos in origins:
+            self.unplace(enemy)
+        placed = []
+        ok = True
+        for enemy, pos in origins:
+            nx, ny = pos[0] + dx, pos[1] + dy
+            if not self.cell_free(nx, ny, enemy=enemy):
+                ok = False
+                break
+            self.place(enemy, nx, ny)
+            placed.append(enemy)
+        if ok:
+            return True
+        for enemy in placed:
+            self.unplace(enemy)
+        for enemy, pos in origins:
+            self.place(enemy, pos[0], pos[1])
+        return False
 
     # ---------- сводка для интерфейса ----------
     def describe(self, enemy):

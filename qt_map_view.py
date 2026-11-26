@@ -10,8 +10,8 @@ import os
 from PyQt6.QtCore import Qt, pyqtSignal, QRectF, QPointF
 from PyQt6.QtGui import (QBrush, QColor, QFont, QImage, QPainter, QPainterPath,
                           QPen, QPixmap, QPolygonF, QRadialGradient)
-from PyQt6.QtWidgets import (QGraphicsEllipseItem, QGraphicsPixmapItem, QGraphicsRectItem,
-                             QGraphicsScene, QGraphicsView)
+from PyQt6.QtWidgets import (QGraphicsEllipseItem, QGraphicsItem, QGraphicsPixmapItem,
+                             QGraphicsRectItem, QGraphicsScene, QGraphicsView)
 
 CELL = 28
 
@@ -68,12 +68,48 @@ COVER_TINT = {
 }
 
 
+class _GridItem(QGraphicsItem):
+    """Вся сетка одним элементом: тысячи линий больше не создаются по одной."""
+
+    def __init__(self, width, height, cell, color, half):
+        super().__init__()
+        self._width = width
+        self._height = height
+        self._cell = cell
+        self._color = color
+        self._half = half
+        self.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
+        self.setZValue(-5)
+
+    def boundingRect(self):
+        return QRectF(0, 0, self._width, self._height)
+
+    def paint(self, painter, _option, _widget=None):
+        cell = self._cell
+        cols = int(round(self._width / cell))
+        rows = int(round(self._height / cell))
+        painter.setPen(QPen(self._color, 1))
+        for x in range(cols + 1):
+            painter.drawLine(int(x * cell), 0, int(x * cell), int(self._height))
+        for y in range(rows + 1):
+            painter.drawLine(0, int(y * cell), int(self._width), int(y * cell))
+        painter.setPen(QPen(self._half, 1, Qt.PenStyle.DotLine))
+        for x in range(cols):
+            painter.drawLine(int(x * cell + cell / 2), 0,
+                             int(x * cell + cell / 2), int(self._height))
+        for y in range(rows):
+            painter.drawLine(0, int(y * cell + cell / 2),
+                             int(self._width), int(y * cell + cell / 2))
+
+
 class MapView(QGraphicsView):
     token_clicked = pyqtSignal(object)
     token_menu = pyqtSignal(object, object)
     cell_menu = pyqtSignal(float, float, object)
     cell_clicked = pyqtSignal(float, float)
     token_dragged = pyqtSignal(object, float, float)
+    token_settled = pyqtSignal(object)
+    marquee_chosen = pyqtSignal(object)
     image_dropped = pyqtSignal(str)
     aim_moved = pyqtSignal(float, float)
     terrain_cell = pyqtSignal(int, int, bool)
@@ -121,6 +157,16 @@ class MapView(QGraphicsView):
         self._cover_items = []
         self._hover_enemy = None
         self._cover_hover = False
+        self._selection = []
+        self._selection_ids = set()
+        self._marquee = False
+        self._rubber = None
+        self._pan = None
+        self._token_items = {}
+        self._token_sigs = {}
+        self._reach_items = []
+        self._static_key = None
+        self._static_ready = False
 
     # ---------- фон ----------
     def set_background(self, path):
@@ -290,6 +336,12 @@ class MapView(QGraphicsView):
                 self.cell_menu.emit(x, y, point)
             e.accept()
             return
+        if e.button() == Qt.MouseButton.MiddleButton:
+            self._pan = e.pos()
+            self._last = e.pos()
+            self.setCursor(Qt.CursorShape.ClosedHandCursor)
+            e.accept()
+            return
         if e.button() == Qt.MouseButton.LeftButton:
             enemy = self._token_at(e.pos())
             if enemy is not None and not self._aiming:
@@ -306,7 +358,10 @@ class MapView(QGraphicsView):
             self._press = e.pos()
             self._last = e.pos()
             self._dragged = False
-            self.setCursor(Qt.CursorShape.ClosedHandCursor)
+            self._marquee = False
+            alt = bool(e.modifiers() & Qt.KeyboardModifier.AltModifier)
+            if alt or self._aiming:
+                self.setCursor(Qt.CursorShape.ClosedHandCursor)
         super().mousePressEvent(e)
 
     def set_aiming(self, on):
@@ -369,11 +424,33 @@ class MapView(QGraphicsView):
             if self._press is not None:
                 e.accept()
                 return
+        if self._pan is not None:
+            d = e.pos() - self._last
+            self._last = e.pos()
+            self.horizontalScrollBar().setValue(self.horizontalScrollBar().value() - d.x())
+            self.verticalScrollBar().setValue(self.verticalScrollBar().value() - d.y())
+            e.accept()
+            return
         if self._token_drag is not None and self._token_press is not None:
             if (e.pos() - self._token_press).manhattanLength() > 6:
                 self._token_moved = True
                 self.setCursor(Qt.CursorShape.ClosedHandCursor)
             e.accept()
+            return
+        if self._press is not None and not self._aiming:
+            if (e.pos() - self._press).manhattanLength() > 4:
+                self._dragged = True
+            alt = bool(e.modifiers() & Qt.KeyboardModifier.AltModifier)
+            if self._dragged and alt:
+                d = e.pos() - self._last
+                self._last = e.pos()
+                self.horizontalScrollBar().setValue(self.horizontalScrollBar().value() - d.x())
+                self.verticalScrollBar().setValue(self.verticalScrollBar().value() - d.y())
+                return
+            if self._dragged:
+                self._marquee = True
+                self._update_rubber(self._press, e.pos())
+                self.setCursor(Qt.CursorShape.CrossCursor)
             return
         if self._press is not None:
             if (e.pos() - self._press).manhattanLength() > 4:
@@ -404,9 +481,26 @@ class MapView(QGraphicsView):
                 sp = self.mapToScene(e.pos())
                 x, y = self._cell_at(sp, self.opts['cell'])
                 self.token_dragged.emit(enemy, x, y)
+            else:
+                self.token_settled.emit(enemy)
+            e.accept()
+            return
+        if self._pan is not None:
+            self._pan = None
+            self.setCursor(Qt.CursorShape.ArrowCursor)
             e.accept()
             return
         if self._press is not None:
+            if self._marquee:
+                enemies = self._tokens_in_rect(self._press, e.pos())
+                self._clear_rubber()
+                self._press = None
+                self._marquee = False
+                self._dragged = False
+                self.setCursor(Qt.CursorShape.ArrowCursor)
+                self.marquee_chosen.emit(enemies)
+                e.accept()
+                return
             if self._aiming or not self._dragged:
                 sp = self.mapToScene(e.pos() if self._aiming else self._press)
                 x, y = self._cell_at(sp, self.opts['cell'])
@@ -415,6 +509,46 @@ class MapView(QGraphicsView):
             if not self._aiming:
                 self.setCursor(Qt.CursorShape.ArrowCursor)
         super().mouseReleaseEvent(e)
+
+    def _update_rubber(self, start, end):
+        p1 = self.mapToScene(start)
+        p2 = self.mapToScene(end)
+        rect = QRectF(p1, p2).normalized()
+        if self._rubber is None:
+            color = QColor(self.pal.get('accent', '#5865f2'))
+            pen = QPen(color, 1.6, Qt.PenStyle.DashLine)
+            pen.setCosmetic(True)
+            fill = QColor(color)
+            fill.setAlpha(48)
+            self._rubber = self.scene().addRect(rect, pen, QBrush(fill))
+            self._rubber.setZValue(8)
+            self._rubber.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
+        else:
+            self._rubber.setRect(rect)
+
+    def _clear_rubber(self):
+        if self._rubber is not None and self.scene() is not None:
+            self.scene().removeItem(self._rubber)
+        self._rubber = None
+
+    def _tokens_in_rect(self, start, end):
+        """Токены, чьё пятно пересекает рамку. Порядок — слева направо, сверху вниз."""
+        if self._bm is None:
+            return []
+        rect = QRectF(self.mapToScene(start), self.mapToScene(end)).normalized()
+        cell = self.opts['cell']
+        found = []
+        for side in self._sides:
+            for enemy in side:
+                pos = self._bm.get_pos(enemy)
+                if not pos:
+                    continue
+                side_px = self._bm.cells_of(enemy) * cell
+                token = QRectF(pos[0] * cell, pos[1] * cell, side_px, side_px)
+                if rect.intersects(token):
+                    found.append((pos[1], pos[0], enemy.name, enemy))
+        found.sort()
+        return [row[-1] for row in found]
 
     # ---------- отрисовка ----------
     def _reach_cells(self, bm, enemy, c):
@@ -574,7 +708,44 @@ class MapView(QGraphicsView):
                 rect.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
                 self._area_items.append(rect)
 
-    def rebuild(self, bm, sides, selected=None):
+    def _static_key_of(self, bm):
+        if bm is None:
+            return None
+        terrain = tuple(sorted(bm._terrain.items())) if bm._terrain else ()
+        return (
+            id(bm), bm.width, bm.height, self.opts['cell'], bool(self.opts['grid']),
+            self.opts.get('labels'), self.opts.get('sides'), self.opts.get('dead_alpha'),
+            self.opts.get('stroke'), bool(self.opts.get('glow')),
+            self._bg_path, self.opts.get('bg_opacity'), self.opts.get('bg_mode'),
+            terrain, self.pal.get('canvas_map'), self.pal.get('canvas_grid'),
+            self.pal.get('accent'),
+        )
+
+    def _remember_selection(self, selected, selection):
+        if selection is None:
+            if (selected is not None and selected in self._selection
+                    and len(self._selection) > 1):
+                selection = list(self._selection)
+            else:
+                selection = [selected] if selected is not None else []
+        self._selection = [enemy for enemy in selection if enemy is not None]
+        self._selection_ids = {id(enemy) for enemy in self._selection}
+        if selected is not None:
+            self._selected = selected
+        elif self._selection:
+            self._selected = self._selection[-1]
+        else:
+            self._selected = None
+
+    def rebuild(self, bm, sides, selected=None, selection=None):
+        self._remember_selection(selected, selection)
+        self._sides = sides or []
+        key = self._static_key_of(bm)
+        if (key is not None and key == self._static_key and self._bm is bm
+                and self.scene() is not None and self._static_ready):
+            self._bm = bm
+            self._repaint_tokens()
+            return
         lines = list(self._round_lines)
         focus_lines = list(self._focus_lines)
         focus_enemies = [enemy for enemy in self._focus_enemies if enemy is not None]
@@ -586,9 +757,13 @@ class MapView(QGraphicsView):
         self._area_items = []
         self._terrain_items = []
         self._cover_items = []
-        self._bm, self._sides, self._selected = bm, sides or [], selected
+        self._token_items = {}
+        self._reach_items = []
+        self._rubber = None
+        self._bm = bm
         sc = self.scene()
         sc.clear()
+        self._static_ready = False
         self.setBackgroundBrush(QColor(self.pal['canvas_map']))
         self._round_lines = lines
         self._focus_lines = focus_lines
@@ -597,6 +772,7 @@ class MapView(QGraphicsView):
         self._preview_cells = preview_cells
         self._focus_cells = focus_cells
         if bm is None:
+            self._static_key = None
             return
         o = self.opts
         c = o['cell']
@@ -608,30 +784,48 @@ class MapView(QGraphicsView):
             gc = QColor(self.pal['canvas_grid'])
             if self._bg_pix is not None:
                 gc.setAlpha(150)
-            gp = QPen(gc, 1)
-            for x in range(bm.width + 1):
-                sc.addLine(x * c, 0, x * c, h, gp).setZValue(-5)
-            for y in range(bm.height + 1):
-                sc.addLine(0, y * c, w, y * c, gp).setZValue(-5)
             half = QColor(gc)
             half.setAlpha(70)
-            hp = QPen(half, 1, Qt.PenStyle.DotLine)
-            for x in range(bm.width):
-                sc.addLine(x * c + c / 2, 0, x * c + c / 2, h, hp).setZValue(-6)
-            for y in range(bm.height):
-                sc.addLine(0, y * c + c / 2, w, y * c + c / 2, hp).setZValue(-6)
+            sc.addItem(_GridItem(w, h, c, gc, half))
 
         self._paint_terrain()
+        self._paint_tokens()
+        self._static_key = key
+        self._static_ready = True
+        self._paint_areas()
+        self._paint_attack_lines()
+        self._paint_focus_rings()
+        self._paint_cover()
 
-        if o['reach'] and selected is not None and selected.alive:
+    def _repaint_tokens(self):
+        """Токены и зона хода заново, сетка и рельеф остаются."""
+        scene = self.scene()
+        for item in self._token_items.values():
+            scene.removeItem(item)
+        self._token_items = {}
+        for item in self._reach_items:
+            scene.removeItem(item)
+        self._reach_items = []
+        self._paint_tokens()
+
+    def _paint_tokens(self):
+        bm = self._bm
+        if bm is None:
+            return
+        sc = self.scene()
+        o = self.opts
+        c = o['cell']
+        selected = self._selected
+        if o['reach'] and selected is not None and getattr(selected, 'alive', False):
             brush = QBrush(QColor(self.pal['canvas_reach']))
             alpha = 0.5 if self._bg_pix is not None else 1.0
             for hx, hy in self._reach_cells(bm, selected, c):
-                r = sc.addRect(hx * c / 2 + 1, hy * c / 2 + 1, c / 2 - 2, c / 2 - 2,
-                               QPen(Qt.PenStyle.NoPen), brush)
-                r.setOpacity(alpha)
-                r.setZValue(-2)
-
+                reach = sc.addRect(hx * c / 2 + 1, hy * c / 2 + 1, c / 2 - 2, c / 2 - 2,
+                                   QPen(Qt.PenStyle.NoPen), brush)
+                reach.setOpacity(alpha)
+                reach.setZValue(-2)
+                reach.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
+                self._reach_items.append(reach)
         colors = SIDE_PALETTES[o['sides']]
         no_pen = QPen(Qt.PenStyle.NoPen)
         for i, side in enumerate(self._sides):
@@ -646,9 +840,10 @@ class MapView(QGraphicsView):
                 x0, y0 = pos[0] * c + pad, pos[1] * c + pad
                 box = side_px - 2 * pad
                 cx, cy = pos[0] * c + side_px / 2, pos[1] * c + side_px / 2
-                is_sel = en is selected
+                is_sel = id(en) in self._selection_ids or en is selected
+                is_primary = en is selected
 
-                if is_sel and o['glow']:
+                if is_primary and o['glow']:
                     R = side_px * 0.95
                     grad = QRadialGradient(cx, cy, R)
                     hot = QColor(self.pal['accent']); hot.setAlpha(165)
@@ -659,10 +854,15 @@ class MapView(QGraphicsView):
                     grad.setColorAt(1.0, cold)
                     halo = sc.addEllipse(cx - R, cy - R, 2 * R, 2 * R, no_pen, QBrush(grad))
                     halo.setZValue(1)
+                    halo.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
+                    self._reach_items.append(halo)
 
                 fill = QBrush(color if en.alive else QColor('#555555'))
-                pen = QPen(QColor('#ffffff' if is_sel else '#000000'),
-                           max(1, o['stroke'] + (1 if is_sel else 0)))
+                if is_sel:
+                    pen = QPen(QColor(self.pal.get('accent', '#ffffff')),
+                               max(3, o['stroke'] + 2))
+                else:
+                    pen = QPen(QColor('#000000'), max(1, o['stroke']))
                 if cells >= 2:
                     path = QPainterPath()
                     radius = max(3.0, box * 0.14)
@@ -674,6 +874,14 @@ class MapView(QGraphicsView):
                     item.setOpacity(max(0.1, o['dead_alpha'] / 100.0))
                 item.setData(0, en)
                 item.setZValue(2 + cells * 0.01)
+                self._token_items[id(en)] = item
+                if is_sel:
+                    ring_pen = QPen(QColor(self.pal.get('accent', '#ffffff')), 2.4)
+                    ring_pen.setCosmetic(True)
+                    ring = sc.addEllipse(x0 - 4, y0 - 4, box + 8, box + 8, ring_pen,
+                                         QBrush(Qt.BrushStyle.NoBrush))
+                    ring.setParentItem(item)
+                    ring.setZValue(3)
 
                 if o['labels'] != 'none':
                     txt = (en.name.split('_')[0][:6] if o['labels'] == 'name'
@@ -687,10 +895,6 @@ class MapView(QGraphicsView):
                     if not en.alive:
                         t.setOpacity(max(0.1, o['dead_alpha'] / 100.0))
                 self._paint_condition_badges(item, en, x0, y0, box)
-        self._paint_areas()
-        self._paint_attack_lines()
-        self._paint_focus_rings()
-        self._paint_cover()
 
     def refresh_terrain(self):
         """Перерисовать только клетки рельефа, не трогая токены."""

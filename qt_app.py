@@ -18,7 +18,7 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QMessageBox, QFileDialog, QDialog, QTableWidget,
                              QTableWidgetItem, QHeaderView, QSlider,
                              QMenu, QDockWidget, QToolBar, QToolButton, QTabWidget,
-                             QButtonGroup,
+                             QButtonGroup, QInputDialog,
                              QListWidget, QListWidgetItem, QSizePolicy)
 
 from qt_icons import tool_icon
@@ -99,6 +99,11 @@ class MainWindow(QMainWindow):
         self.battle_events = []
         self.round_no = 0
         self.selected = None
+        self.selection = []
+        self._keep_group = None
+        self._relocate_group = None
+        self._roster_sig = None
+        self.side_all_checks = []
         self.cards, self.all_vars = [], []
         self.enemy_labels, self.side_checks = {}, []
         self.dirty, self.suspend = set(), False
@@ -120,7 +125,7 @@ class MainWindow(QMainWindow):
         self._terrain_dirty = False
         self._esc = QShortcut(QKeySequence(Qt.Key.Key_Escape), self)
         self._esc.setContext(Qt.ShortcutContext.WindowShortcut)
-        self._esc.activated.connect(self._cancel_relocate)
+        self._esc.activated.connect(self._on_escape)
         self._auto_timer = QTimer(self)
         self._auto_timer.setInterval(700)
         self._auto_timer.timeout.connect(self._auto_tick)
@@ -150,6 +155,9 @@ class MainWindow(QMainWindow):
         self._fill_menus()
 
         self.status = self.statusBar()
+        self._sel_label = QLabel('Выделено: 0')
+        self._sel_label.setObjectName('selection_count')
+        self.status.addPermanentWidget(self._sel_label)
         self.status.showMessage(
             'Карта — основная сцена. Правый щелчок по клетке добавляет существо, '
             'по токену — открывает карточку.')
@@ -409,6 +417,18 @@ class MainWindow(QMainWindow):
         dock_action.setText('Панель боя')
         self.menu_view.addAction(dock_action)
         self._menu_action(self.menu_view, 'Участники', lambda: self._show_dock_tab(0))
+        select_menu = self.menu_view.addMenu('Выделение')
+        select_menu.setObjectName('select_menu')
+        select_all = select_menu.addAction('Выделить всех', self.select_all_tokens)
+        select_all.setObjectName('select_all')
+        select_all.setShortcut(QKeySequence('Ctrl+A'))
+        select_all.setShortcutContext(Qt.ShortcutContext.WindowShortcut)
+        self.addAction(select_all)
+        clear_sel = select_menu.addAction('Снять выделение', self.clear_selection)
+        clear_sel.setObjectName('select_none')
+        self._side_select_menu = select_menu.addMenu('Выделить сторону')
+        self._side_select_menu.setObjectName('select_side_menu')
+        self._side_select_menu.aboutToShow.connect(self._fill_side_select_menu)
         self._menu_action(self.menu_view, 'Журнал', lambda: self._show_dock_tab(1))
         self._menu_action(self.menu_view, 'Бестиарий', lambda: self._show_dock_tab(2))
         self.menu_view.addSeparator()
@@ -608,10 +628,13 @@ class MainWindow(QMainWindow):
         if not self._history_ready or self._suspend_history or not self._current:
             return
         uid = ensure_uid(self.selected) if self.selected is not None else None
-        if self._current.get('selected_uid') == uid:
+        uids = [ensure_uid(enemy) for enemy in self.selection if enemy is not None]
+        if (self._current.get('selected_uid') == uid
+                and self._current.get('selected_uids') == uids):
             return
         snap = dict(self._current)
         snap['selected_uid'] = uid
+        snap['selected_uids'] = uids
         self._current = snap
 
     def _latest_round_events(self):
@@ -673,7 +696,13 @@ class MainWindow(QMainWindow):
             if info.events_changed:
                 self.log_panel.load_events(self.battle_events)
             self.selected = info.selected
-            self.map_view.rebuild(self.battle_map, self.sides, self.selected)
+            self.selection = [enemy for enemy in (info.selection or []) if self._holds(enemy)]
+            if self.selected is not None and self.selected not in self.selection:
+                self.selection.append(self.selected)
+            self.map_view.rebuild(self.battle_map, self.sides, self.selected, self.selection)
+            self._sync_checks()
+            if self._sel_label is not None:
+                self._sel_label.setText(f'Выделено: {len(self.selection)}')
             self.map_view.set_round_lines(
                 map_marks(self._latest_round_events(), self._token_radius))
             self.map_view.set_focus_lines([])
@@ -1035,6 +1064,7 @@ class MainWindow(QMainWindow):
                 self.battle_map.copy_terrain_from(old_map)
             self.ignore_sides = {}
             self.selected = None
+            self.selection = []
             self.round_no = 0
             self.battle_events = []
             self.battle_map.formation_placement(self.sides)
@@ -1247,8 +1277,25 @@ class MainWindow(QMainWindow):
         self.resizeDocks([dock], [420], Qt.Orientation.Horizontal)
 
     def rebuild_battle_lists(self):
+        sig = (
+            tuple(tuple(id(enemy) for enemy in side) for side in self.sides),
+            tuple(self.side_names),
+        )
+        if sig == self._roster_sig and self.enemy_labels:
+            self.refresh_all_labels()
+            self._sync_checks()
+            return
+        self.battle_host.setUpdatesEnabled(False)
+        try:
+            self._rebuild_battle_lists_full()
+            self._roster_sig = sig
+        finally:
+            self.battle_host.setUpdatesEnabled(True)
+        self._sync_checks()
+
+    def _rebuild_battle_lists_full(self):
         clear_layout(self.battle_lay)
-        self.enemy_labels, self.side_checks = {}, []
+        self.enemy_labels, self.side_checks, self.side_all_checks = {}, [], []
         if not any(self.sides):
             hint = QLabel('На карте пока никого. Правый щелчок по клетке, '
                           '«Добавить существо…» или «Создать армии».')
@@ -1268,7 +1315,9 @@ class MainWindow(QMainWindow):
             host = QWidget()
             hl = QVBoxLayout(host)
             hl.setContentsMargins(4, 4, 4, 4)
-            all_cb = QCheckBox('Выделить все')
+            all_cb = QCheckBox('Выделить сторону')
+            all_cb.setObjectName(f'select_side_{i}')
+            all_cb.setTristate(True)
             hl.addWidget(all_cb)
             checks = []
             for e in side:
@@ -1282,6 +1331,8 @@ class MainWindow(QMainWindow):
                     lambda pos, en=e, widget=lab: self.open_token_menu(
                         en, widget.mapToGlobal(pos)))
                 lab.mouseDoubleClickEvent = lambda ev, en=e: self.edit_one(en)
+                lab.mousePressEvent = lambda ev, en=e, widget=lab: self._roster_press(ev, en, widget)
+                cb.toggled.connect(lambda on, en=e: self._on_roster_check(en, on))
                 r.addWidget(cb)
                 r.addWidget(lab, 1)
                 hl.addLayout(r)
@@ -1290,8 +1341,9 @@ class MainWindow(QMainWindow):
             hl.addStretch()
             sa.setWidget(host)
             bl.addWidget(sa)
-            all_cb.toggled.connect(lambda on, cs=checks: [c.setChecked(on) for c in cs])
+            all_cb.clicked.connect(lambda checked, idx=i: self._on_side_toggle(idx, checked))
             self.side_checks.append(checks)
+            self.side_all_checks.append(all_cb)
             grid.addWidget(box, i // cols, i % cols)
         for c in range(cols):
             grid.setColumnStretch(c, 1)
@@ -1376,7 +1428,12 @@ class MainWindow(QMainWindow):
     def open_token_menu(self, enemy, global_pos):
         if enemy is None:
             return
-        menu = self.build_token_menu(enemy)
+        if enemy not in self.selection:
+            self.set_selection([enemy])
+        if len(self.selection) > 1 and enemy in self.selection:
+            menu = self.build_group_menu(self.selection)
+        else:
+            menu = self.build_token_menu(enemy)
         menu.exec(global_pos)
 
     def build_token_menu(self, enemy):
@@ -1427,6 +1484,67 @@ class MainWindow(QMainWindow):
             if item.get('id') == 'exhaustion':
                 title = f'{title} {item.get("level")}'
             remove.addAction(title, lambda _checked=False, cond=item: self._lift(enemy, cond))
+        return menu
+
+    def build_group_menu(self, enemies):
+        """Действия по выделенной группе. Каждый пункт — один шаг отмены."""
+        from conditions import CATALOG, active_conditions, condition_name
+        enemies = [enemy for enemy in enemies if enemy is not None]
+        menu = QMenu(self)
+        menu.setObjectName('group_menu')
+        title = menu.addAction(f'Выделено: {len(enemies)}')
+        title.setEnabled(False)
+        sheet = menu.addAction('Карточка выделенных', lambda: self.open_creature_sheet(enemies))
+        sheet.setObjectName('group_sheet')
+        menu.addSeparator()
+        duplicate = menu.addAction('Дублировать', lambda: self.duplicate_group(enemies))
+        duplicate.setObjectName('group_duplicate')
+        delete = menu.addAction('Удалить…', lambda: self.delete_group(enemies))
+        delete.setObjectName('group_delete')
+        sides = menu.addMenu('Сменить сторону')
+        sides.setObjectName('group_side')
+        for index, name in enumerate(self.side_names):
+            sides.addAction(
+                name, lambda _checked=False, idx=index, who=list(enemies): self.change_group_side(
+                    who, idx))
+        sides.addAction('Новая сторона…', lambda who=list(enemies): self.change_group_side(who, -1))
+        move = menu.addAction('Переместить', lambda: self.begin_relocate_group(enemies))
+        move.setObjectName('group_move')
+        menu.addSeparator()
+        harm = menu.addAction('Нанести урон…', lambda: self.damage_group(enemies))
+        harm.setObjectName('group_damage')
+        heal = menu.addAction('Лечить…', lambda: self.heal_group(enemies))
+        heal.setObjectName('group_heal')
+        menu.addSeparator()
+        add = menu.addMenu('Наложить состояние')
+        add.setObjectName('group_conditions')
+        for condition_id, label, _short, _color, hidden in CATALOG:
+            if hidden or condition_id == 'exhaustion':
+                continue
+            add.addAction(
+                label, lambda _checked=False, cid=condition_id, who=list(enemies):
+                self._impose_group(who, cid))
+        levels = menu.addMenu('Истощение')
+        for level in range(0, 7):
+            title = 'снять' if level == 0 else f'уровень {level}'
+            levels.addAction(
+                title, lambda _checked=False, value=level, who=list(enemies):
+                self._exhaust_group(who, value))
+        remove = menu.addMenu('Снять состояние')
+        remove.setObjectName('group_clear_conditions')
+        seen = []
+        for enemy in enemies:
+            for item in active_conditions(enemy):
+                if isinstance(item, dict) and item.get('id') not in seen:
+                    seen.append(item.get('id'))
+        if not seen:
+            empty = remove.addAction('нет состояний')
+            empty.setEnabled(False)
+        for condition_id in seen:
+            remove.addAction(
+                condition_name(condition_id),
+                lambda _checked=False, cid=condition_id, who=list(enemies):
+                self._lift_group(who, cid))
         return menu
 
     def open_cell_menu(self, x, y, global_pos):
@@ -1979,14 +2097,15 @@ class MainWindow(QMainWindow):
         self.rebuild_battle_lists()
         self.refresh_alliances()
         self.log_panel.set_roster(self.sides, self.side_names)
-        self.map_view.rebuild(self.battle_map, self.sides, focus if focus is not None
-                              else self.selected)
         self._refresh_initiative()
         if focus is not None:
-            self.on_token(focus)
-        elif self.selected is None:
-            self.map_info.setText(
-                'Токен не выбран. Правый щелчок по пустой клетке — добавить существо.')
+            self.set_selection([focus])
+            return
+        self.selection = [enemy for enemy in self.selection if self._holds(enemy)]
+        if self.selected not in self.selection:
+            self.selected = self.selection[-1] if self.selection else None
+        self._sync_selection_widgets()
+        self._note_selection()
 
     def _unique_name(self, base):
         existing = {enemy.name for side in self.sides for enemy in side}
@@ -2091,8 +2210,11 @@ class MainWindow(QMainWindow):
                 break
         if self.battle_map is not None:
             self.battle_map.unplace(enemy)
+        self.selection = [item for item in self.selection if item is not enemy]
         if self.selected is enemy:
             self.selected = None
+            if self.selection:
+                self.selected = self.selection[-1]
         if self._relocate is enemy:
             self._relocate = None
         self._close_sheets_for(enemy)
@@ -2138,7 +2260,9 @@ class MainWindow(QMainWindow):
         for side in self.sides:
             side.clear()
         self.selected = None
+        self.selection = []
         self._relocate = None
+        self._relocate_group = None
         for sheet in list(self._sheets):
             sheet.close()
         if self.battle_map is not None:
@@ -2164,6 +2288,14 @@ class MainWindow(QMainWindow):
 
     def _finish_relocate(self, x, y):
         enemy = self._relocate
+        group = [item for item in (self._relocate_group or []) if self._holds(item)]
+        if len(group) > 1 and enemy in group:
+            self._relocate = None
+            self._relocate_group = None
+            self.set_selection(group, primary=enemy)
+            self.shift_group(enemy, x, y)
+            return
+        self._relocate_group = None
         if enemy is None or not self._holds(enemy):
             self._relocate = None
             return
@@ -2185,17 +2317,14 @@ class MainWindow(QMainWindow):
         self._commit(f'перемещение {enemy.name}')
 
     def _cancel_relocate(self):
-        if self._relocate is None:
+        if self._relocate is None and not self._relocate_group:
             return
-        name = self._relocate.name
+        name = self._relocate.name if self._relocate is not None else 'группа'
         self._relocate = None
+        self._relocate_group = None
         self.status.showMessage(f'Перемещение «{name}» отменено.')
 
     def keyPressEvent(self, event):
-        if event.key() == Qt.Key.Key_Escape and self._relocate is not None:
-            self._cancel_relocate()
-            event.accept()
-            return
         super().keyPressEvent(event)
 
     def show_status(self):
@@ -2547,13 +2676,16 @@ class MainWindow(QMainWindow):
         self.map_view.cell_menu.connect(self.open_cell_menu)
         self.map_view.cell_clicked.connect(self.on_cell)
         self.map_view.token_dragged.connect(self.on_token_dragged)
+        self.map_view.token_settled.connect(self.on_token_settled)
+        self.map_view.marquee_chosen.connect(self.on_marquee)
         self.map_view.image_dropped.connect(self._apply_background_path)
         self.map_view.aim_moved.connect(self.on_aim)
         self.map_view.terrain_cell.connect(self.on_terrain_cell)
         self.map_view.terrain_stroke_finished.connect(self.finish_terrain_stroke)
         self.map_view.hover_target.connect(self.on_hover_target)
         self.map_view.setToolTip(
-            'Колесо — зум. Тяни поле — панорама. Клик по токену — выбрать. '
+            'Колесо — зум. Рамка по пустому месту выделяет группу, Alt или средняя кнопка — панорама. '
+            'Клик по токену — выбрать, Ctrl или Shift — добавить. '
             'Перетащи токен или кликни по зелёной клетке — ход. '
             'Правый щелчок по токену — карточка и действия, по пустой клетке — '
             'добавить существо. «Рельеф» на тулбаре рисует клетки. '
@@ -2834,21 +2966,381 @@ class MainWindow(QMainWindow):
         self.status.showMessage('Расстановка строем выполнена.')
         self._commit('расстановка строем')
 
+    def set_selection(self, enemies, primary=None, *, extend=False):
+        cleaned = []
+        seen = set()
+        pool = list(self.selection) if extend else []
+        for enemy in pool + list(enemies or []):
+            if enemy is None or id(enemy) in seen or not self._holds(enemy):
+                continue
+            seen.add(id(enemy))
+            cleaned.append(enemy)
+        if primary is not None and primary in cleaned:
+            cleaned = [enemy for enemy in cleaned if enemy is not primary] + [primary]
+        self.selection = cleaned
+        self.selected = cleaned[-1] if cleaned else None
+        self._sync_selection_widgets()
+        self._note_selection()
+
+    def toggle_selection(self, enemy):
+        if enemy in self.selection:
+            rest = [item for item in self.selection if item is not enemy]
+            self.set_selection(rest)
+        else:
+            self.set_selection([enemy], primary=enemy, extend=True)
+
+    def clear_selection(self):
+        self._keep_group = None
+        self.set_selection([])
+        self.status.showMessage('Выделение снято')
+
+    def select_all_tokens(self):
+        self.set_selection([enemy for side in self.sides for enemy in side])
+        self.status.showMessage(f'Выделено: {len(self.selection)}')
+
+    def select_side(self, index):
+        if index < 0 or index >= len(self.sides):
+            return
+        self.set_selection(list(self.sides[index]))
+        name = self.side_names[index] if index < len(self.side_names) else str(index + 1)
+        self.status.showMessage(f'Выделена сторона: {name} ({len(self.selection)})')
+
+    def _on_escape(self):
+        if self._relocate is not None or self._relocate_group:
+            self._cancel_relocate()
+            return
+        if self.selection:
+            self.clear_selection()
+
+    def _sync_selection_widgets(self):
+        count = len(self.selection)
+        if getattr(self, '_sel_label', None) is not None:
+            self._sel_label.setText(f'Выделено: {count}')
+        if getattr(self, 'map_view', None) is not None:
+            self.map_view.rebuild(self.battle_map, self.sides, self.selected, self.selection)
+        if getattr(self, 'map_info', None) is not None:
+            if self.selected is not None:
+                self.map_info.setText(self._token_line(self.selected))
+            elif count == 0:
+                self.map_info.setText(
+                    'Никто не выделен. Рамка по пустому месту или Ctrl+клик — несколько.')
+        self._sync_checks()
+        self._mark_initiative_selection()
+
+    def _sync_checks(self):
+        chosen = {id(enemy) for enemy in self.selection}
+        checks_rows = getattr(self, 'side_checks', None) or []
+        for index, checks in enumerate(checks_rows):
+            side = self.sides[index] if index < len(self.sides) else []
+            marked = 0
+            for box, enemy in zip(checks, side):
+                box.blockSignals(True)
+                box.setChecked(id(enemy) in chosen)
+                box.blockSignals(False)
+                if id(enemy) in chosen:
+                    marked += 1
+                label = self.enemy_labels.get(enemy)
+                if label is not None:
+                    if id(enemy) in chosen:
+                        label.setStyleSheet(
+                            'background: rgba(88, 101, 242, 0.38); border-radius: 4px; '
+                            'padding: 1px 4px;')
+                    else:
+                        label.setStyleSheet('')
+            all_rows = getattr(self, 'side_all_checks', None) or []
+            if index >= len(all_rows):
+                continue
+            master = all_rows[index]
+            master.blockSignals(True)
+            if not side or marked == 0:
+                master.setCheckState(Qt.CheckState.Unchecked)
+            elif marked >= len(list(zip(checks, side))):
+                master.setCheckState(Qt.CheckState.Checked)
+            else:
+                master.setCheckState(Qt.CheckState.PartiallyChecked)
+            master.blockSignals(False)
+
+    def _roster_press(self, event, enemy, widget):
+        if event.button() == Qt.MouseButton.LeftButton:
+            mods = event.modifiers()
+            if mods & (Qt.KeyboardModifier.ControlModifier | Qt.KeyboardModifier.ShiftModifier):
+                self.toggle_selection(enemy)
+            else:
+                self.set_selection([enemy])
+        QLabel.mousePressEvent(widget, event)
+
+    def _on_roster_check(self, enemy, on):
+        if on and enemy not in self.selection:
+            self.set_selection([enemy], primary=enemy, extend=True)
+        elif not on and enemy in self.selection:
+            self.set_selection([item for item in self.selection if item is not enemy])
+
+    def _on_side_toggle(self, index, checked):
+        if index < 0 or index >= len(self.sides):
+            return
+        side = list(self.sides[index])
+        if checked:
+            self.set_selection(side, extend=True)
+        else:
+            drop = {id(enemy) for enemy in side}
+            self.set_selection([enemy for enemy in self.selection if id(enemy) not in drop])
+
+    def _fill_side_select_menu(self):
+        menu = getattr(self, '_side_select_menu', None)
+        if menu is None:
+            return
+        menu.clear()
+        if not self.sides:
+            empty = menu.addAction('нет сторон')
+            empty.setEnabled(False)
+            return
+        for index, name in enumerate(self.side_names):
+            count = len(self.sides[index]) if index < len(self.sides) else 0
+            menu.addAction(
+                f'{name} ({count})',
+                lambda _checked=False, idx=index: self.select_side(idx))
+
+    def shift_group(self, anchor, x, y):
+        """Сдвиг всей группы на вектор от якоря до клетки. Один шаг отмены."""
+        if anchor is None or self.battle_map is None or not self._holds(anchor):
+            return False
+        origin = self.battle_map.get_pos(anchor)
+        if origin is None:
+            return False
+        dx, dy = float(x) - float(origin[0]), float(y) - float(origin[1])
+        members = [enemy for enemy in self.selection
+                   if self._holds(enemy) and self.battle_map.get_pos(enemy)]
+        if len(members) < 2 or anchor not in members:
+            return False
+        if abs(dx) < 1e-9 and abs(dy) < 1e-9:
+            self.status.showMessage('Группа уже здесь.')
+            return False
+        if not self.battle_map.try_shift_group(members, dx, dy):
+            self.status.showMessage(
+                'Группу нельзя поставить: нужна свободная проходимая клетка каждому.')
+            self._sync_selection_widgets()
+            return False
+        self._sync_selection_widgets()
+        self._commit(f'перемещение группы ({len(members)})')
+        self.status.showMessage(f'Группа сдвинута: {len(members)}')
+        return True
+
+    def begin_relocate_group(self, enemies):
+        enemies = [enemy for enemy in enemies if self._holds(enemy)]
+        if len(enemies) < 2:
+            if enemies:
+                self.begin_relocate(enemies[0])
+            return
+        if self._manual_loop is not None:
+            self.status.showMessage('Сначала закончите ручной ход.')
+            return
+        self._ensure_map()
+        self.set_selection(enemies, primary=enemies[0])
+        self._relocate_group = list(enemies)
+        self._relocate = enemies[0]
+        self.status.showMessage(
+            f'Кликните клетку — группа из {len(enemies)} встанет туда, форма сохранится. Esc отменяет.')
+
+    def duplicate_group(self, enemies):
+        import copy
+        from entities import Enemy
+        enemies = [enemy for enemy in enemies if self._holds(enemy) and self._manual_loop is None]
+        if not enemies or self._manual_loop is not None:
+            return []
+        self._ensure_map()
+        created = []
+        for enemy in enemies:
+            data = copy.deepcopy(enemy.to_dict())
+            data['name'] = self._unique_name(enemy.name)
+            data.pop('uid', None)
+            clone = Enemy.from_dict(data)
+            clone.initiative_bonus = int(getattr(enemy, 'initiative_bonus', 0) or 0)
+            side = self._ensure_side(int(getattr(enemy, 'side', 0) or 0))
+            clone.side = side
+            origin = self.battle_map.get_pos(enemy) or (0, 0)
+            spot = self._nearest_free(clone, origin[0] + 1, origin[1])
+            if spot is None:
+                for clone_done in created:
+                    for row in self.sides:
+                        if clone_done in row:
+                            row.remove(clone_done)
+                    self.battle_map.unplace(clone_done)
+                QMessageBox.warning(self, 'Карта', 'Не хватает места, чтобы скопировать группу.')
+                self._refresh_roster(None)
+                return []
+            self.sides[side].append(clone)
+            self.battle_map.place(clone, spot[0], spot[1])
+            clone.moved_ft = 0
+            created.append(clone)
+        self._refresh_roster(None)
+        self.set_selection(created)
+        self._commit(f'дублирование группы ({len(created)})')
+        self.status.showMessage(f'Скопировано: {len(created)}')
+        return created
+
+    def delete_group(self, enemies):
+        enemies = [enemy for enemy in enemies if self._holds(enemy)]
+        if not enemies:
+            return False
+        if len(enemies) == 1:
+            return self.delete_enemy(enemies[0])
+        if self._manual_loop is not None:
+            self.status.showMessage('Сначала закончите ручной ход.')
+            return False
+        answer = QMessageBox.question(
+            self, 'Удалить группу?',
+            f'Удалить {len(enemies)} существ с карты?',
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+        if answer != QMessageBox.StandardButton.Yes:
+            return False
+        for enemy in enemies:
+            for side in self.sides:
+                if enemy in side:
+                    side.remove(enemy)
+                    break
+            if self.battle_map is not None:
+                self.battle_map.unplace(enemy)
+            self._close_sheets_for(enemy)
+        self._relocate = None
+        self._relocate_group = None
+        self.selection = []
+        self.selected = None
+        self._refresh_roster(None)
+        self._commit(f'удаление группы ({len(enemies)})')
+        self.status.showMessage(f'Удалено: {len(enemies)}')
+        return True
+
+    def change_group_side(self, enemies, side_index):
+        enemies = [enemy for enemy in enemies if self._holds(enemy)]
+        if not enemies or self._manual_loop is not None:
+            return
+        self._reassign_side(enemies, side_index)
+        self._refresh_roster(None)
+        self.set_selection(enemies, primary=enemies[0])
+        self._commit(f'сторона группы ({len(enemies)})')
+        self.status.showMessage(f'Сторона изменена у {len(enemies)}')
+
+    def damage_group(self, enemies):
+        enemies = [enemy for enemy in enemies if self._holds(enemy)]
+        if not enemies:
+            return
+        amount, ok = QInputDialog.getInt(
+            self, 'Урон группе', f'Урон каждому из {len(enemies)}:', 1, 0, 9999, 1)
+        if not ok:
+            return
+        for enemy in enemies:
+            enemy.take_damage(int(amount))
+        self._refresh_roster(None)
+        self.set_selection(enemies)
+        self._commit(f'урон группе ({len(enemies)})')
+        self.status.showMessage(f'Урон {amount} — {len(enemies)} существ')
+
+    def heal_group(self, enemies):
+        enemies = [enemy for enemy in enemies if self._holds(enemy)]
+        if not enemies:
+            return
+        amount, ok = QInputDialog.getInt(
+            self, 'Лечение группы', f'Хиты каждому живому из {len(enemies)}:', 1, 0, 9999, 1)
+        if not ok:
+            return
+        healed = 0
+        for enemy in enemies:
+            if enemy.heal(int(amount)):
+                healed += 1
+        self._refresh_roster(None)
+        self.set_selection(enemies)
+        self._commit(f'лечение группы ({len(enemies)})')
+        self.status.showMessage(f'Лечение {amount}: получили {healed} из {len(enemies)}')
+
+    def _impose_group(self, enemies, condition_id):
+        from conditions import apply_condition, permanent_duration
+        enemies = [enemy for enemy in enemies if self._holds(enemy)]
+        changed = 0
+        for enemy in enemies:
+            if apply_condition(enemy, condition_id, duration=permanent_duration(),
+                               note='вручную') is not None:
+                changed += 1
+        if not changed:
+            self.status.showMessage('Никто не получил состояние')
+            return
+        self.refresh_all_labels()
+        self._sync_selection_widgets()
+        self._commit(f'состояние группе ({changed})')
+        self.status.showMessage(f'Состояние наложено: {changed}')
+
+    def _exhaust_group(self, enemies, level):
+        from conditions import set_exhaustion
+        enemies = [enemy for enemy in enemies if self._holds(enemy)]
+        for enemy in enemies:
+            set_exhaustion(enemy, level)
+        self.refresh_all_labels()
+        self._sync_selection_widgets()
+        self._commit(f'истощение группе ({len(enemies)})')
+
+    def _lift_group(self, enemies, condition_id):
+        from conditions import active_conditions, remove_condition
+        enemies = [enemy for enemy in enemies if self._holds(enemy)]
+        changed = 0
+        for enemy in enemies:
+            current = [item for item in active_conditions(enemy)
+                       if isinstance(item, dict) and item.get('id') == condition_id]
+            for item in current:
+                remove_condition(enemy, cond=item, reason='снято вручную')
+                changed += 1
+        if not changed:
+            self.status.showMessage('Снимать нечего')
+            return
+        self.refresh_all_labels()
+        self._sync_selection_widgets()
+        self._commit(f'снято состояние группе ({changed})')
+
     def on_token(self, enemy):
         if self._manual_loop is not None:
             self._manual_click_token(enemy)
             return
-        self.selected = enemy
-        self.map_view.rebuild(self.battle_map, self.sides, self.selected)
-        self.map_info.setText(self._token_line(enemy))
-        self._mark_initiative_selection()
-        self._note_selection()
+        mods = QApplication.keyboardModifiers()
+        if mods & (Qt.KeyboardModifier.ControlModifier | Qt.KeyboardModifier.ShiftModifier):
+            self.toggle_selection(enemy)
+            return
+        if enemy in self.selection and len(self.selection) > 1:
+            self._keep_group = enemy
+            self.selected = enemy
+            self._sync_selection_widgets()
+            self._note_selection()
+            return
+        self._keep_group = None
+        self.set_selection([enemy])
+
+    def on_token_settled(self, enemy):
+        """Клик без протягивания по уже выделенному в группе оставляет только его."""
+        if self._manual_loop is not None:
+            return
+        if self._keep_group is enemy:
+            self._keep_group = None
+            self.set_selection([enemy])
+
+    def on_marquee(self, enemies):
+        if self._manual_loop is not None or self._aiming_blocks_marquee():
+            return
+        mods = QApplication.keyboardModifiers()
+        if mods & (Qt.KeyboardModifier.ControlModifier | Qt.KeyboardModifier.ShiftModifier):
+            self.set_selection(enemies, extend=True)
+        else:
+            self.set_selection(enemies)
+        count = len(self.selection)
+        self.status.showMessage(f'Выделено: {count}' if count else 'Выделение снято')
+
+    def _aiming_blocks_marquee(self):
+        return bool(getattr(self.map_view, '_aiming', False))
 
     def on_token_dragged(self, enemy, x, y):
         if self._manual_loop is not None or enemy is None:
             return
-        self.selected = enemy
-        self._note_selection()
+        self._keep_group = None
+        if len(self.selection) > 1 and enemy in self.selection:
+            self.shift_group(enemy, x, y)
+            return
+        self.set_selection([enemy])
         self.on_cell(x, y)
 
     def on_cell(self, x, y):

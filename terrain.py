@@ -150,8 +150,8 @@ def segment_overlaps_cell(x0, y0, x1, y1, left, top, right, bottom):
     return t1 - t0 > 1e-8
 
 
-def cells_along(x0, y0, x1, y1):
-    """Клетки, через внутренность или ребро которых проходит отрезок."""
+def _cells_along_scan(x0, y0, x1, y1):
+    """Перебор окна вокруг отрезка. Эталон для проверки быстрого обхода."""
     min_x, max_x = (x0, x1) if x0 <= x1 else (x1, x0)
     min_y, max_y = (y0, y1) if y0 <= y1 else (y1, y0)
     cx0 = int(math.floor(min_x)) - 1
@@ -164,6 +164,78 @@ def cells_along(x0, y0, x1, y1):
             if segment_overlaps_cell(x0, y0, x1, y1, cx, cy, cx + 1, cy + 1):
                 found.append((cx, cy))
     return found
+
+
+# Геометрия отрезка не зависит от рельефа. В одном раунде одни и те же
+# углы клеток проверяются десятки раз — список клеток запоминаем.
+_CELL_CACHE = {}
+_CELL_CACHE_LIMIT = 50000
+
+
+def cells_along(x0, y0, x1, y1):
+    """Клетки, через внутренность или ребро которых проходит отрезок.
+
+    Идём по столбцам или по рядам — их число линейно от длины, — и оставляем
+    клетку только если её прямоугольник реально пересекается с отрезком.
+    Набор совпадает с полным перебором окна.
+    """
+    x0, y0, x1, y1 = float(x0), float(y0), float(x1), float(y1)
+    key = (x0, y0, x1, y1)
+    cached = _CELL_CACHE.get(key)
+    if cached is not None:
+        return cached
+    found = _cells_along_walk(x0, y0, x1, y1)
+    if len(_CELL_CACHE) >= _CELL_CACHE_LIMIT:
+        _CELL_CACHE.clear()
+    _CELL_CACHE[key] = found
+    return found
+
+
+def _cells_along_walk(x0, y0, x1, y1):
+    if abs(x1 - x0) < 1e-15 and abs(y1 - y0) < 1e-15:
+        return ((int(math.floor(x0)), int(math.floor(y0))),)
+    found = []
+    seen = set()
+
+    def add(cx, cy):
+        if (cx, cy) in seen:
+            return
+        seen.add((cx, cy))
+        if segment_overlaps_cell(x0, y0, x1, y1, cx, cy, cx + 1, cy + 1):
+            found.append((cx, cy))
+
+    min_x, max_x = (x0, x1) if x0 <= x1 else (x1, x0)
+    min_y, max_y = (y0, y1) if y0 <= y1 else (y1, y0)
+    # Точка ровно на линии сетки принадлежит двум клеткам — захватываем обе.
+    c0 = int(math.floor(min_x - 1e-9))
+    c1 = int(math.floor(max_x + 1e-9))
+    r0 = int(math.floor(min_y - 1e-9))
+    r1 = int(math.floor(max_y + 1e-9))
+    dx = x1 - x0
+    dy = y1 - y0
+    if abs(dx) >= abs(dy):
+        for cx in range(c0, c1 + 1):
+            left = max(min_x, float(cx))
+            right = min(max_x, float(cx + 1))
+            if right < left - 1e-12:
+                continue
+            ya = y0 + dy * ((left - x0) / dx)
+            yb = y0 + dy * ((right - x0) / dx)
+            ylo, yhi = (ya, yb) if ya <= yb else (yb, ya)
+            for cy in range(int(math.floor(ylo - 1e-9)), int(math.floor(yhi + 1e-9)) + 1):
+                add(cx, cy)
+    else:
+        for cy in range(r0, r1 + 1):
+            bottom = max(min_y, float(cy))
+            top = min(max_y, float(cy + 1))
+            if top < bottom - 1e-12:
+                continue
+            xa = x0 + dx * ((bottom - y0) / dy)
+            xb = x0 + dx * ((top - y0) / dy)
+            xlo, xhi = (xa, xb) if xa <= xb else (xb, xa)
+            for cx in range(int(math.floor(xlo - 1e-9)), int(math.floor(xhi + 1e-9)) + 1):
+                add(cx, cy)
+    return tuple(found)
 
 
 def line_obstruction(x0, y0, x1, y1, terrain, ignore, creature_cells):
