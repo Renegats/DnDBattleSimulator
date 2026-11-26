@@ -368,6 +368,9 @@ def parse_special_effect(name, desc):
         'immunity_on_save': immunity,
         'choice': choice,
         'replaces': not supplement,
+        'spreads': bool(re.search(
+            r'огибает углы|обходит углы|spreads around corners',
+            desc or '', re.IGNORECASE)),
     }, None
 
 
@@ -504,13 +507,14 @@ def _legacy_targets(attacker, effect, sides, ignore, battle_map, focus):
             continue
         found.append(creature)
     if (effect.get('area') or 'radius') == 'single':
+        found = _visible(attacker, effect, battle_map, found, None)
         if focus is not None and focus in found:
             return [focus]
         if not found:
             return []
         found.sort(key=lambda creature: _distance(attacker, creature, battle_map))
         return found[:1]
-    return found
+    return _visible(attacker, effect, battle_map, found, None)
 
 
 def _exposed(creature, effect):
@@ -583,6 +587,44 @@ def _cells_for(effect, origin, direction, bounds):
     return template_cells(
         effect.get('area'), origin, direction, effect.get('range_ft') or 0,
         effect.get('width_ft'), bounds=bounds, height_ft=effect.get('height_ft'))
+
+
+def _behind_wall(attacker, effect, battle_map, origin, creature, placement):
+    """Область и одиночная цель не проходят сквозь непрозрачные клетки."""
+    if effect is not None and effect.get('sight') is False:
+        return False
+    placed = bool(effect and effect.get('placed') and origin is not None)
+    if placed and not battle_map.can_see_point(attacker, origin):
+        return True
+    if effect is not None and effect.get('spreads') and placement is not None:
+        return not battle_map.reaches_around(origin, creature, placement.cells)
+    if origin is None:
+        return battle_map.combat_cover(attacker, creature) == 'total'
+    return battle_map.cover_from_origin(origin, creature, attacker) == 'total'
+
+
+def _dex_cover(attacker, effect, battle_map, placement, target):
+    """Бонус укрытия к спасброску Ловкости. На пустой карте 0."""
+    ability = (effect or {}).get('ability') or 'dex'
+    if ability != 'dex' or battle_map is None or not battle_map.has_terrain():
+        return 0
+    origin = None if placement is None else getattr(placement, 'origin', None)
+    if origin is None:
+        cover = battle_map.combat_cover(attacker, target)
+    else:
+        cover = battle_map.cover_from_origin(origin, target, attacker)
+    if cover in ('half', 'three_quarters'):
+        from terrain import COVER_BONUS
+        return COVER_BONUS[cover]
+    return 0
+
+
+def _visible(attacker, effect, battle_map, creatures, placement):
+    if not creatures or battle_map is None or not battle_map.has_terrain():
+        return creatures
+    origin = None if placement is None else getattr(placement, 'origin', None)
+    return [creature for creature in creatures
+            if not _behind_wall(attacker, effect, battle_map, origin, creature, placement)]
 
 
 def _occupants(attacker, sides, battle_map, cells):
@@ -715,7 +757,9 @@ def best_placement(attacker, effect, sides, ignore, battle_map, focus=None):
     best_key = None
     choice = bool(effect.get('choice'))
     for placement in iter_placements(attacker, effect, sides, ignore, battle_map):
-        creatures = _occupants(attacker, sides, battle_map, placement.cells)
+        creatures = _visible(
+            attacker, effect, battle_map,
+            _occupants(attacker, sides, battle_map, placement.cells), placement)
         enemies, allies = _split_sides(attacker, creatures, ignore)
         enemies = [creature for creature in enemies if _exposed(creature, effect)]
         allies = [creature for creature in allies if _exposed(creature, effect)]
@@ -769,7 +813,9 @@ def aim_at(attacker, effect, battle_map, point, sides=None, ignore=None):
             origin = cube_origin(origin, (dx, dy), length)
         placement = _make_placement(attacker, effect, battle_map, origin, (dx, dy))
     if sides is not None:
-        placement.creatures = _occupants(attacker, sides, battle_map, placement.cells)
+        placement.creatures = _visible(
+            attacker, effect, battle_map,
+            _occupants(attacker, sides, battle_map, placement.cells), placement)
     return placement
 
 
@@ -784,7 +830,9 @@ def resolve_targets(attacker, effect, sides, ignore, battle_map, focus=None, *,
         placement = best_placement(attacker, effect, sides, ignore, battle_map, focus)
     if placement is None:
         return [], None
-    creatures = _occupants(attacker, sides, battle_map, placement.cells)
+    creatures = _visible(
+        attacker, effect, battle_map,
+        _occupants(attacker, sides, battle_map, placement.cells), placement)
     if effect.get('choice'):
         if include is not None:
             wanted = set(include)
@@ -930,10 +978,11 @@ def execute_effect(attacker, effect, sides, ignore, battle_map, *,
         else:
             fail_final = success_final = 0
         before = getattr(target, 'hp', None)
+        cover_bonus = _dex_cover(attacker, effect, battle_map, placement, target)
         roll = saving_throw(
             target, effect.get('ability') or 'dex', effect.get('dc') or 10,
             disabling=disabling, damage_fail=fail_final,
-            damage_success=success_final)
+            damage_success=success_final, bonus=cover_bonus)
         dealt_raw = (raw // 2 if half else 0) if roll.success else raw
         final = dealt_raw
         note_dmg = ''

@@ -6,12 +6,20 @@
 
 Дистанция считается между краями пятен, поэтому огромный тролль достаёт дальше
 от своего края, а не от центра клетки. Трупы по-прежнему прозрачны для движения.
+
+Рельеф — словарь клеток. Пустая карта ведёт себя как раньше: поиск пути
+равномерный, укрытия нет. Стены обходятся, трудная местность и вода стоят
+вдвое дороже, укрытие считается по углам клеток.
 """
+import heapq
 import math
 import random
 
 from creature_size import size_cells, size_label, size_space, half_cells
 from rng_channel import active as _active_rng
+from terrain import (BLOCKS_MOVE, COVER_BONUS, COVER_NONE, COVER_TOTAL, DIFFICULT,
+                     OPAQUE, SIGHT_KINDS, canon_kind, cover_against, cover_from_point,
+                     occupied_squares, point_blocked)
 
 
 def _rng():
@@ -34,6 +42,7 @@ class BattleMap:
         self._enemies = {}       # id(enemy) -> enemy
         self.cell_map = {}       # (int x, int y) -> enemy (якорь, для совместимости)
         self._occ = {}           # (hx, hy) полуклетки -> enemy
+        self._terrain = {}       # (x, y) клетка 5 фт -> тип рельефа
 
     # ---------- габариты ----------
     @staticmethod
@@ -63,6 +72,8 @@ class BattleMap:
 
     def _area_free(self, hx, hy, n, ignore_id=None):
         if not self._fits(hx, hy, n):
+            return False
+        if self._terrain_blocks(hx, hy, n):
             return False
         for yy in range(hy, hy + n):
             for xx in range(hx, hx + n):
@@ -139,6 +150,185 @@ class BattleMap:
             return 0.0
         return self._distance_from_gap(
             self._gap_h(pa, self.span_of(a), pb, self.span_of(b)))
+
+    # ---------- рельеф ----------
+    def has_terrain(self):
+        return bool(self._terrain)
+
+    def affects_sight(self):
+        return any(kind in SIGHT_KINDS for kind in self._terrain.values())
+
+    def terrain_at(self, x, y):
+        return self._terrain.get((int(x), int(y)))
+
+    def set_terrain(self, x, y, kind):
+        """kind=None или «ластик» снимает клетку. За границей карты ничего не пишет."""
+        ix, iy = int(x), int(y)
+        if not (0 <= ix < self.width and 0 <= iy < self.height):
+            return
+        cleaned = canon_kind(kind)
+        if cleaned is None:
+            self._terrain.pop((ix, iy), None)
+            return
+        self._terrain[(ix, iy)] = cleaned
+
+    def paint_terrain(self, cells, kind):
+        for cell in cells or ():
+            self.set_terrain(cell[0], cell[1], kind)
+
+    def clear_terrain(self):
+        self._terrain.clear()
+
+    def terrain_records(self):
+        """Список [x, y, тип] для JSON. Пустой рельеф — пустой список."""
+        return [[x, y, kind] for (x, y), kind in sorted(self._terrain.items())]
+
+    def load_terrain(self, records):
+        self._terrain.clear()
+        for item in records or ():
+            if isinstance(item, dict):
+                self.set_terrain(item.get('x'), item.get('y'), item.get('kind'))
+                continue
+            if not item or len(item) < 3:
+                continue
+            self.set_terrain(item[0], item[1], item[2])
+
+    def copy_terrain_from(self, other):
+        if other is None:
+            return
+        for (x, y), kind in getattr(other, '_terrain', {}).items():
+            if 0 <= x < self.width and 0 <= y < self.height:
+                self._terrain[(x, y)] = kind
+
+    def _cells_of_anchor(self, hx, hy, n):
+        cells = set()
+        for yy in range(hy, hy + n):
+            for xx in range(hx, hx + n):
+                cells.add((xx // 2, yy // 2))
+        return cells
+
+    def _terrain_blocks(self, hx, hy, n):
+        if not self._terrain:
+            return False
+        for cell in self._cells_of_anchor(hx, hy, n):
+            if self._terrain.get(cell) in BLOCKS_MOVE:
+                return True
+        return False
+
+    def _footprint_difficult(self, hx, hy, n):
+        if not self._terrain:
+            return False
+        for cell in self._cells_of_anchor(hx, hy, n):
+            if self._terrain.get(cell) in DIFFICULT:
+                return True
+        return False
+
+    def _enter_cost(self, hx, hy, n):
+        """Футы за шаг в этот якорь. Крошечный шагает на 2,5, остальные на 5.
+        Трудная клетка в пятне удваивает шаг."""
+        base = 2.5 if n == 1 else 5
+        if self._footprint_difficult(hx, hy, n):
+            return base * 2
+        return base
+
+    def _creature_cells(self, attacker, target):
+        cells = set()
+        for enemy in self._enemies.values():
+            if enemy is attacker or enemy is target or not getattr(enemy, 'alive', False):
+                continue
+            pos = self.get_pos(enemy)
+            if not pos:
+                continue
+            cells.update(occupied_squares(pos, self.cells_of(enemy)))
+        return cells
+
+    def cover_between(self, attacker, target, creatures=False, origin=None):
+        """Укрытие target от attacker. origin — якорь атакующего, если он ещё не встал."""
+        if not self._terrain and not creatures:
+            return COVER_NONE
+        if origin is None:
+            origin = self.get_pos(attacker)
+        dest = self.get_pos(target)
+        if origin is None or dest is None:
+            return COVER_NONE
+        others = self._creature_cells(attacker, target) if creatures else ()
+        return cover_against(
+            origin, self.cells_of(attacker), dest, self.cells_of(target),
+            self._terrain, others)
+
+    def combat_cover(self, attacker, target):
+        """Укрытие для броска. На карте без рельефа всегда «нет», чтобы старые
+        бои не меняли попадания из-за существ на линии."""
+        if not self._terrain:
+            return COVER_NONE
+        return self.cover_between(attacker, target, creatures=True)
+
+    def cover_bonus(self, attacker, target):
+        """(бонус КД, степень). Полное укрытие — бонус None, бить нельзя."""
+        cover = self.combat_cover(attacker, target)
+        if cover == COVER_TOTAL:
+            return None, cover
+        return COVER_BONUS[cover], cover
+
+    def cover_from_origin(self, origin, target, attacker=None, creatures=True):
+        if not self._terrain and not creatures:
+            return COVER_NONE
+        dest = self.get_pos(target)
+        if dest is None:
+            return COVER_NONE
+        ignore = ()
+        if attacker is not None:
+            pos = self.get_pos(attacker)
+            if pos is not None:
+                ignore = occupied_squares(pos, self.cells_of(attacker))
+        others = ()
+        if creatures and self._terrain:
+            others = self._creature_cells(attacker, target)
+        return cover_from_point(
+            origin, dest, self.cells_of(target), self._terrain, others, ignore)
+
+    def can_see_point(self, attacker, point):
+        if not self.affects_sight():
+            return True
+        pos = self.get_pos(attacker)
+        if pos is None or point is None:
+            return True
+        return not point_blocked(pos, self.cells_of(attacker), point, self._terrain)
+
+    def reaches_around(self, origin, creature, allowed):
+        """Есть ли путь по клеткам области в обход непрозрачных (дыхание за угол)."""
+        if origin is None or not self.affects_sight():
+            return True
+        goals = set(occupied_squares(self.get_pos(creature), self.cells_of(creature)))
+        if not goals:
+            return False
+        opaque = {cell for cell, kind in self._terrain.items() if kind in OPAQUE}
+        if goals & opaque and not (goals - opaque):
+            return False
+        allowed = set(allowed or ())
+        start = (int(math.floor(float(origin[0]))), int(math.floor(float(origin[1]))))
+        queue = [start]
+        seen = {start}
+        while queue:
+            cx, cy = queue.pop()
+            if (cx, cy) in goals:
+                return True
+            for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1),
+                           (1, 1), (1, -1), (-1, 1), (-1, -1)):
+                nxt = (cx + dx, cy + dy)
+                if nxt in seen or nxt in opaque:
+                    continue
+                if nxt not in allowed and nxt not in goals:
+                    continue
+                seen.add(nxt)
+                queue.append(nxt)
+        return False
+
+    def _anchor_sees(self, enemy, anchor_h, target):
+        if not self.affects_sight():
+            return True
+        origin = (anchor_h[0] / 2.0, anchor_h[1] / 2.0)
+        return self.cover_between(enemy, target, creatures=True, origin=origin) != COVER_TOTAL
 
     # ---------- расстановка ----------
     def _zone_for(self, side_idx, total):
@@ -221,16 +411,25 @@ class BattleMap:
 
     def find_path(self, enemy, target, max_steps, reach_steps=1, reach_ft=None,
                   allow=None):
-        """BFS с учётом габаритов: пятно должно помещаться в каждую клетку пути.
-        Возвращает список якорей в клетках (без стартового) или None.
-        reach_ft — досягаемость в футах (приоритетнее reach_steps)."""
+        """Маршрут якорей без старта или None.
+
+        Без рельефа — прежний BFS: каждый шаг 5 фт, диагональ не дороже.
+        С рельефом — Дейкстра: стена не входит в путь, трудная клетка стоит
+        10 фт, остановка там, откуда цель видна и достаётся.
+        """
+        if reach_ft is None:
+            reach_ft = max(0, int(reach_steps)) * 5
+        if not self._terrain:
+            return self._find_path_open(enemy, target, max_steps, reach_ft, allow)
+        budget = max(0, int(max_steps)) * 5
+        return self._find_path_cost(enemy, target, budget, reach_ft, allow, shuffle=True)
+
+    def _find_path_open(self, enemy, target, max_steps, reach_ft, allow):
         start, goal = self._anchor_h(enemy), self._anchor_h(target)
         if start is None or goal is None:
             return None
         n, tn = self.span_of(enemy), self.span_of(target)
         step = 1 if n == 1 else 2
-        if reach_ft is None:
-            reach_ft = max(0, int(reach_steps)) * 5
         levels = max(1, int(max_steps * 2) // step)
         if self._within_reach(self._gap_h(start, n, goal, tn), reach_ft):
             return []
@@ -265,6 +464,192 @@ class BattleMap:
             return None
         return self._rebuild(parents, best)
 
+    def _find_path_cost(self, enemy, target, budget, reach_ft, allow, shuffle):
+        """Путь минимальной стоимости. None — ни один шаг не приближает."""
+        start, goal = self._anchor_h(enemy), self._anchor_h(target)
+        if start is None or goal is None:
+            return None
+        n, tn = self.span_of(enemy), self.span_of(target)
+        step = 1 if n == 1 else 2
+        if (self._within_reach(self._gap_h(start, n, goal, tn), reach_ft)
+                and self._anchor_sees(enemy, start, target)):
+            return []
+        dirs = [(-1, -1), (0, -1), (1, -1), (-1, 0),
+                (1, 0), (-1, 1), (0, 1), (1, 1)]
+        if shuffle:
+            _rng().shuffle(dirs)
+        parents = {start: None}
+        cost = {start: 0}
+        heap = [(0, 0, start)]
+        tie = 0
+        best, best_key = start, (self._gap_h(start, n, goal, tn), 0)
+        while heap:
+            spent, _order, (cx, cy) = heapq.heappop(heap)
+            if spent != cost.get((cx, cy)):
+                continue
+            if (cx, cy) != start and self._within_reach(
+                    self._gap_h((cx, cy), n, goal, tn), reach_ft):
+                if self._anchor_sees(enemy, (cx, cy), target):
+                    return self._rebuild(parents, (cx, cy))
+            for dx, dy in dirs:
+                nx, ny = cx + dx * step, cy + dy * step
+                if not self._area_free(nx, ny, n, ignore_id=id(enemy)):
+                    continue
+                if allow is not None and not allow(nx, ny):
+                    continue
+                new_cost = spent + self._enter_cost(nx, ny, n)
+                if new_cost > budget or new_cost >= cost.get((nx, ny), 10 ** 9):
+                    continue
+                cost[(nx, ny)] = new_cost
+                parents[(nx, ny)] = (cx, cy)
+                tie += 1
+                heapq.heappush(heap, (new_cost, tie, (nx, ny)))
+                gap = self._gap_h((nx, ny), n, goal, tn)
+                key = (gap, new_cost)
+                if key < best_key:
+                    best_key, best = key, (nx, ny)
+        if best == start:
+            return None
+        return self._rebuild(parents, best)
+
+    def can_reach_shot(self, enemy, target, speed_ft, reach_ft):
+        """Можно ли в этот запас футов встать так, чтобы цель была видна и в досягаемости.
+
+        Кости боя не тратит: порядок обхода фиксированный.
+        """
+        if not self._terrain:
+            return True
+        if self.get_pos(enemy) is None or self.get_pos(target) is None:
+            return True
+        if (self.distance_ft(enemy, target) <= float(reach_ft) + 1e-9
+                and self.combat_cover(enemy, target) != COVER_TOTAL):
+            return True
+        budget = max(0, int(speed_ft) - int(getattr(enemy, 'moved_ft', 0) or 0))
+        if budget < 5 and self.span_of(enemy) > 1:
+            return False
+        path = self._find_path_cost(enemy, target, budget, reach_ft, None, shuffle=False)
+        if path is None:
+            return False
+        if not path:
+            return self.combat_cover(enemy, target) != COVER_TOTAL
+        end = path[-1]
+        anchor = (int(round(end[0] * 2)), int(round(end[1] * 2)))
+        return self._anchor_sees(enemy, anchor, target) and self._within_reach(
+            self._gap_h(anchor, self.span_of(enemy), self._anchor_h(target),
+                        self.span_of(target)), reach_ft)
+
+    def path_cost(self, enemy, path):
+        n = self.span_of(enemy)
+        total = 0
+        for point in path or ():
+            hx = int(round(float(point[0]) * 2))
+            hy = int(round(float(point[1]) * 2))
+            total += self._enter_cost(hx, hy, n)
+        return total
+
+    def travel_cost(self, enemy, x, y):
+        """Футы до якоря (x, y) с учётом стен и трудной местности. None — пути нет."""
+        start = self._anchor_h(enemy)
+        if start is None:
+            return None
+        n = self.span_of(enemy)
+        step = 1 if n == 1 else 2
+        goal = (int(round(float(x) * 2)), int(round(float(y) * 2)))
+        if goal == start:
+            return 0
+        if not self._area_free(goal[0], goal[1], n, ignore_id=id(enemy)):
+            return None
+        if not self._terrain:
+            return max(abs(goal[0] - start[0]), abs(goal[1] - start[1])) / step * (
+                2.5 if n == 1 else 5)
+        dirs = ((-1, -1), (0, -1), (1, -1), (-1, 0),
+                (1, 0), (-1, 1), (0, 1), (1, 1))
+        cost = {start: 0}
+        heap = [(0, start)]
+        while heap:
+            spent, (cx, cy) = heapq.heappop(heap)
+            if (cx, cy) == goal:
+                return spent
+            if spent != cost.get((cx, cy)):
+                continue
+            for dx, dy in dirs:
+                nx, ny = cx + dx * step, cy + dy * step
+                if not self._area_free(nx, ny, n, ignore_id=id(enemy)):
+                    continue
+                new_cost = spent + self._enter_cost(nx, ny, n)
+                if new_cost >= cost.get((nx, ny), 10 ** 9):
+                    continue
+                cost[(nx, ny)] = new_cost
+                heapq.heappush(heap, (new_cost, (nx, ny)))
+        return None
+
+    def snap_move(self, enemy, x, y):
+        """Якорь на сетке шага рядом с кликом и стоимость пути. (None, None) — нельзя."""
+        start = self._anchor_h(enemy)
+        if start is None:
+            return None, None
+        n = self.span_of(enemy)
+        step = 1 if n == 1 else 2
+        hx = int(round(float(x) * 2))
+        hy = int(round(float(y) * 2))
+        hx = start[0] + ((hx - start[0]) // step) * step
+        hy = start[1] + ((hy - start[1]) // step) * step
+        if (hx, hy) == start:
+            return None, None
+        spent = self.travel_cost(enemy, hx / 2.0, hy / 2.0)
+        if spent is None:
+            return None, None
+        return (_clean(hx), _clean(hy)), spent
+
+    def reach_half_cells(self, enemy):
+        """Полуклетки, куда существо дотягивается оставшейся скоростью.
+
+        Без рельефа набор совпадает с прежней подсветкой. Со стенами и трудной
+        местностью клетка за стеной и слишком дорогой шаг не подсвечиваются.
+        """
+        pos = self.get_pos(enemy)
+        if not pos:
+            return set()
+        n = self.span_of(enemy)
+        step = 1 if n == 1 else 2
+        left = max(0, (getattr(enemy, 'speed', 0) or 0) - (getattr(enemy, 'moved_ft', 0) or 0))
+        ax, ay = int(round(pos[0] * 2)), int(round(pos[1] * 2))
+        if not self._terrain:
+            radius_h = int(left // 2.5)
+            covered = set()
+            for dy in range(-radius_h, radius_h + 1, step):
+                for dx in range(-radius_h, radius_h + 1, step):
+                    hx, hy = ax + dx, ay + dy
+                    if not self._area_free(hx, hy, n, ignore_id=id(enemy)):
+                        continue
+                    for yy in range(hy, hy + n):
+                        for xx in range(hx, hx + n):
+                            covered.add((xx, yy))
+            return covered
+        covered = set()
+        cost = {(ax, ay): 0}
+        heap = [(0, (ax, ay))]
+        dirs = ((-1, -1), (0, -1), (1, -1), (-1, 0),
+                (1, 0), (-1, 1), (0, 1), (1, 1))
+        while heap:
+            spent, (cx, cy) = heapq.heappop(heap)
+            if spent != cost.get((cx, cy)):
+                continue
+            if self._area_free(cx, cy, n, ignore_id=id(enemy)) or (cx, cy) == (ax, ay):
+                for yy in range(cy, cy + n):
+                    for xx in range(cx, cx + n):
+                        covered.add((xx, yy))
+            for dx, dy in dirs:
+                nx, ny = cx + dx * step, cy + dy * step
+                if not self._area_free(nx, ny, n, ignore_id=id(enemy)):
+                    continue
+                new_cost = spent + self._enter_cost(nx, ny, n)
+                if new_cost > left or new_cost >= cost.get((nx, ny), 10 ** 9):
+                    continue
+                cost[(nx, ny)] = new_cost
+                heapq.heappush(heap, (new_cost, (nx, ny)))
+        return covered
+
     def move_towards(self, enemy, target, max_ft, reach_ft=5, allow=None):
         already = int(getattr(enemy, 'moved_ft', 0) or 0)
         steps = max(0, (int(max_ft) - already) // 5)
@@ -275,7 +660,10 @@ class BattleMap:
                 nx, ny = path[-1]
                 self.place(enemy, nx, ny)
                 if before:
-                    moved = max(abs(nx - before[0]), abs(ny - before[1])) * 5
+                    if self._terrain:
+                        moved = self.path_cost(enemy, path)
+                    else:
+                        moved = max(abs(nx - before[0]), abs(ny - before[1])) * 5
                     enemy.moved_ft = min(max_ft, getattr(enemy, 'moved_ft', 0) + moved)
             return
         anchor = self._anchor_h(enemy)
@@ -293,10 +681,17 @@ class BattleMap:
                     if allow is not None and not allow(hx, hy):
                         continue
                     free.append((hx, hy))
+        if self._terrain:
+            left = max_ft - int(getattr(enemy, 'moved_ft', 0) or 0)
+            free = [cell for cell in free if self._enter_cost(cell[0], cell[1], n) <= left + 1e-9]
         if free:
             hx, hy = _rng().choice(free)
             self.place(enemy, hx / 2, hy / 2)
-            enemy.moved_ft = min(max_ft, getattr(enemy, 'moved_ft', 0) + step * 2.5)
+            if self._terrain:
+                spent = self._enter_cost(hx, hy, n)
+            else:
+                spent = step * 2.5
+            enemy.moved_ft = min(max_ft, getattr(enemy, 'moved_ft', 0) + spent)
 
     # ---------- сводка для интерфейса ----------
     def describe(self, enemy):

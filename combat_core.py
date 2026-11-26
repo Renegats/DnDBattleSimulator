@@ -77,10 +77,23 @@ def nearest_in_range(attacker, atk, ignore, sides, battle_map):
                 return e
             if battle_map.get_pos(e) is None:
                 continue
+            if _total_cover(battle_map, attacker, e):
+                continue
             d = battle_map.distance_ft(attacker, e)
             if d <= need and (best_d is None or d < best_d):
                 best, best_d = e, d
     return best
+
+
+def _total_cover(battle_map, attacker, target):
+    """Полное укрытие есть только на карте с рельефом. Пустая карта — как раньше."""
+    if battle_map is None or target is None or attacker is None:
+        return False
+    if not getattr(battle_map, 'has_terrain', lambda: False)():
+        return False
+    if battle_map.get_pos(attacker) is None or battle_map.get_pos(target) is None:
+        return False
+    return battle_map.combat_cover(attacker, target) == 'total'
 
 
 def _roll_component(attacker, comp, critical, crit_mode):
@@ -248,6 +261,10 @@ def _heal_strike(attacker, target, atk, battle_map, round_no, legendary):
             or getattr(target, 'side', None) != getattr(attacker, 'side', None)):
         text = f'{attacker.name} не применяет {atk.name}: лечить некого'
         return [CombatEvent(kind='heal', result='no_target', text=text, **common)]
+    if _total_cover(battle_map, attacker, target):
+        text = (f'{attacker.name} не видит {target.name}: полное укрытие '
+                f'({atk.name})')
+        return [CombatEvent(kind='heal', result='no_los', text=text, **common)]
     if not in_range_of(attacker, target, atk, battle_map):
         text = (f'{attacker.name} не может достать {target.name} лечением '
                 f'({atk.name})')
@@ -282,17 +299,39 @@ def _attack_distance(attacker, target, battle_map):
     return distance_ft_between(attacker, target)
 
 
+def _cover_attack(attacker, target, battle_map):
+    """(эффективный КД, текст к броску). None — бить нельзя, полное укрытие."""
+    if not _total_cover(battle_map, attacker, target):
+        bonus = 0
+        note = ''
+        if battle_map is not None and getattr(battle_map, 'has_terrain', lambda: False)():
+            extra, _cover = battle_map.cover_bonus(attacker, target)
+            if extra:
+                bonus = extra
+                note = f' (+{extra} укрытие)'
+        return target.ac + bonus, note
+    return None, ''
+
+
 def _attack_strike(attacker, target, atk, battle_map, crit_mode, round_no, legendary,
                    sides=None):
     from conditions import attack_modifiers
+    common = _actor_fields(attacker, target, battle_map)
+    effective_ac, cover_note = _cover_attack(attacker, target, battle_map)
+    if effective_ac is None:
+        text = f'{attacker.name} не видит {target.name}: полное укрытие ({atk.name})'
+        event = CombatEvent(
+            kind='out_of_reach', result='no_los', text=text,
+            action=getattr(atk, 'name', None),
+            round=round_no, legendary=legendary, **common)
+        return [event], False
     advantage, disadvantage, force_crit = attack_modifiers(
         attacker, target, _attack_distance(attacker, target, battle_map))
     roll = attacker.perform_attack(
-        atk, target.ac, crit_mode=crit_mode, advantage=advantage,
+        atk, effective_ac, crit_mode=crit_mode, advantage=advantage,
         disadvantage=disadvantage, force_crit=force_crit)
     hit, damage, attack_roll, critical, damage_info, natural, modifier = _roll_details(roll, atk)
     result = _strike_result(hit, critical, natural)
-    common = _actor_fields(attacker, target, battle_map)
     before = getattr(target, 'hp', None)
     if hit:
         magical = bool(getattr(atk, 'magical', False))
@@ -312,7 +351,7 @@ def _attack_strike(attacker, target, atk, battle_map, crit_mode, round_no, legen
         extra_text = (' ' + ' '.join(extra_notes)) if extra_notes else ''
         mark = _advantage_mark(roll)
         text = (f"{attacker.name} → {target.name} ({atk.name}: "
-                f"{attack_roll} vs AC {target.ac}){mark} - ПОПАДАНИЕ!{crit_text} "
+                f"{attack_roll} vs AC {target.ac}{cover_note}){mark} - ПОПАДАНИЕ!{crit_text} "
                 f"{damage_info}{dmg_note}{extra_text}")
         after = getattr(target, 'hp', None)
         event = CombatEvent(
@@ -341,7 +380,7 @@ def _attack_strike(attacker, target, atk, battle_map, crit_mode, round_no, legen
         return produced, killed
     mark = _advantage_mark(roll)
     text = (f"{attacker.name} → {target.name} ({atk.name}: "
-            f"{attack_roll} vs AC {target.ac}){mark} - ПРОМАХ!")
+            f"{attack_roll} vs AC {target.ac}{cover_note}){mark} - ПРОМАХ!")
     event = CombatEvent(
         kind='attack', result=result, crit=False, text=text,
         action=getattr(atk, 'name', None), natural=natural, modifier=modifier,

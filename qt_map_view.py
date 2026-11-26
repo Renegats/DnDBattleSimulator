@@ -43,6 +43,31 @@ ATTACK_STYLES = {
 }
 
 
+_TERRAIN_DARK = {
+    'wall': ((74, 81, 96, 235), (186, 194, 206)),
+    'difficult': ((138, 154, 74, 110), (214, 224, 150)),
+    'water': ((46, 134, 171, 150), (214, 243, 255)),
+    'half': ((224, 179, 65, 120), (255, 224, 138)),
+    'three_quarters': ((224, 122, 61, 150), (255, 214, 186)),
+    'total': ((142, 61, 85, 170), (255, 208, 220)),
+}
+_TERRAIN_LIGHT = {
+    'wall': ((110, 101, 88, 230), (62, 56, 47)),
+    'difficult': ((109, 122, 50, 120), (63, 74, 24)),
+    'water': ((61, 142, 184, 140), (8, 54, 74)),
+    'half': ((196, 146, 42, 130), (106, 74, 8)),
+    'three_quarters': ((198, 90, 30, 140), (90, 36, 8)),
+    'total': ((138, 48, 72, 150), (58, 16, 32)),
+}
+
+COVER_TINT = {
+    'none': (46, 204, 113, 90),
+    'half': (241, 196, 15, 110),
+    'three_quarters': (230, 126, 34, 120),
+    'total': (231, 76, 60, 130),
+}
+
+
 class MapView(QGraphicsView):
     token_clicked = pyqtSignal(object)
     token_menu = pyqtSignal(object, object)
@@ -51,6 +76,9 @@ class MapView(QGraphicsView):
     token_dragged = pyqtSignal(object, float, float)
     image_dropped = pyqtSignal(str)
     aim_moved = pyqtSignal(float, float)
+    terrain_cell = pyqtSignal(int, int, bool)
+    terrain_stroke_finished = pyqtSignal()
+    hover_target = pyqtSignal(object)
 
     def __init__(self, palette, parent=None):
         super().__init__(parent)
@@ -85,6 +113,14 @@ class MapView(QGraphicsView):
         self._focus_cells = []
         self._area_items = []
         self._aiming = False
+        self._terrain_mode = False
+        self._terrain_stroke = None
+        self._terrain_items = []
+        self._cover_enemy = None
+        self._cover_kind = None
+        self._cover_items = []
+        self._hover_enemy = None
+        self._cover_hover = False
 
     # ---------- фон ----------
     def set_background(self, path):
@@ -234,6 +270,15 @@ class MapView(QGraphicsView):
                 round(scene_pos.y() / cell * 2) / 2)
 
     def mousePressEvent(self, e):
+        if self._terrain_mode and not self._aiming and e.button() in (
+                Qt.MouseButton.LeftButton, Qt.MouseButton.RightButton):
+            cell = self._cell_floor(e.pos())
+            if cell is not None:
+                erase = e.button() == Qt.MouseButton.RightButton
+                self._terrain_stroke = erase
+                self.terrain_cell.emit(cell[0], cell[1], erase)
+            e.accept()
+            return
         if e.button() == Qt.MouseButton.RightButton:
             point = e.globalPosition().toPoint()
             enemy = self._token_at(e.pos())
@@ -267,11 +312,56 @@ class MapView(QGraphicsView):
     def set_aiming(self, on):
         """Клик и движение мыши выбирают клетку прицела, а не тащат карту."""
         self._aiming = bool(on)
-        self.setMouseTracking(bool(on))
-        if not on:
+        self._track_mouse()
+        if not on and not self._terrain_mode:
             self.setCursor(Qt.CursorShape.ArrowCursor)
 
+    def set_terrain_mode(self, on):
+        """Кисть рельефа: левая кнопка рисует, правая стирает, протягивание — штрих."""
+        self._terrain_mode = bool(on)
+        self._terrain_stroke = None
+        self._track_mouse()
+        if on:
+            self.setCursor(Qt.CursorShape.CrossCursor)
+        elif not self._aiming:
+            self.setCursor(Qt.CursorShape.ArrowCursor)
+
+    def set_cover_hover(self, on):
+        self._cover_hover = bool(on)
+        self._track_mouse()
+        if not on:
+            self._hover_enemy = None
+
+    def _track_mouse(self):
+        self.setMouseTracking(self._aiming or self._terrain_mode or self._cover_hover)
+
+    def set_cover_overlay(self, enemy, kind):
+        self._cover_enemy = enemy
+        self._cover_kind = kind
+        self._paint_cover()
+
+    def _cell_floor(self, pos):
+        sp = self.mapToScene(pos)
+        cell = self.opts['cell']
+        if cell <= 0:
+            return None
+        return int(math.floor(sp.x() / cell)), int(math.floor(sp.y() / cell))
+
+    def _map_is_dark(self):
+        return QColor(self.pal.get('canvas_map', '#2b2d31')).lightness() < 140
+
     def mouseMoveEvent(self, e):
+        if self._terrain_stroke is not None:
+            cell = self._cell_floor(e.pos())
+            if cell is not None:
+                self.terrain_cell.emit(cell[0], cell[1], bool(self._terrain_stroke))
+            e.accept()
+            return
+        if self._cover_hover or self._aiming:
+            enemy = self._token_at(e.pos())
+            if enemy is not self._hover_enemy:
+                self._hover_enemy = enemy
+                self.hover_target.emit(enemy)
         if self._aiming and self._token_drag is None:
             sp = self.mapToScene(e.pos())
             x, y = self._cell_at(sp, self.opts['cell'])
@@ -297,6 +387,11 @@ class MapView(QGraphicsView):
         super().mouseMoveEvent(e)
 
     def mouseReleaseEvent(self, e):
+        if self._terrain_stroke is not None:
+            self._terrain_stroke = None
+            self.terrain_stroke_finished.emit()
+            e.accept()
+            return
         if self._token_drag is not None:
             enemy = self._token_drag
             moved = self._token_moved
@@ -323,24 +418,8 @@ class MapView(QGraphicsView):
 
     # ---------- отрисовка ----------
     def _reach_cells(self, bm, enemy, c):
-        pos = bm.get_pos(enemy)
-        if not pos:
-            return set()
-        n = bm.span_of(enemy)
-        step = 1 if n == 1 else 2
-        left = max(0, enemy.speed - getattr(enemy, 'moved_ft', 0))
-        radius_h = int(left // 2.5)
-        ax, ay = int(round(pos[0] * 2)), int(round(pos[1] * 2))
-        covered = set()
-        for dy in range(-radius_h, radius_h + 1, step):
-            for dx in range(-radius_h, radius_h + 1, step):
-                hx, hy = ax + dx, ay + dy
-                if not bm._area_free(hx, hy, n, ignore_id=id(enemy)):
-                    continue
-                for yy in range(hy, hy + n):
-                    for xx in range(hx, hx + n):
-                        covered.add((xx, yy))
-        return covered
+        del c
+        return bm.reach_half_cells(enemy)
 
     def set_area_cells(self, cells):
         """Клетки уже сыгранной области. Сцену не пересобирает."""
@@ -505,6 +584,8 @@ class MapView(QGraphicsView):
         self._attack_items = []
         self._focus_items = []
         self._area_items = []
+        self._terrain_items = []
+        self._cover_items = []
         self._bm, self._sides, self._selected = bm, sides or [], selected
         sc = self.scene()
         sc.clear()
@@ -539,6 +620,8 @@ class MapView(QGraphicsView):
                 sc.addLine(x * c + c / 2, 0, x * c + c / 2, h, hp).setZValue(-6)
             for y in range(bm.height):
                 sc.addLine(0, y * c + c / 2, w, y * c + c / 2, hp).setZValue(-6)
+
+        self._paint_terrain()
 
         if o['reach'] and selected is not None and selected.alive:
             brush = QBrush(QColor(self.pal['canvas_reach']))
@@ -607,6 +690,105 @@ class MapView(QGraphicsView):
         self._paint_areas()
         self._paint_attack_lines()
         self._paint_focus_rings()
+        self._paint_cover()
+
+    def refresh_terrain(self):
+        """Перерисовать только клетки рельефа, не трогая токены."""
+        if self._bm is None:
+            return
+        self._paint_terrain()
+        self._paint_cover()
+
+    def _remember(self, item):
+        item.setZValue(-4)
+        item.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
+        self._terrain_items.append(item)
+        return item
+
+    def _paint_terrain(self):
+        scene = self.scene()
+        for item in self._terrain_items:
+            scene.removeItem(item)
+        self._terrain_items = []
+        bm = self._bm
+        if bm is None or not bm.has_terrain():
+            return
+        cell = self.opts['cell']
+        palette = _TERRAIN_DARK if self._map_is_dark() else _TERRAIN_LIGHT
+        for (x, y), kind in bm._terrain.items():
+            fill, edge = palette.get(kind, palette['wall'])
+            left, top = x * cell, y * cell
+            rect = scene.addRect(
+                left + 1, top + 1, cell - 2, cell - 2,
+                QPen(QColor(*edge), 1.2), QBrush(QColor(*fill)))
+            self._remember(rect)
+            self._terrain_mark(scene, kind, left, top, cell, QColor(*edge))
+
+    def _terrain_mark(self, scene, kind, left, top, cell, color):
+        pen = QPen(color, 1.4)
+        pen.setCosmetic(True)
+        inset = max(3, cell * 0.18)
+
+        def line(x1, y1, x2, y2):
+            item = scene.addLine(x1, y1, x2, y2, pen)
+            self._remember(item)
+
+        if kind == 'wall':
+            line(left + inset, top + cell * 0.38, left + cell - inset, top + cell * 0.38)
+            line(left + inset, top + cell * 0.62, left + cell - inset, top + cell * 0.62)
+            line(left + cell * 0.35, top + inset, left + cell * 0.35, top + cell * 0.38)
+            line(left + cell * 0.68, top + cell * 0.38, left + cell * 0.68, top + cell * 0.62)
+        elif kind == 'difficult':
+            for step in (0.25, 0.5, 0.75):
+                line(left + cell * step, top + inset, left + inset, top + cell * step)
+                line(left + cell - inset, top + cell * step, left + cell * step, top + cell - inset)
+        elif kind == 'water':
+            for frac in (0.32, 0.5, 0.68):
+                y = top + cell * frac
+                line(left + inset, y, left + cell * 0.35, y - cell * 0.06)
+                line(left + cell * 0.35, y - cell * 0.06, left + cell * 0.65, y + cell * 0.06)
+                line(left + cell * 0.65, y + cell * 0.06, left + cell - inset, y)
+        elif kind == 'half':
+            block = scene.addRect(
+                left + inset, top + cell * 0.55, cell - 2 * inset, cell * 0.28,
+                QPen(Qt.PenStyle.NoPen), QBrush(color))
+            self._remember(block)
+        elif kind == 'three_quarters':
+            thick = max(3.0, cell * 0.16)
+            for rect in (
+                (left + inset, top + inset, cell - 2 * inset, thick),
+                (left + inset, top + inset, thick, cell - 2 * inset),
+                (left + cell - inset - thick, top + inset, thick, cell - 2 * inset),
+            ):
+                block = scene.addRect(*rect, QPen(Qt.PenStyle.NoPen), QBrush(color))
+                self._remember(block)
+        elif kind == 'total':
+            line(left + inset, top + inset, left + cell - inset, top + cell - inset)
+            line(left + cell - inset, top + inset, left + inset, top + cell - inset)
+
+    def _paint_cover(self):
+        scene = self.scene()
+        for item in self._cover_items:
+            scene.removeItem(item)
+        self._cover_items = []
+        enemy = self._cover_enemy
+        bm = self._bm
+        if enemy is None or bm is None or self._cover_kind is None:
+            return
+        pos = bm.get_pos(enemy)
+        if not pos:
+            return
+        cell = self.opts['cell']
+        tint = COVER_TINT.get(self._cover_kind, COVER_TINT['none'])
+        side = bm.cells_of(enemy) * cell
+        pen = QPen(QColor(tint[0], tint[1], tint[2]), 2.4)
+        pen.setCosmetic(True)
+        rect = scene.addRect(
+            pos[0] * cell, pos[1] * cell, side, side, pen,
+            QBrush(QColor(*tint)))
+        rect.setZValue(5)
+        rect.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
+        self._cover_items.append(rect)
 
     def _paint_condition_badges(self, item, enemy, x0, y0, box):
         from conditions import (active_conditions, condition_color, condition_short,

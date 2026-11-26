@@ -198,6 +198,9 @@ def capture_battle(source):
             'height': int(battle_map.height),
             'positions': positions,
         }
+        terrain = battle_map.terrain_records() if hasattr(battle_map, 'terrain_records') else []
+        if terrain:
+            map_state['terrain'] = terrain
 
     ignore = {}
     for key, value in (getattr(source, 'ignore_sides', None) or {}).items():
@@ -314,6 +317,8 @@ def apply_snapshot(snapshot, target):
         target.battle_map = None
     else:
         battle_map = BattleMap(int(map_state['width']), int(map_state['height']))
+        if hasattr(battle_map, 'load_terrain'):
+            battle_map.load_terrain(map_state.get('terrain'))
         positions = map_state.get('positions') or {}
         for side in new_sides:
             for enemy in side:
