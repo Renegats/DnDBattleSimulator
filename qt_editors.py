@@ -21,6 +21,25 @@ SCALAR_FIELDS = [('cr', 'Опасность (CR)'), ('prof_bonus', 'Бонус �
                  ('size', 'Размер'), ('type', 'Тип')]
 DICE = ['d4', 'd6', 'd8', 'd10', 'd12', 'd20']
 STRATS = ['случайная', 'агрессивная', 'защитная', 'поддержка']
+
+
+def strategy_name(strategy):
+    """Имя тактики для комбобокса. Неизвестные классы считаются случайными."""
+    return {
+        'AggressiveStrategy': 'агрессивная',
+        'DefensiveStrategy': 'защитная',
+        'SupportStrategy': 'поддержка',
+    }.get(type(strategy).__name__ if strategy is not None else '', 'случайная')
+
+
+def make_strategy(name):
+    from battle_strategies import (AggressiveStrategy, DefensiveStrategy,
+                                   RandomStrategy, SupportStrategy)
+    return {
+        'агрессивная': AggressiveStrategy,
+        'защитная': DefensiveStrategy,
+        'поддержка': SupportStrategy,
+    }.get(name, RandomStrategy)()
 CHAR_KEYS = ('ability_scores', 'ability_mods', 'saves', 'skills', 'senses',
              'vulnerabilities', 'resistances', 'immunities', 'condition_immunities',
              'languages', 'cr', 'prof_bonus', 'size', 'type', 'traits')
@@ -449,7 +468,8 @@ class SideCreatorDialog(QDialog):
         self.types = types
         self.mode = mode
         self.multiattack_data = None
-        self.setWindowTitle('Кого ведём в бой?' if mode == 'create' else 'Изменить состав')
+        titles = {'create': 'Кого ведём в бой?', 'spawn': 'Своё существо'}
+        self.setWindowTitle(titles.get(mode, 'Изменить состав'))
         self.resize(620, 780)
         outer = QVBoxLayout(self)
         self.stack = QStackedWidget()
@@ -521,7 +541,7 @@ class SideCreatorDialog(QDialog):
         back = QPushButton('← Назад')
         back.setProperty('variant', 'outline')
         back.clicked.connect(lambda: self.stack.setCurrentIndex(0))
-        create = QPushButton('✅ Создать сторону')
+        create = QPushButton('Готово' if mode == 'spawn' else '✅ Создать сторону')
         create.setProperty('variant', 'primary')
         create.clicked.connect(self.confirm)
         bottom.addWidget(back)

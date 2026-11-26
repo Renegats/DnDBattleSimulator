@@ -1,9 +1,8 @@
-"""GUI-независимый оркестратор раунда (фаза 1 миграции на Qt).
+"""Оркестратор раунда, независимый от интерфейса.
 
-Семантика близка к прежнему BattleLogic._run_round_inner, но БЕЗ tkinter:
-ни messagebox, ни вставки в виджет. Возвращает RoundResult: распаковка
+Ни диалогов, ни виджетов. Возвращает RoundResult: распаковка
 `outcome, text = run_round(...)` сохранена, текст собран из CombatEvent
-(`result.events`). Оба фронтенда зависят от этого модуля.
+(`result.events`).
 
 Ход внутри раунда — по инициативе 5e (d20 + мод Ловкости), а не сторона за стороной.
 """
@@ -33,6 +32,15 @@ def dex_modifier(enemy) -> int:
     return 0
 
 
+def _initiative_bonus(enemy) -> int:
+    """Дополнительный бонус к броску, помимо мода Ловкости. По умолчанию 0."""
+    raw = getattr(enemy, 'initiative_bonus', 0)
+    try:
+        return int(raw or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
 def dex_score(enemy) -> int:
     scores = getattr(enemy, 'ability_scores', None) or {}
     raw = scores.get('dex') if isinstance(scores, dict) else None
@@ -47,7 +55,8 @@ def dex_score(enemy) -> int:
 def living_initiative(sides, rng=None):
     """Живые существа по убыванию инициативы.
 
-    Бросок: d20 + мод Ловкости. Ничья: большее значение Ловкости, затем
+    Бросок: d20 + мод Ловкости + дополнительный бонус (по умолчанию 0).
+    Ничья: большее значение Ловкости, затем
     повторный d20. rng, если передан, бросает за всех; иначе — rng существа
     (внедряемый _rng, иначе модульный random).
     """
@@ -60,7 +69,7 @@ def living_initiative(sides, rng=None):
             if source is None:
                 source = getattr(enemy, '_rng', None) or random
             natural = source.randint(1, 20)
-            modifier = dex_modifier(enemy)
+            modifier = dex_modifier(enemy) + _initiative_bonus(enemy)
             total = natural + modifier
             tie = source.randint(1, 20)
             rows.append(InitiativeEntry(
@@ -132,6 +141,15 @@ def _close_turn(attacker, sides, round_no):
               for note in tick_rounds_and_saves(attacker, sides, round_no)]
     events.extend(_bound_events(turn_bounds(attacker, sides, 'end'), round_no, 'конец хода'))
     return events
+
+
+def _shot_blocked(battle_map, attacker, target):
+    """Полное укрытие. На пустой карте всегда ложь."""
+    if battle_map is None or not battle_map.has_terrain():
+        return False
+    if battle_map.get_pos(attacker) is None or battle_map.get_pos(target) is None:
+        return False
+    return battle_map.combat_cover(attacker, target) == 'total'
 
 
 def _fear_allow(battle_map, attacker, sides):
@@ -228,7 +246,9 @@ def _act_manual(attacker, manual, side_idx, sides, ignore_sides, battle_map,
     allow = _fear_allow(battle_map, attacker, sides)
     if battle_map is not None and battle_map.get_pos(attacker) and battle_map.get_pos(target):
         dist = battle_map.distance_ft(attacker, target)
-        if dist > reach and auto_move and budget - int(getattr(attacker, 'moved_ft', 0) or 0) >= 5:
+        blocked = _shot_blocked(battle_map, attacker, target)
+        if (dist > reach or blocked) and auto_move and budget - int(
+                getattr(attacker, 'moved_ft', 0) or 0) >= 5:
             origin = battle_map.get_pos(attacker)
             battle_map.move_towards(attacker, target, budget, reach_ft=reach, allow=allow)
             dest = battle_map.get_pos(attacker)
@@ -243,6 +263,7 @@ def _act_manual(attacker, manual, side_idx, sides, ignore_sides, battle_map,
                     text=(f'{attacker.name} перемещается {format_pos(origin)} → '
                           f'{format_pos(dest)}')))
             dist = battle_map.distance_ft(attacker, target)
+            blocked = _shot_blocked(battle_map, attacker, target)
         if dist > reach:
             events.append(CombatEvent(
                 kind='out_of_reach', round=round_no, actor=attacker.name,
@@ -252,6 +273,16 @@ def _act_manual(attacker, manual, side_idx, sides, ignore_sides, battle_map,
                 reason='ручное управление',
                 text=(f'{attacker.name} не может достать {target.name} '
                       f'({dist} фт > {reach} фт)')))
+            return
+        if blocked:
+            events.append(CombatEvent(
+                kind='out_of_reach', result='no_los', round=round_no,
+                actor=attacker.name, actor_id=id(attacker),
+                actor_side=getattr(attacker, 'side', None),
+                target=target.name, target_id=id(target),
+                target_side=getattr(target, 'side', None),
+                reason='ручное управление',
+                text=(f'{attacker.name} не видит {target.name}: полное укрытие')))
             return
     execute_strikes(attacker, target, [attack], sides, ignore_sides, battle_map,
                     crit_mode=crit_mode, round_no=round_no, events=events)
@@ -291,7 +322,7 @@ def _act_turn(attacker, side_idx, sides, side_names, ignore_sides, battle_map,
         return
 
     ignore = ignore_sides.get(side_idx, set())
-    decision = engine.decide(attacker, sides, ignore)
+    decision = engine.decide(attacker, sides, ignore, battle_map)
     target = decision.target
     breath = replacing_effect(attacker)
     plan_breath = should_replace_attacks(
@@ -345,9 +376,11 @@ def _act_turn(attacker, side_idx, sides, side_names, ignore_sides, battle_map,
     if battle_map is not None and \
             battle_map.get_pos(attacker) and battle_map.get_pos(target):
         dist = battle_map.distance_ft(attacker, target)
-        if decision.move_intent == 'hold' and dist <= move_reach:
+        blocked = _shot_blocked(battle_map, attacker, target)
+        if decision.move_intent == 'hold' and dist <= move_reach and not blocked:
             pass
-        elif dist > move_reach and auto_move and budget - int(getattr(attacker, 'moved_ft', 0) or 0) >= 5:
+        elif (dist > move_reach or blocked) and auto_move and budget - int(
+                getattr(attacker, 'moved_ft', 0) or 0) >= 5:
             origin = battle_map.get_pos(attacker)
             battle_map.move_towards(attacker, target, budget,
                                     reach_ft=move_reach, allow=allow)
@@ -364,6 +397,7 @@ def _act_turn(attacker, side_idx, sides, side_names, ignore_sides, battle_map,
                     text=(f'{attacker.name} перемещается {format_pos(origin)} → '
                           f'{format_pos(dest)}')))
             dist = battle_map.distance_ft(attacker, target)
+            blocked = _shot_blocked(battle_map, attacker, target)
         if plan_breath:
             fired = _replacing_special(
                 attacker, breath, sides, ignore, battle_map, target, round_no)
@@ -382,6 +416,16 @@ def _act_turn(attacker, side_idx, sides, side_names, ignore_sides, battle_map,
                 reason=decision.rationale or None,
                 text=(f'{attacker.name} не может достать {target.name} '
                       f'({dist} фт > {reach} фт)')))
+        elif blocked:
+            in_reach = False
+            events.append(CombatEvent(
+                kind='out_of_reach', result='no_los', round=round_no,
+                actor=attacker.name, actor_id=id(attacker),
+                actor_side=getattr(attacker, 'side', None),
+                target=getattr(target, 'name', None), target_id=id(target),
+                target_side=getattr(target, 'side', None),
+                reason=decision.rationale or None,
+                text=(f'{attacker.name} не видит {target.name}: полное укрытие')))
         elif decision.attack is None and decision.tier <= 1 \
                 and not getattr(attacker, 'multiattack', None):
             strikes = resolve_strikes(attacker, target)

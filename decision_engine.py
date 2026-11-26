@@ -10,6 +10,7 @@ from typing import List
 from conditions import (HARD_DISABLE, attack_modifiers, charm_blocks,
                         effective_speed, fear_sources, has_condition,
                         is_incapacitated)
+from terrain import COVER_RANK, COVER_TOTAL
 
 DMG_CANON_TRIGGERS = [
     ('bludgeoning', ['дроб', 'bludgeon']),
@@ -118,7 +119,7 @@ class DecisionEngine:
             self._round_log.append(kw)
 
     # ---------- главный вход ----------
-    def decide(self, attacker, sides, ignore):
+    def decide(self, attacker, sides, ignore, battle_map=None):
         from battle_strategies import distance_ft_between
 
         int_score = (attacker.ability_scores or {}).get('int')
@@ -147,6 +148,12 @@ class DecisionEngine:
 
         target, condition_note = self._condition_target(
             attacker, target, sides, ignore, tier)
+        if target is not None and battle_map is not None and battle_map.has_terrain():
+            target, terrain_note = self._terrain_target(
+                attacker, target, sides, ignore, battle_map)
+            if terrain_note:
+                condition_note = (f'{condition_note}; {terrain_note}'
+                                  if condition_note else terrain_note)
         if target is None:
             self._log(unit=attacker.name, side=attacker.side, int_score=int_score,
                       tier=tier, tier_name=TIER_NAMES[tier], archetype=arch,
@@ -160,7 +167,8 @@ class DecisionEngine:
         if condition_note:
             target_reason = f'{target_reason}; {condition_note}'
         if tier >= 2 and self._all_immune(attacker, target):
-            alt = self._first_not_fully_immune(attacker, sides, ignore, skip=target)
+            alt = self._first_not_fully_immune(
+                attacker, sides, ignore, skip=target, battle_map=battle_map)
             if alt is not None:
                 target_reason = (f'архетип {arch} выбрал {target.name}, но весь арсенал '
                                  f'иммунен -> A5 переключил на {alt.name}')
@@ -194,7 +202,8 @@ class DecisionEngine:
                             condition_note or '')
 
         dist_now = distance_ft_between(attacker, target)
-        attack, reason, candidates = self._pick_attack(attacker, target, tier, dist_now)
+        attack, reason, candidates = self._pick_attack(
+            attacker, target, tier, dist_now, battle_map)
 
         if attack is None:
             self._log(unit=attacker.name, side=attacker.side, int_score=int_score,
@@ -338,23 +347,75 @@ class DecisionEngine:
                 return False
         return True
 
-    def _first_not_fully_immune(self, attacker, sides, ignore, skip):
+    def _first_not_fully_immune(self, attacker, sides, ignore, skip, battle_map=None):
         for side_idx, side_enemies in enumerate(sides):
             if side_idx == attacker.side or side_idx in ignore \
                     or side_idx in getattr(attacker, 'ignore_sides', set()):
                 continue
             for e in side_enemies:
-                if e.alive and e is not skip and not self._all_immune(attacker, e):
-                    return e
+                if not (e.alive and e is not skip and not self._all_immune(attacker, e)):
+                    continue
+                if (battle_map is not None and battle_map.has_terrain()
+                        and not self._shot_possible(attacker, e, battle_map)):
+                    continue
+                return e
         return None
 
     # ---------- B1/B2/B3 ----------
-    def _pick_attack(self, attacker, target, tier, dist_now):
+    def _terrain_target(self, attacker, target, sides, ignore, battle_map):
+        """Не бьёт в полное укрытие, если есть кого видеть. Меньшее укрытие лучше."""
+        enemies = [enemy for enemy in self._enemies(attacker, sides, ignore)
+                   if self._shot_possible(attacker, enemy, battle_map)]
+        if not enemies:
+            return None, 'нет цели с линией обзора'
+        note = ''
+        if target not in enemies:
+            target = min(enemies, key=lambda enemy: battle_map.distance_ft(attacker, enemy))
+            note = 'цель за полным укрытием, выбрана доступная'
+        reach = self._reach(attacker)
+
+        def rank(enemy):
+            return COVER_RANK.get(battle_map.combat_cover(attacker, enemy), 0)
+
+        visible = [enemy for enemy in enemies
+                   if battle_map.combat_cover(attacker, enemy) != COVER_TOTAL
+                   and battle_map.distance_ft(attacker, enemy) <= reach]
+        if visible and target not in visible:
+            target = min(visible, key=lambda enemy: (
+                rank(enemy), battle_map.distance_ft(attacker, enemy),
+                getattr(enemy, 'hp', 0)))
+            extra = 'бьёт видимую цель'
+            note = f'{note}; {extra}' if note else extra
+        elif visible and rank(target) > 0:
+            better = [enemy for enemy in visible if rank(enemy) < rank(target)]
+            if better:
+                target = min(better, key=lambda enemy: (rank(enemy), getattr(enemy, 'hp', 0)))
+                extra = 'предпочитает цель с меньшим укрытием'
+                note = f'{note}; {extra}' if note else extra
+        return target, note
+
+    def _shot_possible(self, attacker, enemy, battle_map):
+        if battle_map.get_pos(attacker) is None or battle_map.get_pos(enemy) is None:
+            return True
+        reach = self._reach(attacker)
+        if (battle_map.combat_cover(attacker, enemy) != COVER_TOTAL
+                and battle_map.distance_ft(attacker, enemy) <= reach):
+            return True
+        speed = effective_speed(attacker)
+        if battle_map.can_reach_shot(attacker, enemy, speed, reach):
+            return True
+        return battle_map.can_reach_shot(attacker, enemy, max(int(speed or 0), 1000), reach)
+
+    def _pick_attack(self, attacker, target, tier, dist_now, battle_map=None):
         use_defense = tier >= 2
         use_hit = tier >= 3
         raw_imm = list(getattr(target, 'immunities', []) or [])
         raw_res = list(getattr(target, 'resistances', []) or [])
         ac = getattr(target, 'ac', 10)
+        if battle_map is not None and battle_map.has_terrain():
+            bonus, _cover = battle_map.cover_bonus(attacker, target)
+            if bonus:
+                ac += bonus
 
         def metrics(a):
             magical = bool(getattr(a, 'magical', False))

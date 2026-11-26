@@ -93,7 +93,10 @@ class TestQtCombatLog(unittest.TestCase):
             scene = win.map_view.scene()
             # Сначала убираем стрелки раунда, чтобы считать только сетку и токены.
             win.map_view.set_round_lines([])
-            base_ids = {id(item) for item in scene.items()}
+            # Список держим живым: иначе сборщик может выбросить обёртки
+            # QGraphicsItem, и следующий scene.items() получит другие id.
+            base_items = list(scene.items())
+            base_ids = {id(item) for item in base_items}
             spec = {'x1': 0, 'y1': 0, 'x2': 3, 'y2': 0, 'r1': 0.5, 'r2': 0.5, 'style': 'crit'}
             win.map_view.set_round_lines([spec])
             mid = len(scene.items())
@@ -111,6 +114,7 @@ class TestQtCombatLog(unittest.TestCase):
             self.assertTrue(win.map_view._focus_items)
             self.assertTrue(win.map_view._focus_lines)
             self.assertTrue(base_ids.issubset({id(item) for item in scene.items()}))
+            del base_items
         finally:
             win.close()
 

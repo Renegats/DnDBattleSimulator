@@ -31,11 +31,12 @@ CHAR_KEYS = ('ability_scores', 'ability_mods', 'saves', 'skills', 'senses',
 class BestiaryDialog(QDialog):
     imported = pyqtSignal(str)
 
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, embedded=False):
         super().__init__(parent)
+        self._embedded = bool(embedded)
         self.pal = current_palette()
         self.setWindowTitle('📖 Импорт монстров из бестиария')
-        self.setSizeGripEnabled(True)
+        self.setSizeGripEnabled(not self._embedded)
         self._guard = qt_async.Guard()
         self._req = 0
         self._pic_req = 0
@@ -46,7 +47,11 @@ class BestiaryDialog(QDialog):
         self._busy_text = ''
 
         self._build()
-        self._fit_screen(parent)
+        if self._embedded:
+            self.setMinimumSize(300, 360)
+            self.setWindowFlags(Qt.WindowType.Widget)
+        else:
+            self._fit_screen(parent)
 
         self._timer = QTimer(self)
         self._timer.setInterval(90)
@@ -56,8 +61,9 @@ class BestiaryDialog(QDialog):
     def _build(self):
         p = self.pal
         lay = QVBoxLayout(self)
-        lay.setContentsMargins(14, 12, 14, 12)
-        lay.setSpacing(10)
+        margin = 8 if self._embedded else 14
+        lay.setContentsMargins(margin, margin, margin, margin)
+        lay.setSpacing(8 if self._embedded else 10)
 
         search = QGroupBox('Поиск монстра')
         sr = QHBoxLayout(search)
@@ -76,13 +82,16 @@ class BestiaryDialog(QDialog):
         sr.addWidget(self.btn_search)
         lay.addWidget(search)
 
-        split = QSplitter(Qt.Orientation.Horizontal)
+        split = QSplitter(Qt.Orientation.Vertical if self._embedded
+                          else Qt.Orientation.Horizontal)
         split.setChildrenCollapsible(False)
 
         rbox = QGroupBox('Результаты поиска')
         rl = QVBoxLayout(rbox)
         self.list = QListWidget()
-        self.list.setMinimumWidth(230)
+        self.list.setMinimumWidth(160 if self._embedded else 230)
+        if self._embedded:
+            self.list.setMaximumHeight(180)
         self.list.currentRowChanged.connect(self.pick)
         self.list.itemDoubleClicked.connect(lambda *_: self.pick(self.list.currentRow()))
         rl.addWidget(self.list)
@@ -119,6 +128,9 @@ class BestiaryDialog(QDialog):
         close.setMinimumHeight(34)
         close.setCursor(Qt.CursorShape.PointingHandCursor)
         close.clicked.connect(self.reject)
+        self.btn_close = close
+        if self._embedded:
+            close.hide()
         self.btn_import = QPushButton('✨  Импортировать в симулятор')
         self.btn_import.setProperty('variant', 'primary')
         self.btn_import.setMinimumHeight(34)
@@ -151,7 +163,8 @@ class BestiaryDialog(QDialog):
 
     def showEvent(self, e):
         super().showEvent(e)
-        self._fit_screen(self.parentWidget())
+        if not self._embedded:
+            self._fit_screen(self.parentWidget())
 
     # =================Busy =================
     def _busy(self, on, text=''):
@@ -545,6 +558,9 @@ class BestiaryDialog(QDialog):
         if urls:
             portraits.pick(m['name'], self._pic_index)
         self.imported.emit(m['name'])
+        if self._embedded:
+            self.status.setText(f"Импортировано: {m['name']}. Тип доступен в составе стороны.")
+            return
         self.accept()
 
     # ================= жизненный цикл =================
@@ -554,11 +570,15 @@ class BestiaryDialog(QDialog):
         super().closeEvent(e)
 
     def reject(self):
+        if self._embedded:
+            return
         self._guard.drop()
         self._timer.stop()
         super().reject()
 
     def accept(self):
+        if self._embedded:
+            return
         self._guard.drop()
         self._timer.stop()
         super().accept()
