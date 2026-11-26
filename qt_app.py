@@ -1,6 +1,7 @@
-"""Qt-фронтенд симулятора: полное приложение на общем ядре.
+"""Qt-фронтенд симулятора: карта в центре, тулбар и прячущаяся панель.
 
-Карта боя имеет постоянно видимую панель отображения (живые настройки + экспорт).
+Редкие правила собраны в диалоге «Настройки боя». Вкладка армий остаётся
+отдельной страницей: перенос на карту — следующий шаг, см. docs/ui-redesign.md.
 """
 import json
 import os
@@ -8,15 +9,18 @@ import random
 import sys
 from datetime import datetime
 
-from PyQt6.QtCore import Qt, QEventLoop, QTimer
-from PyQt6.QtGui import QAction, QKeySequence, QPixmap
+from PyQt6.QtCore import QSettings, QSize, Qt, QEventLoop, QTimer
+from PyQt6.QtGui import QAction, QActionGroup, QColor, QKeySequence, QPixmap
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QHBoxLayout, QGridLayout, QLabel, QLineEdit, QSpinBox,
                              QComboBox, QPushButton, QCheckBox,
-                             QScrollArea, QSplitter, QStackedWidget, QGroupBox, QFrame,
+                             QScrollArea, QStackedWidget, QGroupBox, QFrame,
                              QMessageBox, QFileDialog, QDialog, QTableWidget,
-                             QTableWidgetItem, QHeaderView, QButtonGroup, QSlider,
-                             QMenu)
+                             QTableWidgetItem, QHeaderView, QSlider,
+                             QMenu, QDockWidget, QToolBar, QToolButton, QTabWidget,
+                             QListWidget, QListWidgetItem, QSizePolicy)
+
+from qt_icons import tool_icon
 
 import battle_round
 from battle_history import BattleHistory, apply_snapshot, capture_battle, ensure_uid
@@ -38,6 +42,8 @@ from qt_editors import SideCreatorDialog, CreatureEditDialog, Section, STRATS
 from battle_map_model import BattleMap
 
 MAX_SIDES = 26
+SETTINGS_ORG = 'Renegats'
+SETTINGS_APP = 'DnDBattleSimulator'
 
 
 def types_available():
@@ -98,6 +104,7 @@ class MainWindow(QMainWindow):
         self.dirty, self.suspend = set(), False
         self.cols = 3
         self._icon_buttons = []
+        self._tool_icons = []
         self.history = BattleHistory()
         self._manual_loop = None
         self._manual_subjects = set()
@@ -105,111 +112,365 @@ class MainWindow(QMainWindow):
         self._history_ready = False
         self._suspend_history = False
         self._current = None
+        self._round_busy = False
+        self._nav_index = 0
+        self._auto_timer = QTimer(self)
+        self._auto_timer.setInterval(700)
+        self._auto_timer.timeout.connect(self._auto_tick)
+
+        self._create_menus()
+        self._install_history_controls()
+        self._install_batch_menu()
+        self._batch_dialog = None
 
         root = QWidget()
         self.setCentralWidget(root)
         v = QVBoxLayout(root)
-        v.setContentsMargins(12, 8, 12, 0)
-        v.setSpacing(6)
-
-        top = QGridLayout()
-        top.setContentsMargins(0, 0, 0, 0)
-        top.setColumnStretch(0, 1)
-        top.setColumnStretch(2, 1)
-        self._install_history_controls()
-        self._install_batch_menu()
-        self._batch_dialog = None
-        left_host = QWidget()
-        left = QHBoxLayout(left_host)
-        left.setContentsMargins(0, 0, 0, 0)
-        left.setSpacing(6)
-        left.addWidget(self.btn_undo)
-        left.addWidget(self.btn_redo)
-        left.addStretch()
-        top.addWidget(left_host, 0, 0, Qt.AlignmentFlag.AlignLeft)
-        nav_host = QWidget()
-        nav = QHBoxLayout(nav_host)
-        nav.setContentsMargins(0, 0, 0, 0)
-        nav.setSpacing(6)
-        self.nav_group = QButtonGroup(self)
-        self.nav_group.setExclusive(True)
-        self.nav_buttons = []
-        for i, name in enumerate(('Настройка армий', 'Битва', 'Альянсы', 'Карта боя')):
-            b = QPushButton(name)
-            b.setCheckable(True)
-            b.setMinimumWidth(152)
-            b.setMinimumHeight(36)
-            b.setCursor(Qt.CursorShape.PointingHandCursor)
-            b.clicked.connect(lambda _=False, idx=i: self.select_tab(idx))
-            self.nav_group.addButton(b, i)
-            nav.addWidget(b)
-            self.nav_buttons.append(b)
-        top.addWidget(nav_host, 0, 1, Qt.AlignmentFlag.AlignCenter)
-        right_host = QWidget()
-        right = QHBoxLayout(right_host)
-        right.setContentsMargins(0, 0, 0, 0)
-        right.addStretch()
-        self.theme_btn = IconButton('moon' if self.theme.current == 'dark' else 'sun',
-                                    self.theme.palette(), size=40)
-        self.theme_btn.setToolTip('Переключить тему')
-        self.theme_btn.clicked.connect(self.toggle_theme)
-        right.addWidget(self.theme_btn)
-        self._icon_buttons.append(self.theme_btn)
-        top.addWidget(right_host, 0, 2)
-        v.addLayout(top)
-
+        v.setContentsMargins(0, 0, 0, 0)
+        v.setSpacing(0)
         self.stack = QStackedWidget()
-        v.addWidget(self.stack, 1)
+        v.addWidget(self.stack)
         self.stack.addWidget(self._build_setup())
-        self.stack.addWidget(self._build_battle())
-        self.stack.addWidget(self._build_alliances())
-        self.stack.addWidget(self._build_map())
+        self.map_page = self._build_map()
+        self.stack.addWidget(self.map_page)
 
-        sep = QFrame()
-        sep.setProperty('role', 'sep')
-        sep.setFixedHeight(2)
-        v.addWidget(sep)
-        bar = QFrame()
-        bar.setProperty('role', 'bar')
-        bl = QHBoxLayout(bar)
-        bl.setContentsMargins(10, 7, 10, 7)
-        self.sub_holder = QHBoxLayout()
-        self.sub_holder.setSpacing(6)
-        bl.addStretch()
-        bl.addLayout(self.sub_holder)
-        bl.addStretch()
-        v.addWidget(bar)
+        self.roster_page = self._build_roster()
+        self.log_page = self._build_log_tab()
+        self._build_settings_dialog()
+        self._build_dock()
+        self._build_toolbar()
+        self._fill_menus()
 
         self.status = self.statusBar()
-        self.status.showMessage('Создайте армии на вкладке «Настройка армий».')
+        self.status.showMessage(
+            'Карта — основная сцена. Стороны собираются отдельно: кнопка армий или меню «Вид».')
         self.add_card()
         self.add_card()
-        self.select_tab(0)
+        page = self._restore_layout()
+        self.select_tab(page)
+        self._refresh_initiative()
         self._current = capture_battle(self)
         self._history_ready = True
         self._sync_history_actions()
+        self._sync_auto_buttons()
 
-    # ================= вкладки =================
+    # ================= каркас окна =================
+    def _create_menus(self):
+        bar = self.menuBar()
+        self.menu_file = bar.addMenu('Файл')
+        self.menu_edit = bar.addMenu('Правка')
+        self.menu_battle = bar.addMenu('Бой')
+        self.menu_sim = bar.addMenu('Симуляция')
+        self.menu_view = bar.addMenu('Вид')
+
+    def _settings(self):
+        app = QApplication.instance()
+        name = SETTINGS_APP
+        if app is not None and app.platformName() == 'offscreen':
+            name += '.test'
+        return QSettings(SETTINGS_ORG, name)
+
     def select_tab(self, idx):
-        self.stack.setCurrentIndex(idx)
-        self.nav_buttons[idx].setChecked(True)
-        clear_layout(self.sub_holder)
-        tools = {
-            0: [('Сохранить настройки', self.save_settings),
-                ('Загрузить настройки', self.load_settings)],
-            1: [('Показать статус', self.show_status),
-                ('Очистить результаты', self.clear_log)],
-            2: [('Применить настройки альянсов', self.apply_alliances)],
-            3: [('🎲 Расставить случайно', self.place_random),
-                ('🛡 Расставить строем', self.place_formation)],
-        }[idx]
-        for text, fn in tools:
-            b = QPushButton(text)
-            b.setProperty('variant', 'outline')
-            b.setMinimumHeight(32)
-            b.setCursor(Qt.CursorShape.PointingHandCursor)
-            b.clicked.connect(fn)
-            self.sub_holder.addWidget(b)
+        try:
+            idx = int(idx)
+        except (TypeError, ValueError):
+            idx = 0
+        if idx not in (0, 1, 2, 3):
+            idx = 0
+        self._nav_index = idx
+        self.stack.setCurrentIndex(0 if idx == 0 else 1)
+        armies = idx == 0
+        if hasattr(self, 'armies_btn'):
+            self.armies_btn.blockSignals(True)
+            self.armies_btn.setChecked(armies)
+            self.armies_btn.blockSignals(False)
+        for action, on in ((getattr(self, 'act_armies_page', None), armies),
+                           (getattr(self, 'act_map_page', None), not armies)):
+            if action is None:
+                continue
+            action.blockSignals(True)
+            action.setChecked(on)
+            action.blockSignals(False)
+        if idx == 1 and hasattr(self, 'side_tabs'):
+            self.side_dock.show()
+            self.side_tabs.setCurrentIndex(0)
+        if idx == 2 and hasattr(self, 'settings_dialog'):
+            self._show_settings('alliances')
+
+    def _tool_button(self, kind, tip, slot, name, checkable=False):
+        button = QToolButton()
+        button.setObjectName(name)
+        button.setAutoRaise(True)
+        button.setCheckable(checkable)
+        button.setIconSize(QSize(20, 20))
+        button.setFixedSize(36, 36)
+        button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonIconOnly)
+        button.setToolTip(tip)
+        button.setStatusTip(tip)
+        button.setCursor(Qt.CursorShape.PointingHandCursor)
+        button.clicked.connect(slot)
+        self._tool_icons.append((button, kind))
+        return button
+
+    def _apply_tool_icons(self):
+        color = self.theme.palette()['fg']
+        for button, kind in self._tool_icons:
+            button.setIcon(tool_icon(kind, color))
+        self._refresh_tab_icons()
+
+    def _refresh_tab_icons(self):
+        tabs = getattr(self, 'side_tabs', None)
+        if tabs is None:
+            return
+        color = self.theme.palette()['fg']
+        for index, kind in ((0, 'roster'), (1, 'log'), (2, 'book')):
+            if index < tabs.count():
+                tabs.setTabIcon(index, tool_icon(kind, color, 18))
+
+    def _build_toolbar(self):
+        bar = QToolBar('Бой')
+        bar.setObjectName('battle_toolbar')
+        bar.setMovable(True)
+        bar.setFloatable(True)
+        bar.setOrientation(Qt.Orientation.Vertical)
+        bar.setIconSize(QSize(20, 20))
+        bar.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonIconOnly)
+        self.battle_toolbar = bar
+        self.addToolBar(Qt.ToolBarArea.LeftToolBarArea, bar)
+
+        self.armies_btn = self._tool_button(
+            'armies', 'Настройка армий', self._on_armies_button, 'armies_button',
+            checkable=True)
+        self.create_btn = self._tool_button(
+            'create', 'Создать армии', self.create_armies, 'create_button')
+        self.round_btn = self._tool_button(
+            'next', 'Следующий раунд', self.run_round, 'round_button')
+        self.auto_btn = self._tool_button(
+            'play', 'Автобой — раунды идут, пока не пауза или конец боя',
+            self.start_auto, 'auto_button')
+        self.pause_btn = self._tool_button(
+            'pause', 'Пауза автобоя', self.pause_auto, 'pause_button')
+        self.settings_btn = self._tool_button(
+            'settings', 'Настройки боя', self._show_settings, 'settings_button')
+        self.theme_btn = IconButton('moon' if self.theme.current == 'dark' else 'sun',
+                                    self.theme.palette(), size=36)
+        self.theme_btn.setToolTip('Переключить тему')
+        self.theme_btn.setStatusTip('Переключить тему')
+        self.theme_btn.clicked.connect(self.toggle_theme)
+        self._icon_buttons.append(self.theme_btn)
+
+        for button in (self.armies_btn,):
+            bar.addWidget(button)
+        bar.addSeparator()
+        for button in (self.create_btn, self.round_btn, self.auto_btn, self.pause_btn):
+            bar.addWidget(button)
+        bar.addSeparator()
+        bar.addWidget(self.btn_undo)
+        bar.addWidget(self.btn_redo)
+        bar.addSeparator()
+        bar.addWidget(self.settings_btn)
+        spacer = QWidget()
+        spacer.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Expanding)
+        bar.addWidget(spacer)
+        bar.addWidget(self.theme_btn)
+        self._apply_tool_icons()
+
+    def _on_armies_button(self, checked):
+        self.select_tab(0 if checked else 3)
+
+    def _show_settings(self, section=None):
+        if section == 'alliances' and hasattr(self, '_sec_alliances'):
+            self._sec_alliances.arrow.setChecked(True)
+        self.settings_dialog.show()
+        self.settings_dialog.raise_()
+        self.settings_dialog.activateWindow()
+
+    def _save_layout(self):
+        settings = self._settings()
+        settings.setValue('geometry', self.saveGeometry())
+        settings.setValue('windowState', self.saveState())
+        if hasattr(self, 'side_tabs'):
+            settings.setValue('dockTab', self.side_tabs.currentIndex())
+        settings.setValue('page', self._nav_index)
+        if getattr(self, 'settings_dialog', None) is not None:
+            settings.setValue('settingsGeometry', self.settings_dialog.saveGeometry())
+
+    def _restore_layout(self):
+        settings = self._settings()
+        geometry = settings.value('geometry')
+        if geometry is not None:
+            self.restoreGeometry(geometry)
+        state = settings.value('windowState')
+        if state is not None:
+            self.restoreState(state)
+        tab = settings.value('dockTab')
+        if tab is not None and hasattr(self, 'side_tabs'):
+            try:
+                self.side_tabs.setCurrentIndex(int(tab))
+            except (TypeError, ValueError):
+                pass
+        dialog_geo = settings.value('settingsGeometry')
+        if dialog_geo is not None and getattr(self, 'settings_dialog', None) is not None:
+            self.settings_dialog.restoreGeometry(dialog_geo)
+        page = settings.value('page', 0)
+        try:
+            page = int(page)
+        except (TypeError, ValueError):
+            page = 0
+        return page if page in (0, 1, 2, 3) else 0
+
+    def closeEvent(self, event):
+        self.pause_auto()
+        if self.isVisible():
+            self._save_layout()
+        super().closeEvent(event)
+
+    def _menu_action(self, menu, text, slot, name=None, checkable=False, tip=None):
+        action = QAction(text, self)
+        if name:
+            action.setObjectName(name)
+        action.setCheckable(checkable)
+        if tip:
+            action.setToolTip(tip)
+            action.setStatusTip(tip)
+        else:
+            action.setStatusTip(text)
+        action.triggered.connect(slot)
+        menu.addAction(action)
+        return action
+
+    def _fill_menus(self):
+        self._menu_action(self.menu_file, 'Сохранить настройки', self.save_settings)
+        self._menu_action(self.menu_file, 'Загрузить настройки', self.load_settings)
+        self.menu_file.addSeparator()
+        self._menu_action(self.menu_file, 'Экспорт журнала', self.export_log)
+        self._menu_action(self.menu_file, 'Экспорт карты PNG', self.export_map_png)
+        self.menu_file.addSeparator()
+        self._menu_action(self.menu_file, 'Выход', self.close)
+
+        self.act_round = self._menu_action(
+            self.menu_battle, 'Провести раунд', self.run_round, 'act_round',
+            tip='Следующий раунд')
+        self.act_auto = self._menu_action(
+            self.menu_battle, 'Автобой', self.start_auto, 'act_auto',
+            tip='Раунды идут сами, пока не пауза или конец боя')
+        self.act_pause = self._menu_action(
+            self.menu_battle, 'Пауза', self.pause_auto, 'act_pause',
+            tip='Остановить автобой')
+        self._menu_action(self.menu_battle, 'Создать армии', self.create_armies)
+        self.menu_battle.addSeparator()
+        self.act_manual = QAction('Ручное управление', self)
+        self.act_manual.setObjectName('act_manual')
+        self.act_manual.setCheckable(True)
+        self.act_manual.setToolTip(self.manual_toggle.toolTip())
+        self.act_manual.setStatusTip(self.manual_toggle.toolTip())
+        self.act_manual.toggled.connect(self._on_manual_action)
+        self.menu_battle.addAction(self.act_manual)
+        scope = self.menu_battle.addMenu('Кого вести вручную')
+        self.act_scope_one = QAction('Выбранное существо', self)
+        self.act_scope_side = QAction('Сторона выбранного', self)
+        scope_group = QActionGroup(self)
+        scope_group.setExclusive(True)
+        for action, index in ((self.act_scope_one, 0), (self.act_scope_side, 1)):
+            action.setCheckable(True)
+            scope_group.addAction(action)
+            scope.addAction(action)
+            action.triggered.connect(lambda _checked=False, i=index: self._set_manual_scope(i))
+        self.act_scope_one.setChecked(True)
+        self.menu_battle.addSeparator()
+        self._menu_action(self.menu_battle, 'Расставить случайно', self.place_random)
+        self._menu_action(self.menu_battle, 'Расставить строем', self.place_formation)
+        self._menu_action(self.menu_battle, 'Массовое редактирование', self.mass_edit)
+        self._menu_action(self.menu_battle, 'Показать статус', self.show_status)
+        self._menu_action(self.menu_battle, 'Применить альянсы', self.apply_alliances)
+        self.menu_battle.addSeparator()
+        self.act_settings = self._menu_action(
+            self.menu_battle, 'Настройки боя…', self._show_settings, 'act_settings')
+
+        self._menu_action(self.menu_sim, 'Анализ сражения', self.open_analysis)
+
+        self.act_armies_page = self._menu_action(
+            self.menu_view, 'Настройка армий', lambda: self.select_tab(0),
+            checkable=True)
+        self.act_map_page = self._menu_action(
+            self.menu_view, 'Карта боя', lambda: self.select_tab(3), checkable=True)
+        pages = QActionGroup(self)
+        pages.setExclusive(True)
+        pages.addAction(self.act_armies_page)
+        pages.addAction(self.act_map_page)
+        self.act_armies_page.setChecked(True)
+        self.menu_view.addSeparator()
+        dock_action = self.side_dock.toggleViewAction()
+        dock_action.setText('Панель боя')
+        self.menu_view.addAction(dock_action)
+        self._menu_action(self.menu_view, 'Участники', lambda: self._show_dock_tab(0))
+        self._menu_action(self.menu_view, 'Журнал', lambda: self._show_dock_tab(1))
+        self._menu_action(self.menu_view, 'Бестиарий', lambda: self._show_dock_tab(2))
+        self.menu_view.addSeparator()
+        self._menu_action(self.menu_view, 'Переключить тему', self.toggle_theme)
+        self._menu_action(self.menu_view, 'Сбросить расположение панелей', self.reset_layout)
+
+    def _show_dock_tab(self, index):
+        self.side_dock.show()
+        self.side_dock.raise_()
+        self.side_tabs.setCurrentIndex(index)
+
+    def reset_layout(self):
+        self.addToolBar(Qt.ToolBarArea.LeftToolBarArea, self.battle_toolbar)
+        self.battle_toolbar.show()
+        self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self.side_dock)
+        self.side_dock.show()
+        self.resizeDocks([self.side_dock], [420], Qt.Orientation.Horizontal)
+        self.side_tabs.setCurrentIndex(0)
+        self.status.showMessage('Расположение панелей сброшено.')
+
+    def _on_manual_action(self, checked):
+        if self.manual_toggle.isChecked() != bool(checked):
+            self.manual_toggle.setChecked(bool(checked))
+
+    def _set_manual_scope(self, index):
+        self.manual_scope.setCurrentIndex(index)
+
+    def _sync_auto_buttons(self):
+        running = self._auto_timer.isActive()
+        self.auto_btn.setEnabled(not running)
+        self.pause_btn.setEnabled(running)
+        if hasattr(self, 'act_auto'):
+            self.act_auto.setEnabled(not running)
+            self.act_pause.setEnabled(running)
+
+    def start_auto(self):
+        if not self.sides:
+            QMessageBox.warning(self, 'Автобой',
+                                'Сначала создайте армии на странице «Настройка армий».')
+            return
+        if self._auto_timer.isActive():
+            return
+        self.select_tab(3)
+        self._auto_timer.start()
+        self._sync_auto_buttons()
+        self.status.showMessage('Автобой. Пауза остановит его после текущего раунда.')
+        self._auto_tick()
+
+    def pause_auto(self):
+        was = self._auto_timer.isActive()
+        self._auto_timer.stop()
+        self._sync_auto_buttons()
+        if was:
+            self.status.showMessage('Автобой на паузе.')
+
+    def _auto_tick(self):
+        if not self._auto_timer.isActive():
+            return
+        if self._round_busy or self._manual_loop is not None:
+            return
+        if not self.sides:
+            self.pause_auto()
+            return
+        self.run_round()
+
+    def _on_bestiary_import(self, name):
+        self.status.showMessage(f'Бестиарий: импортирован «{name}».')
 
     def toggle_theme(self):
         name = self.theme.toggle()
@@ -220,11 +481,14 @@ class MainWindow(QMainWindow):
         for c in self.cards:
             c['frame'].set_palette(pal)
         self.map_view.set_palette(pal)
+        self._apply_tool_icons()
+        if getattr(self, 'bestiary', None) is not None:
+            self.bestiary.pal = pal
         self.status.showMessage(f'Тема: {"тёмная" if name == "dark" else "светлая"}')
 
     # ================= отмена / повтор =================
     def _install_history_controls(self):
-        edit = self.menuBar().addMenu('Правка')
+        edit = self.menu_edit
         self.undo_action = QAction('Отменить', self)
         self.undo_action.setObjectName('undo')
         self.undo_action.setShortcut(QKeySequence('Ctrl+Z'))
@@ -243,15 +507,18 @@ class MainWindow(QMainWindow):
         self.addAction(self.undo_action)
         self.addAction(self.redo_action)
 
-        self.btn_undo = QPushButton('Отменить')
-        self.btn_redo = QPushButton('Повторить')
-        for button, action in ((self.btn_undo, self.undo_action),
-                               (self.btn_redo, self.redo_action)):
+        self.btn_undo = QToolButton()
+        self.btn_redo = QToolButton()
+        for button, action, kind in ((self.btn_undo, self.undo_action, 'undo'),
+                                     (self.btn_redo, self.redo_action, 'redo')):
             button.setObjectName(action.objectName() + '_button')
-            button.setMinimumHeight(32)
-            button.setMinimumWidth(112)
+            button.setAutoRaise(True)
+            button.setIconSize(QSize(20, 20))
+            button.setFixedSize(36, 36)
+            button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonIconOnly)
             button.setCursor(Qt.CursorShape.PointingHandCursor)
             button.clicked.connect(action.trigger)
+            self._tool_icons.append((button, kind))
 
     def _sync_history_actions(self):
         undo = self.history.undo_label()
@@ -270,7 +537,7 @@ class MainWindow(QMainWindow):
         self.btn_redo.setToolTip(self.redo_action.toolTip())
 
     def _install_batch_menu(self):
-        menu = self.menuBar().addMenu('Симуляция')
+        menu = self.menu_sim
         action = QAction('Пакетная симуляция…', self)
         action.setObjectName('batch_sim_action')
         action.triggered.connect(self.open_batch)
@@ -395,14 +662,10 @@ class MainWindow(QMainWindow):
                 map_marks(self._latest_round_events(), self._token_radius))
             self.map_view.set_focus_lines([])
             if self.selected is not None:
-                pos = None if self.battle_map is None else self.battle_map.get_pos(self.selected)
-                left = self.selected.speed - getattr(self.selected, 'moved_ft', 0)
-                self.map_info.setText(
-                    f'{self.selected.name}: HP {self.selected.hp}/{self.selected.max_hp}, '
-                    f'AC {self.selected.ac}, клетка {pos}, скорость {self.selected.speed} фт, '
-                    f'остаток {left} фт')
+                self.map_info.setText(self._token_line(self.selected))
             else:
                 self.map_info.setText('Токен не выбран.')
+            self._refresh_initiative()
         finally:
             self._suspend_history = False
         self._current = snapshot
@@ -688,6 +951,7 @@ class MainWindow(QMainWindow):
             self._portrait_async(card, search=not portraits.urls_for(card['type']))
 
     def create_armies(self):
+        self.pause_auto()
         try:
             self.sides, self.side_names = [], []
             strat_cls = {'случайная': RandomStrategy, 'агрессивная': AggressiveStrategy,
@@ -716,12 +980,14 @@ class MainWindow(QMainWindow):
             self.rebuild_battle_lists()
             self.refresh_alliances()
             self.map_view.rebuild(self.battle_map, self.sides, self.selected)
+            self.map_info.setText('Токен не выбран.')
             self.map_view.set_round_lines([])
             self.map_view.set_area_cells([])
             self.map_view.set_preview_cells([])
             self.map_view.set_focus_areas([])
             self.log_panel.clear()
             self.log_panel.set_roster(self.sides, self.side_names)
+            self._refresh_initiative()
             total = sum(len(s) for s in self.sides)
             self.battle_events.extend(self.log_panel.add_note(
                 f'Армии созданы: сторон {n}, существ {total}.'))
@@ -734,39 +1000,135 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, 'Ошибка', f'Ошибка при создании армий: {e}')
 
     # ================= битва =================
-    def _build_battle(self):
+    def _outline(self, text, slot, name=None):
+        button = QPushButton(text)
+        button.setProperty('variant', 'outline')
+        button.setCursor(Qt.CursorShape.PointingHandCursor)
+        button.clicked.connect(slot)
+        if name:
+            button.setObjectName(name)
+        return button
+
+    def _build_roster(self):
         page = QWidget()
         lay = QVBoxLayout(page)
+        lay.setContentsMargins(8, 8, 8, 8)
+        lay.setSpacing(8)
+        cap = QLabel('Порядок хода')
+        cap.setProperty('role', 'title')
+        lay.addWidget(cap)
+        self.initiative_list = QListWidget()
+        self.initiative_list.setObjectName('initiative_list')
+        self.initiative_list.setMaximumHeight(168)
+        self.initiative_list.itemDoubleClicked.connect(self._focus_initiative_item)
+        lay.addWidget(self.initiative_list)
         self.battle_scroll = QScrollArea()
         self.battle_scroll.setWidgetResizable(True)
         self.battle_host = QWidget()
         self.battle_lay = QVBoxLayout(self.battle_host)
+        self.battle_lay.setContentsMargins(0, 0, 0, 0)
         self.battle_scroll.setWidget(self.battle_host)
-        lay.addWidget(self.battle_scroll, 2)
+        lay.addWidget(self.battle_scroll, 1)
+        lay.addWidget(self._outline('Массовое редактирование', self.mass_edit))
+        return page
+
+    def _build_log_tab(self):
+        page = QWidget()
+        lay = QVBoxLayout(page)
+        lay.setContentsMargins(8, 8, 8, 8)
+        lay.setSpacing(6)
         self.log_panel = CombatLogPanel()
         self.log_panel.entry_activated.connect(self.on_log_entry)
-        lay.addWidget(self.log_panel, 3)
+        lay.addWidget(self.log_panel, 1)
         row = QHBoxLayout()
-        for text, fn in (('▶  Провести раунд боя', self.run_round),
-                         ('Пакетная симуляция…', self.open_batch),
-                         ('Массовое редактирование', self.mass_edit),
-                         ('📋 Копировать лог', self.copy_log),
-                         ('💾 Экспорт журнала', self.export_log),
-                         ('🔍 Анализ сражения', self.open_analysis)):
-            b = QPushButton(text)
-            b.setCursor(Qt.CursorShape.PointingHandCursor)
-            b.clicked.connect(fn)
-            if text.startswith('▶'):
-                b.setProperty('variant', 'primary')
-                b.setMinimumHeight(38)
-                self.round_btn = b
-            if text.startswith('Пакетная'):
-                b.setObjectName('batch_sim')
-                self.batch_btn = b
-            if 'Копировать' in text:
-                self.copy_btn = b
-            row.addWidget(b)
-        row.addStretch()
+        row.setSpacing(6)
+        self.copy_btn = self._outline('📋 Копировать лог', self.copy_log, 'copy_log')
+        row.addWidget(self.copy_btn)
+        row.addWidget(self._outline('Экспорт журнала', self.export_log))
+        row.addWidget(self._outline('Очистить результаты', self.clear_log))
+        lay.addLayout(row)
+        row2 = QHBoxLayout()
+        row2.setSpacing(6)
+        row2.addWidget(self._outline('Показать статус', self.show_status))
+        row2.addWidget(self._outline('Анализ сражения', self.open_analysis))
+        lay.addLayout(row2)
+        self.batch_btn = QPushButton('Пакетная симуляция…')
+        self.batch_btn.setObjectName('batch_sim')
+        self.batch_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.batch_btn.clicked.connect(self.open_batch)
+        lay.addWidget(self.batch_btn)
+        return page
+
+    def _build_settings_dialog(self):
+        dialog = QDialog(self)
+        dialog.setObjectName('battle_settings')
+        dialog.setWindowTitle('Настройки боя')
+        dialog.setModal(False)
+        dialog.resize(480, 680)
+        outer = QVBoxLayout(dialog)
+        outer.setContentsMargins(12, 12, 12, 12)
+        outer.setSpacing(8)
+        note = QLabel('Редкие правила и вид карты. Частые команды — на панели слева и в меню.')
+        note.setProperty('role', 'muted')
+        note.setWordWrap(True)
+        outer.addWidget(note)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        host = QWidget()
+        lay = QVBoxLayout(host)
+        lay.setContentsMargins(4, 4, 8, 4)
+        lay.setSpacing(8)
+        scroll.setWidget(host)
+        outer.addWidget(scroll, 1)
+
+        rules = Section('Правила боя')
+        self._sec_rules = rules
+        self._build_rules_section(rules.body_lay)
+        lay.addWidget(rules)
+
+        display = Section('Отображение карты')
+        self._sec_display = display
+        self._build_display_section(display.body_lay)
+        lay.addWidget(display)
+
+        background = Section('Фон карты')
+        self._sec_bg = background
+        self._build_background_section(background.body_lay)
+        lay.addWidget(background)
+
+        allies = Section('Альянсы')
+        self._sec_alliances = allies
+        allies.body_lay.addWidget(self._build_alliances())
+        lay.addWidget(allies)
+        lay.addStretch()
+        rules.arrow.setChecked(True)
+        self.settings_dialog = dialog
+
+    def _build_rules_section(self, lay):
+        crit_row = QHBoxLayout()
+        crit_row.addWidget(QLabel('Крит:'))
+        self.crit_mode = QComboBox()
+        self.crit_mode.setObjectName('crit_mode')
+        self.crit_mode.addItem('Удваивать весь урон', 'double_all')
+        self.crit_mode.addItem('Удваивать только кости', 'dice_only')
+        self.crit_mode.setCurrentIndex(0)
+        crit_row.addWidget(self.crit_mode, 1)
+        lay.addLayout(crit_row)
+
+        self.auto_move = QCheckBox('Автоперемещение в бою')
+        self.auto_move.setObjectName('auto_move')
+        self.auto_move.setChecked(True)
+        self.auto_move.setToolTip('Бойцы сами подходят на дистанцию удара')
+        lay.addWidget(self.auto_move)
+
+        self.hide_hp = QCheckBox('Скрывать хиты в списках')
+        self.hide_hp.setObjectName('hide_hp')
+        self.hide_hp.setToolTip(
+            'В списке участников и в строке карты вместо чисел будет «хиты скрыты». '
+            'Журнал по-прежнему хранит точные хиты.')
+        self.hide_hp.toggled.connect(self._on_hide_hp)
+        lay.addWidget(self.hide_hp)
+
         self.manual_toggle = QCheckBox('Ручное управление')
         self.manual_toggle.setObjectName('manual_toggle')
         self.manual_toggle.setToolTip(
@@ -775,32 +1137,60 @@ class MainWindow(QMainWindow):
         self.manual_scope = QComboBox()
         self.manual_scope.setObjectName('manual_scope')
         self.manual_scope.addItems(['Выбранное существо', 'Сторона выбранного'])
+        lay.addWidget(self.manual_toggle)
+        lay.addWidget(self.manual_scope)
+
+        self.manual_map_toggle = QCheckBox('Ручное управление', self)
+        self.manual_map_toggle.setObjectName('manual_map_toggle')
+        self.manual_map_toggle.hide()
+        self.manual_map_scope = QComboBox(self)
+        self.manual_map_scope.setObjectName('manual_map_scope')
+        self.manual_map_scope.addItems(['Выбранное существо', 'Сторона выбранного'])
+        self.manual_map_scope.hide()
         self.manual_toggle.toggled.connect(self._sync_manual_toggle)
         self.manual_scope.currentIndexChanged.connect(self._sync_manual_scope)
-        row.addWidget(self.manual_toggle)
-        row.addWidget(self.manual_scope)
-        self.auto_move = QCheckBox('Автоперемещение в бою')
-        self.auto_move.setChecked(True)
-        row.addWidget(self.auto_move)
-        row.addWidget(QLabel('Крит:'))
-        self.crit_mode = QComboBox()
-        self.crit_mode.addItem('Удваивать весь урон', 'double_all')
-        self.crit_mode.addItem('Удваивать только кости', 'dice_only')
-        self.crit_mode.setCurrentIndex(0)
-        row.addWidget(self.crit_mode)
-        lay.addLayout(row)
-        return page
+        self.manual_map_toggle.toggled.connect(self._sync_manual_toggle_from_map)
+        self.manual_map_scope.currentIndexChanged.connect(self._sync_manual_scope_from_map)
+
+    def _on_hide_hp(self, _checked):
+        self.refresh_all_labels()
+        if self.selected is not None and self._manual_loop is None:
+            self.on_token(self.selected)
+
+    def _build_dock(self):
+        from qt_bestiary import BestiaryDialog
+        self.bestiary = BestiaryDialog(self, embedded=True)
+        self.bestiary.imported.connect(self._on_bestiary_import)
+        self.side_tabs = QTabWidget()
+        self.side_tabs.setObjectName('side_tabs')
+        self.side_tabs.setTabPosition(QTabWidget.TabPosition.East)
+        self.side_tabs.setIconSize(QSize(18, 18))
+        self.side_tabs.addTab(self.roster_page, 'Участники')
+        self.side_tabs.addTab(self.log_page, 'Журнал')
+        self.side_tabs.addTab(self.bestiary, 'Бестиарий')
+        self.side_tabs.setTabToolTip(0, 'Инициатива и участники')
+        self.side_tabs.setTabToolTip(1, 'Журнал боя')
+        self.side_tabs.setTabToolTip(2, 'Бестиарий dnd.su')
+        self._refresh_tab_icons()
+        dock = QDockWidget('Панель боя', self)
+        dock.setObjectName('side_dock')
+        dock.setAllowedAreas(Qt.DockWidgetArea.LeftDockWidgetArea
+                             | Qt.DockWidgetArea.RightDockWidgetArea)
+        dock.setWidget(self.side_tabs)
+        self.side_dock = dock
+        self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, dock)
+        self.resizeDocks([dock], [420], Qt.Orientation.Horizontal)
 
     def rebuild_battle_lists(self):
         clear_layout(self.battle_lay)
         self.enemy_labels, self.side_checks = {}, []
         if not self.sides:
-            hint = QLabel('Сначала создайте армии на вкладке «Настройка армий».')
+            hint = QLabel('Сначала создайте армии: кнопка армий или меню «Вид».')
             hint.setProperty('role', 'muted')
             self.battle_lay.addWidget(hint)
             self.battle_lay.addStretch()
             return
-        cols = min(len(self.sides), 3)
+        cols = 1
         grid = QGridLayout()
         grid.setSpacing(8)
         for i, (side, name) in enumerate(zip(self.sides, self.side_names)):
@@ -808,7 +1198,7 @@ class MainWindow(QMainWindow):
             bl = QVBoxLayout(box)
             sa = QScrollArea()
             sa.setWidgetResizable(True)
-            sa.setMinimumHeight(200)
+            sa.setMinimumHeight(min(220, 28 * (len(side) + 2)))
             host = QWidget()
             hl = QVBoxLayout(host)
             hl.setContentsMargins(4, 4, 4, 4)
@@ -841,20 +1231,72 @@ class MainWindow(QMainWindow):
             grid.setColumnStretch(c, 1)
         self.battle_lay.addLayout(grid)
 
-    @staticmethod
-    def _enemy_text(e):
+    def _enemy_text(self, e):
         from conditions import condition_marks
         status = '🟢' if e.alive else '🔴'
         atk = ', '.join(f'{a.name}{"✦" if getattr(a, "magical", False) else ""}'
                         f'+{a.attack_bonus}' for a in e.attacks)
         marks = condition_marks(e)
         suffix = f' · {marks}' if marks else ''
-        return f'{status} {e.name}: {e.hp}/{e.max_hp} HP [{atk}]{suffix}'
+        hidden = getattr(self, 'hide_hp', None) is not None and self.hide_hp.isChecked()
+        hp = 'хиты скрыты' if hidden else f'{e.hp}/{e.max_hp} HP'
+        return f'{status} {e.name}: {hp} [{atk}]{suffix}'
 
     @staticmethod
     def _enemy_tip(e):
         from conditions import condition_tooltip
         return condition_tooltip(e)
+
+    def _token_line(self, enemy):
+        from conditions import condition_marks, effective_speed
+        pos = None if self.battle_map is None else self.battle_map.get_pos(enemy)
+        speed = effective_speed(enemy)
+        left = speed - getattr(enemy, 'moved_ft', 0)
+        marks = condition_marks(enemy)
+        tail = f', {marks}' if marks else ''
+        hidden = getattr(self, 'hide_hp', None) is not None and self.hide_hp.isChecked()
+        hp = 'хиты скрыты, ' if hidden else f'HP {enemy.hp}/{enemy.max_hp}, '
+        return (f'{enemy.name}: {hp}AC {enemy.ac}, клетка {pos}, '
+                f'скорость {speed} фт, остаток {left} фт{tail}')
+
+    def _refresh_initiative(self):
+        listing = getattr(self, 'initiative_list', None)
+        if listing is None:
+            return
+        listing.clear()
+        event = next((item for item in reversed(self.battle_events)
+                      if getattr(item, 'kind', None) == 'initiative'), None)
+        if event is None or not event.rolls:
+            empty = QListWidgetItem('Порядок хода появится после раунда')
+            empty.setFlags(Qt.ItemFlag.NoItemFlags)
+            listing.addItem(empty)
+            return
+        colors = SIDE_PALETTES.get('classic', [])
+        for roll in event.rolls:
+            enemy = self._find_enemy(roll.actor_id)
+            item = QListWidgetItem(f'{roll.total:>2}   {roll.name}')
+            item.setData(Qt.ItemDataRole.UserRole, enemy)
+            side = roll.side if roll.side is not None else 0
+            if colors:
+                item.setForeground(QColor(colors[int(side) % len(colors)]))
+            listing.addItem(item)
+        self._mark_initiative_selection()
+
+    def _focus_initiative_item(self, item):
+        enemy = item.data(Qt.ItemDataRole.UserRole)
+        if enemy is None or self._manual_loop is not None:
+            return
+        self.on_token(enemy)
+
+    def _mark_initiative_selection(self):
+        listing = getattr(self, 'initiative_list', None)
+        if listing is None:
+            return
+        for row in range(listing.count()):
+            item = listing.item(row)
+            if item.data(Qt.ItemDataRole.UserRole) is self.selected:
+                listing.setCurrentItem(item)
+                return
 
     def open_condition_menu(self, enemy, global_pos):
         from conditions import CATALOG, active_conditions, condition_name
@@ -925,8 +1367,13 @@ class MainWindow(QMainWindow):
         self.dirty.clear()
 
     def run_round(self):
+        if self._round_busy:
+            return
+        self._round_busy = True
         self._manual_subjects = self._manual_subject_ids()
         self.round_btn.setEnabled(False)
+        if hasattr(self, 'act_round'):
+            self.act_round.setEnabled(False)
         try:
             result = battle_round.run_round(
                 self.sides, self.side_names, self.ignore_sides, self.battle_map,
@@ -935,10 +1382,14 @@ class MainWindow(QMainWindow):
                 controller=self._manual_controller)
         finally:
             self.round_btn.setEnabled(True)
+            if hasattr(self, 'act_round'):
+                self.act_round.setEnabled(True)
             self._manual_subjects = set()
             self._close_manual_ui()
+            self._round_busy = False
         outcome, text = result
         if outcome == 'empty':
+            self.pause_auto()
             QMessageBox.warning(self, 'Ошибка', text)
             return
         self.round_no += 1
@@ -954,11 +1405,14 @@ class MainWindow(QMainWindow):
         self.map_view.set_area_cells(self._area_cells(result.events))
         alive = sum(1 for s in self.sides for e in s if e.alive)
         attacks = sum(1 for event in result.events if event.kind == 'attack')
+        self._refresh_initiative()
         self.status.showMessage(
             f'Раунд {self.round_no}: живых {alive}, атак {attacks}' +
             ('  ·  бой завершён' if outcome == 'over' else '') +
             '  ·  линии атак на карте')
         self._commit(f'раунд {self.round_no}')
+        if outcome == 'over':
+            self.pause_auto()
 
     def _sync_manual_toggle(self, checked):
         if getattr(self, 'manual_map_toggle', None) is None:
@@ -966,6 +1420,11 @@ class MainWindow(QMainWindow):
         self.manual_map_toggle.blockSignals(True)
         self.manual_map_toggle.setChecked(bool(checked))
         self.manual_map_toggle.blockSignals(False)
+        action = getattr(self, 'act_manual', None)
+        if action is not None and action.isChecked() != bool(checked):
+            action.blockSignals(True)
+            action.setChecked(bool(checked))
+            action.blockSignals(False)
 
     def _sync_manual_toggle_from_map(self, checked):
         self.manual_toggle.blockSignals(True)
@@ -978,11 +1437,25 @@ class MainWindow(QMainWindow):
         self.manual_map_scope.blockSignals(True)
         self.manual_map_scope.setCurrentIndex(index)
         self.manual_map_scope.blockSignals(False)
+        self._sync_scope_actions(index)
 
     def _sync_manual_scope_from_map(self, index):
         self.manual_scope.blockSignals(True)
         self.manual_scope.setCurrentIndex(index)
         self.manual_scope.blockSignals(False)
+        self._sync_scope_actions(index)
+
+    def _sync_scope_actions(self, index):
+        one = getattr(self, 'act_scope_one', None)
+        side = getattr(self, 'act_scope_side', None)
+        if one is None or side is None:
+            return
+        one.blockSignals(True)
+        side.blockSignals(True)
+        one.setChecked(index == 0)
+        side.setChecked(index == 1)
+        one.blockSignals(False)
+        side.blockSignals(False)
 
     def _manual_subject_ids(self):
         if not self.manual_toggle.isChecked() or self.selected is None:
@@ -1280,6 +1753,7 @@ class MainWindow(QMainWindow):
         self.map_view.set_area_cells([])
         self.map_view.set_preview_cells([])
         self.map_view.set_focus_areas([])
+        self._refresh_initiative()
         self._commit('очистка журнала')
 
     def copy_log(self):
@@ -1434,7 +1908,9 @@ class MainWindow(QMainWindow):
         self.all_grid = QGridLayout(self.all_host)
         self.all_grid.setSpacing(6)
         sa.setWidget(self.all_host)
+        sa.setMinimumHeight(220)
         lay.addWidget(sa, 1)
+        lay.addWidget(self._outline('Применить альянсы', self.apply_alliances))
         return page
 
     def refresh_alliances(self):
@@ -1445,7 +1921,7 @@ class MainWindow(QMainWindow):
             self.all_note.setText('Для настройки альянсов требуется минимум 3 стороны.')
             return
         self.all_note.setText('Отметьте, какие стороны игнорируют друг друга, '
-                              'затем нажмите «Применить настройки альянсов» внизу.')
+                              'затем нажмите «Применить альянсы».')
         for j, nm in enumerate(self.side_names):
             lab = QLabel(nm)
             lab.setProperty('role', 'accent')
@@ -1512,138 +1988,89 @@ class MainWindow(QMainWindow):
         row.addWidget(s)
         return row, s, cap
 
-    def _build_map(self):
-        page = QWidget()
-        outer = QHBoxLayout(page)
-        outer.setSpacing(10)
-
-        panel = QFrame()
-        panel.setProperty('role', 'card')
-        panel.setFixedWidth(296)
-        pv = QVBoxLayout(panel)
-        pv.setContentsMargins(12, 12, 12, 12)
-        pv.setSpacing(8)
-        head = QLabel('🎛 Отображение карты')
-        head.setProperty('role', 'title')
-        pv.addWidget(head)
-
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        body = QWidget()
-        pl = QVBoxLayout(body)
-        pl.setContentsMargins(2, 2, 8, 2)
-        pl.setSpacing(8)
-        scroll.setWidget(body)
-        pv.addWidget(scroll, 1)
-
+    def _build_display_section(self, lay):
         self._map_sliders = {}
         for key, label, lo, hi, suffix in (
                 ('cell', 'Размер клетки', 16, 56, ' px'),
                 ('zoom', 'Масштаб', 25, 300, ' %'),
                 ('dead_alpha', 'Видимость павших', 10, 100, ' %'),
                 ('stroke', 'Обводка токенов', 0, 4, ' px')):
-            row, s, cap = self._slider(lo, hi, DEFAULT_OPTS[key], label, key, suffix)
-            pl.addLayout(row)
-            self._map_sliders[key] = (s, cap, label, suffix)
+            row, slider, cap = self._slider(lo, hi, DEFAULT_OPTS[key], label, key, suffix)
+            lay.addLayout(row)
+            self._map_sliders[key] = (slider, cap, label, suffix)
 
         self.cb_grid = QCheckBox('Сетка поля')
         self.cb_grid.setChecked(True)
         self.cb_grid.toggled.connect(lambda v: self.map_view.set_opt('grid', v))
-        pl.addWidget(self.cb_grid)
+        lay.addWidget(self.cb_grid)
         self.cb_reach = QCheckBox('Подсветка досягаемости')
         self.cb_reach.setChecked(True)
         self.cb_reach.toggled.connect(lambda v: self.map_view.set_opt('reach', v))
-        pl.addWidget(self.cb_reach)
+        lay.addWidget(self.cb_reach)
         self.cb_glow = QCheckBox('Свечение выбранного')
         self.cb_glow.setChecked(True)
         self.cb_glow.toggled.connect(lambda v: self.map_view.set_opt('glow', v))
-        pl.addWidget(self.cb_glow)
+        lay.addWidget(self.cb_glow)
         self.cb_attacks = QCheckBox('Линии атак')
         self.cb_attacks.setChecked(True)
         self.cb_attacks.setToolTip(
             'Последний раунд: красный — попадание, золотой — крит, '
             'серый пунктир — промах, фиолетовый — натуральная 1, зелёный — лечение')
         self.cb_attacks.toggled.connect(lambda v: self.map_view.set_opt('attack_lines', v))
-        pl.addWidget(self.cb_attacks)
-        self.manual_map_toggle = QCheckBox('Ручное управление')
-        self.manual_map_toggle.setObjectName('manual_map_toggle')
-        self.manual_map_toggle.toggled.connect(self._sync_manual_toggle_from_map)
-        pl.addWidget(self.manual_map_toggle)
-        self.manual_map_scope = QComboBox()
-        self.manual_map_scope.setObjectName('manual_map_scope')
-        self.manual_map_scope.addItems(['Выбранное существо', 'Сторона выбранного'])
-        self.manual_map_scope.currentIndexChanged.connect(self._sync_manual_scope_from_map)
-        pl.addWidget(self.manual_map_scope)
+        lay.addWidget(self.cb_attacks)
 
-        pl.addWidget(QLabel('Подписи токенов:'))
+        lay.addWidget(QLabel('Подписи токенов:'))
         self.cmb_labels = QComboBox()
         self.cmb_labels.addItems(['Номер бойца', 'Имя стороны', 'Без подписей'])
         self.cmb_labels.currentIndexChanged.connect(
             lambda i: self.map_view.set_opt('labels', ['number', 'name', 'none'][i]))
-        pl.addWidget(self.cmb_labels)
+        lay.addWidget(self.cmb_labels)
 
-        pl.addWidget(QLabel('Палитра сторон:'))
+        lay.addWidget(QLabel('Палитра сторон:'))
         self.cmb_sides = QComboBox()
         self.cmb_sides.addItems(['Классическая', 'Неон', 'Пергамент'])
         self.cmb_sides.currentIndexChanged.connect(
             lambda i: self.map_view.set_opt('sides', ['classic', 'neon', 'parchment'][i]))
-        pl.addWidget(self.cmb_sides)
+        lay.addWidget(self.cmb_sides)
+        lay.addWidget(self._outline('Сбросить вид', self.reset_map_opts))
+        lay.addWidget(self._outline('Случайный вид', self.randomize_map_opts))
+        export = QPushButton('Экспорт PNG')
+        export.setProperty('variant', 'primary')
+        export.setCursor(Qt.CursorShape.PointingHandCursor)
+        export.clicked.connect(self.export_map_png)
+        lay.addWidget(export)
 
-        sep = QFrame()
-        sep.setProperty('role', 'sep')
-        sep.setFixedHeight(2)
-        pl.addWidget(sep)
-
-        bg_cap = QLabel('🖼 Фон карты')
-        bg_cap.setProperty('role', 'accent')
-        pl.addWidget(bg_cap)
-        b_load = QPushButton('Загрузить изображение…')
-        b_load.setCursor(Qt.CursorShape.PointingHandCursor)
-        b_load.clicked.connect(self.load_map_background)
-        pl.addWidget(b_load)
+    def _build_background_section(self, lay):
+        load = QPushButton('Загрузить изображение…')
+        load.setCursor(Qt.CursorShape.PointingHandCursor)
+        load.clicked.connect(self.load_map_background)
+        lay.addWidget(load)
         self.bg_info = QLabel('Фон не задан. Можно перетащить картинку прямо на поле.')
         self.bg_info.setProperty('role', 'muted')
         self.bg_info.setWordWrap(True)
-        pl.addWidget(self.bg_info)
-
-        pl.addWidget(QLabel('Масштабирование фона:'))
+        lay.addWidget(self.bg_info)
+        lay.addWidget(QLabel('Масштабирование фона:'))
         self.cmb_bg_mode = QComboBox()
         self.cmb_bg_mode.addItems(['Растянуть по карте', 'Вписать (с полями)',
                                    'Заполнить (обрезать)', 'Замостить'])
         self.cmb_bg_mode.currentIndexChanged.connect(
             lambda i: self.map_view.set_opt('bg_mode', BG_MODES[i]))
-        pl.addWidget(self.cmb_bg_mode)
+        lay.addWidget(self.cmb_bg_mode)
+        row, slider, cap = self._slider(10, 100, DEFAULT_OPTS['bg_opacity'],
+                                        'Непрозрачность фона', 'bg_opacity', ' %')
+        lay.addLayout(row)
+        self._map_sliders['bg_opacity'] = (slider, cap, 'Непрозрачность фона', ' %')
+        clear = QPushButton('Убрать фон')
+        clear.setProperty('variant', 'danger')
+        clear.setCursor(Qt.CursorShape.PointingHandCursor)
+        clear.clicked.connect(self.clear_map_background)
+        lay.addWidget(clear)
 
-        row, s, cap = self._slider(10, 100, DEFAULT_OPTS['bg_opacity'],
-                                   'Непрозрачность фона', 'bg_opacity', ' %')
-        pl.addLayout(row)
-        self._map_sliders['bg_opacity'] = (s, cap, 'Непрозрачность фона', ' %')
-
-        b_clear = QPushButton('✕ Убрать фон')
-        b_clear.setProperty('variant', 'danger')
-        b_clear.setCursor(Qt.CursorShape.PointingHandCursor)
-        b_clear.clicked.connect(self.clear_map_background)
-        pl.addWidget(b_clear)
-        pl.addStretch()
-
-        for text, fn, variant in (('↺ Сбросить вид', self.reset_map_opts, 'outline'),
-                                  ('🎲 Случайный вид', self.randomize_map_opts, 'outline'),
-                                  ('🖼 Экспорт PNG', self.export_map_png, 'primary')):
-            b = QPushButton(text)
-            b.setProperty('variant', variant)
-            b.setCursor(Qt.CursorShape.PointingHandCursor)
-            b.clicked.connect(fn)
-            pv.addWidget(b)
-        outer.addWidget(panel)
-
-        right = QVBoxLayout()
-        hint = QLabel('Колесо — зум · тяни поле — панорама · клик по токену — выбрать · '
-                      'перетащи токен или кликни по зелёной клетке — ход · Ctrl+Z — отмена · '
-                      'картинку можно бросить на поле мышью')
-        hint.setProperty('role', 'muted')
-        right.addWidget(hint)
-        split = QSplitter(Qt.Orientation.Vertical)
+    def _build_map(self):
+        page = QWidget()
+        lay = QVBoxLayout(page)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(4)
         self.map_view = MapView(self.theme.palette())
         self.map_view.token_clicked.connect(self.on_token)
         self.map_view.token_menu.connect(self.open_condition_menu)
@@ -1651,16 +2078,11 @@ class MainWindow(QMainWindow):
         self.map_view.token_dragged.connect(self.on_token_dragged)
         self.map_view.image_dropped.connect(self._apply_background_path)
         self.map_view.aim_moved.connect(self.on_aim)
-        split.addWidget(self.map_view)
-        mirror = QWidget()
-        mirror_lay = QVBoxLayout(mirror)
-        mirror_lay.setContentsMargins(0, 0, 0, 0)
-        self.log_panel.attach_mirror(mirror_lay)
-        split.addWidget(mirror)
-        split.setStretchFactor(0, 3)
-        split.setStretchFactor(1, 1)
-        split.setSizes([520, 200])
-        right.addWidget(split, 1)
+        self.map_view.setToolTip(
+            'Колесо — зум. Тяни поле — панорама. Клик по токену — выбрать. '
+            'Перетащи токен или кликни по зелёной клетке — ход. Ctrl+Z — отмена. '
+            'Картинку можно бросить на поле.')
+        lay.addWidget(self.map_view, 1)
         self.manual_bar = QFrame()
         self.manual_bar.setObjectName('manual_bar')
         self.manual_bar.setProperty('role', 'card')
@@ -1698,15 +2120,11 @@ class MainWindow(QMainWindow):
         self.manual_hit.setObjectName('manual_hit')
         bar_lay.addWidget(self.manual_hint)
         bar_lay.addWidget(self.manual_hit)
-        right.addWidget(self.manual_bar)
-        self.map_info = QLabel('Токен не выбран.')
+        lay.addWidget(self.manual_bar)
+        self.map_info = QLabel('Токен не выбран. Армии собираются на отдельной странице.')
         self.map_info.setProperty('role', 'muted')
-        right.addWidget(self.map_info)
-        self._manual_loop = None
-        self._manual_subjects = set()
-        self._manual_choices = []
-        outer.addLayout(right, 1)
-        self._sync_bg_info()
+        self.map_info.setContentsMargins(8, 0, 8, 6)
+        lay.addWidget(self.map_info)
         return page
 
     def _apply_background_path(self, path):
@@ -1816,14 +2234,8 @@ class MainWindow(QMainWindow):
             return
         self.selected = enemy
         self.map_view.rebuild(self.battle_map, self.sides, self.selected)
-        from conditions import condition_marks, effective_speed
-        pos = self.battle_map.get_pos(enemy)
-        speed = effective_speed(enemy)
-        left = speed - getattr(enemy, 'moved_ft', 0)
-        marks = condition_marks(enemy)
-        tail = f', {marks}' if marks else ''
-        self.map_info.setText(f'{enemy.name}: HP {enemy.hp}/{enemy.max_hp}, AC {enemy.ac}, '
-                              f'клетка {pos}, скорость {speed} фт, остаток {left} фт{tail}')
+        self.map_info.setText(self._token_line(enemy))
+        self._mark_initiative_selection()
         self._note_selection()
 
     def on_token_dragged(self, enemy, x, y):
@@ -1885,6 +2297,7 @@ class MainWindow(QMainWindow):
                 'alliance_settings': self.alliance_settings,
                 'ignore_sides': {str(k): list(v) for k, v in self.ignore_sides.items()},
                 'crit_mode': self.crit_mode.currentData() or 'double_all',
+                'hide_hp': bool(self.hide_hp.isChecked()),
                 'map_opts': dict(self.map_view.opts),
                 'map_bg': self.map_view.background_path,
                 'battle': capture_battle(self),
@@ -1920,6 +2333,8 @@ class MainWindow(QMainWindow):
                                   names[i] if i < len(names) else None,
                                   counts[i] if i < len(counts) else 5)
                 self._apply_crit_mode(data.get('crit_mode'))
+                if 'hide_hp' in data:
+                    self.hide_hp.setChecked(bool(data.get('hide_hp')))
                 self.alliance_settings = data.get('alliance_settings') or []
                 self.ignore_sides = {int(k): set(v)
                                      for k, v in (data.get('ignore_sides') or {}).items()}
@@ -1946,6 +2361,7 @@ class MainWindow(QMainWindow):
                         self.log_panel.load_events(self.battle_events)
                     self.selected = info.selected
                     self.map_view.rebuild(self.battle_map, self.sides, self.selected)
+                    self._refresh_initiative()
                     self.status.showMessage(
                         f'Бой загружен: сторон {len(self.sides)}, '
                         f'раунд {self.round_no}.')

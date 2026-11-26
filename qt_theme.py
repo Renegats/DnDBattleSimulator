@@ -79,6 +79,12 @@ QGroupBox::title { subcontrol-origin: margin; left: 14px; padding: 0 6px;
 
 QToolButton { background: transparent; border: none; color: $fg; padding: 2px; }
 QToolButton:hover { color: $accent; }
+QToolBar QToolButton { background: transparent; border: 1px solid transparent;
+                       border-radius: 8px; padding: 4px; margin: 1px; }
+QToolBar QToolButton:hover { background: $hover; border-color: $accent; color: $fg; }
+QToolBar QToolButton:pressed, QToolBar QToolButton:checked {
+    background: $accent; color: #ffffff; border-color: $accent; }
+QToolBar QToolButton:disabled { color: $fg_muted; background: transparent; border-color: transparent; }
 
 QScrollArea { border: none; background: transparent; }
 QScrollBar:vertical { background: $bg_secondary; width: 12px; margin: 0; border-radius: 6px; }
@@ -98,6 +104,30 @@ QListWidget::item { padding: 3px 4px; border-radius: 4px; }
 QListWidget::item:selected { background: $accent; color: #ffffff; }
 QToolTip { background: $field_bg; color: $fg; border: 1px solid $accent; padding: 4px; }
 QStatusBar { background: $bg_secondary; color: $fg_muted; }
+
+QMenuBar { background: $bg_secondary; color: $fg; border: none; spacing: 2px; padding: 2px 6px; }
+QMenuBar::item { background: transparent; padding: 5px 12px; border-radius: 6px; }
+QMenuBar::item:selected { background: $hover; }
+QMenuBar::item:pressed { background: $accent; color: #ffffff; }
+QMenu { background: $field_bg; color: $fg; border: 1px solid $border; padding: 4px; }
+QMenu::item { padding: 6px 28px 6px 16px; border-radius: 6px; }
+QMenu::item:selected { background: $accent; color: #ffffff; }
+QMenu::item:disabled { color: $fg_muted; background: transparent; }
+QMenu::separator { height: 1px; background: $border; margin: 4px 8px; }
+
+QToolBar { background: $bg_secondary; border: none; spacing: 2px; padding: 6px 4px; }
+QToolBar::separator { background: $border; width: 1px; height: 1px; margin: 6px 8px; }
+
+QDockWidget { color: $fg; }
+QDockWidget::title { background: $bg_secondary; padding: 6px 8px; text-align: left; }
+QDockWidget::close-button, QDockWidget::float-button {
+    background: transparent; border: none; padding: 0px; }
+
+QTabWidget::pane { border: 1px solid $border; border-radius: 8px; top: -1px; }
+QTabBar::tab { background: $bg_secondary; color: $fg_muted; border: 1px solid transparent;
+               border-radius: 8px; padding: 8px 10px; margin: 2px; min-width: 28px; }
+QTabBar::tab:selected { background: $accent; color: #ffffff; }
+QTabBar::tab:hover:!selected { background: $hover; color: $fg; }
 """)
 
 
